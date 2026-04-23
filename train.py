@@ -26,8 +26,8 @@ from arguments import ModelParams, PipelineParams, SplattingSettings, Optimizati
 from utils.depth_utils import depths_to_points, depth_to_normal, central_diff
 from utils.vis_utils import gui_visualize, export_image
 from scene.gaussian_model import build_scaling_rotation
-from fused_ssim import fused_ssim
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
+from decoupled_fused_ssim import fused_ssim
 import numpy as np
 from scene.appearance_network import AppearanceEmbedding, VastGaussianAppearanceEmbedding, SSIMDecoupledAppearanceEmbedding
 from functools import partial

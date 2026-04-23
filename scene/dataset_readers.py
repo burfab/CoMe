@@ -120,7 +120,10 @@ def fetchPly(path):
     vertices = plydata['vertex']
     positions = np.vstack([vertices['x'], vertices['y'], vertices['z']]).T
     colors = np.vstack([vertices['red'], vertices['green'], vertices['blue']]).T / 255.0
-    normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    if 'nx' in vertices:
+        normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
+    else:
+        normals = np.zeros_like(vertices)
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def storePly(path, xyz, rgb):
@@ -182,6 +185,95 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
         
         xyz = np.random.random((num_pts, 3)) * nerf_normalization["radius"]* 3*2 -(nerf_normalization["radius"]*3)
         
+        num_pts = xyz.shape[0]
+        shs = np.random.random((num_pts, 3)) / 255.0
+        pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
+        storePly(ply_path, xyz, SH2RGB(shs) * 255)
+    else:
+        print("Please specify a correct init_type: random or sfm")
+        exit(0)
+    try:
+        pcd = fetchPly(ply_path)
+    except:
+        pcd = None
+
+    scene_info = SceneInfo(point_cloud=pcd,
+                           train_cameras=train_cam_infos,
+                           test_cameras=test_cam_infos,
+                           nerf_normalization=nerf_normalization,
+                           ply_path=ply_path)
+    return scene_info
+
+def readCamerasJson(cameras_file, images_folder):
+    with open(cameras_file, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+
+    cam_infos = []
+    frames = meta["frames"]
+    per_frame_cams = meta["cameras"]
+    per_frame_cams_dict = {}
+    for cam in per_frame_cams: per_frame_cams_dict[cam["camera_id"]] = cam
+
+    for idx, fr in enumerate(frames):
+        sys.stdout.write('\r')
+        sys.stdout.write(f"Reading camera {idx+1}/{len(frames)}")
+        sys.stdout.flush()
+        cam = per_frame_cams_dict[fr["camera_id"]]
+        K = np.array(cam["K"], dtype=np.float32)
+        width = int(cam["width"])
+        height = int(cam["height"])
+        fx = float(K[0, 0])
+        fy = float(K[1, 1])
+        FovX = focal2fov(fx, width)
+        FovY = focal2fov(fy, height)
+        
+        
+        image_rel = fr["image"]
+        image_path = os.path.join(images_folder, image_rel)
+        image_name = os.path.splitext(os.path.basename(image_rel))[0]
+
+        R = np.array(fr["R"], dtype=np.float32)
+        T = np.array(fr["T"], dtype=np.float32)
+
+        uid = fr["id"]
+
+        cam_info = CameraInfo(
+            uid=uid,
+            R=R.T,
+            T=T,
+            FovY=FovY,
+            FovX=FovX,
+            image=image_path,
+            image_path=image_path,
+            image_name=image_name,
+            width=width,
+            height=height,
+        )
+        cam_infos.append(cam_info)
+
+    sys.stdout.write('\n')
+    return cam_infos
+
+def readIPhoneSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts=100000):
+    cameras_file = os.path.join(path, "cameras.json")
+    cam_infos_unsorted = readCamerasJson(cameras_file, os.path.join(path, "images"))
+    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.uid)
+
+    if eval:
+        train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]
+        test_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold == 0]
+    else:
+        train_cam_infos = cam_infos
+        test_cam_infos = []
+
+    nerf_normalization = getNerfppNorm(train_cam_infos)
+
+    if init_type == "sfm":
+        ply_path = os.path.join(path, "points3D.ply")
+    elif init_type == "random":
+        ply_path = os.path.join(path, "random.ply")
+        print(f"Generating random point cloud ({num_pts})...")
+        xyz = np.random.random((num_pts, 3)) * nerf_normalization["radius"]* 3*2 -(nerf_normalization["radius"]*3)
         num_pts = xyz.shape[0]
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
@@ -335,6 +427,7 @@ def readScanNetSceneInfo(path, eval, init_type="sfm", num_pts=100000):
     return scene_info
 
 sceneLoadTypeCallbacks = {
+    "iPhone": readIPhoneSceneInfo, 
     "Colmap": readColmapSceneInfo,
     "Blender" : readNerfSyntheticInfo,
     "ScanNET" : readScanNetSceneInfo

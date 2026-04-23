@@ -10,6 +10,7 @@
 #
 
 import torch
+import cv2
 import sys
 from datetime import datetime
 import numpy as np
@@ -17,6 +18,32 @@ import random
 
 def inverse_sigmoid(x):
     return torch.log(x/(1-x))
+
+def opencvToTorch(cv_image, resolution, convert_bgr_to_rgb=True, segmentation=False, interpolation = cv2.INTER_LINEAR):
+    """
+    cv_image: numpy array (H, W, C) or (H, W)
+    resolution: (width, height)
+    returns: torch tensor (C, H, W) in [0,1] float32
+    """
+
+    # Resize (cv2 expects (width, height))
+    resized = cv2.resize(cv_image, resolution, interpolation=interpolation)
+
+    # Convert BGR -> RGB if needed
+    if not segmentation and (convert_bgr_to_rgb and len(resized.shape) == 3):
+        resized = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+
+    # To torch float [0,1]
+    if not segmentation:
+        tensor = torch.from_numpy(resized).float() / 255.0
+    else:
+        tensor = torch.from_numpy(resized)
+
+    if len(tensor.shape) == 3:
+        return tensor.permute(2, 0, 1).contiguous()
+    else:
+        # grayscale
+        return tensor.unsqueeze(0).contiguous()
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution)
