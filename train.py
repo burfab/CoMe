@@ -189,7 +189,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         gt_segmentation = viewpoint_cam.seg_mask.cuda()
         # not sure we need detach here
         
-        render_segmentation = iteration % opt.contrastive_interval or iteration % opt.spatial_similarity_interval
+        render_segmentation = iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0
         splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach())
@@ -254,7 +254,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # Spatial-similarity Loss
             if iteration % opt.spatial_similarity_interval == 0:
                 features3d = gaussians.get_segmentation
-                seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians._xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
+                seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
             
             
         # depth distortion regularization
