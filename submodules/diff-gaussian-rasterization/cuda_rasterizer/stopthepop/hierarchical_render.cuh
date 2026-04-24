@@ -217,7 +217,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	const float* __restrict__ projmatrix_inv,
 	const float3* __restrict__ cam_pos,
 	const float4* __restrict__ conic_opacity,
-	DebugVisualization debugType,
+	CudaRasterizer::DebugVisualization debugType,
 	PF && prep_function,
 	SF && store_function,
 	BF && blend_function,
@@ -982,7 +982,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ max_weights,
-	DebugVisualization debugType,
+	CudaRasterizer::DebugVisualization debugType,
 	float* __restrict__ out_color,
 	float* __restrict__ gt_color)
 {
@@ -1051,7 +1051,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 		{
 			return alpha;
 		};
-	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, DebugVisualization debugType, float3 normal_, float4 ABC_)
+	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
 		{
 			//alpha = 0.999f;
 			const float normal[3] = {normal_.x, normal_.y, normal_.z};
@@ -1201,7 +1201,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 
 			return true;
 		};
-	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, DebugVisualization debugType, int range, float3 o)
+	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{		
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
 			// A, D, and D^2
@@ -1275,6 +1275,94 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 		prep_function, store_function, blend_function, fin_function);
 }
 
+
+
+template <int32_t CHANNELS, int32_t N_EXTRA_FEATURES, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blendExtraFeaturesForward(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	float focal_x, float focal_y, 
+	const float far_plane,
+	const float * __restrict__ extra_features,
+	const float* view2gaussian,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ cov3Ds_inv,
+	const float* __restrict__ projmatrix_inv,
+	const float3* __restrict__ cam_pos,
+	const float* __restrict__ features,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ bg_color,
+	CudaRasterizer::DebugVisualization debugType,
+	float* __restrict__ out_color)
+{
+	constexpr uint2 debug_target_pixel = {500, 500};
+	// int num_blends = 0;
+	struct BlendData
+	{
+		float T_opa;
+		float T;
+		float opacity;
+		float F[N_EXTRA_FEATURES];
+
+		uint32_t contributor{0};
+
+		float3 ray_dir;
+	};
+
+	auto prep_function = [&](bool inside, const uint2& pixpos, const float3 ray_dir)
+		{
+			uint32_t pix_id = W * pixpos.y + pixpos.x;
+			BlendData bd;
+			bd.ray_dir = ray_dir;
+
+			bd.T = 1.f;
+
+			bd.opacity = 0.f;
+
+			for(int ch = 0; ch < N_EXTRA_FEATURES; ch++) bd.F[ch] = 0.f;
+
+			return bd;
+		};
+	auto store_function = [](const uint2&, int coll_id, float G, float alpha, float depth)
+		{
+			return alpha;
+		};
+	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
+		{
+			// accumulate the opacity up to the current contributor
+			float test_T = blend_data.T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}
+
+			const float weight = alpha * blend_data.T;
+			// TODO: consider using vectors and better loads?
+			for (int ch = 0; ch < N_EXTRA_FEATURES; ch++) {
+				float val = extra_features[id * N_EXTRA_FEATURES + ch];
+				blend_data.F[ch] += val * weight;
+			}
+
+
+			blend_data.T = test_T;
+			return true;
+		};
+	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
+		{		
+			uint32_t pix_id = W * pixpos.y + pixpos.x;
+			const float blend_normalization_factor = 1.f/max((1 - blend_data.T), 1e-3f);
+
+			for(int ch = 0; ch < N_EXTRA_FEATURES;ch++)
+				out_color[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id] = blend_data.F[ch]*blend_normalization_factor;
+		};
+
+	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
+		prep_function, store_function, blend_function, fin_function);
+}
+
+
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
 __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opacity(
 	const uint2* __restrict__ ranges,
@@ -1292,7 +1380,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 	float* __restrict__ final_T,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	DebugVisualization debugType,
+	CudaRasterizer::DebugVisualization debugType,
 	float* __restrict__ out_color)
 {
 	constexpr uint2 debug_target_pixel = {500, 500};
@@ -1332,7 +1420,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 		{
 			return alpha;
 		};
-	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, DebugVisualization debugType, float3 normal_, float4 ABC_)
+	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
 		{
 			// accumulate the opacity up to the current contributor
 			if (++blend_data.current_contributor > blend_data.max_contributor) {
@@ -1358,7 +1446,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 
 			return true;
 		};
-	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, DebugVisualization debugType, int range, float3 o)
+	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{		
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
 			// we already have everything, except
@@ -1512,7 +1600,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			// confidence
 			bd.dL_dconfidence = inside ? dL_dpixels[CONFIDENCE_OFFSET * H * W + pix_id] : 0;
 			// compensate for normalization
-			bd.dL_dconfidence /= max(1 - bd.T_final, 1e-9f);
+			//TODO: was this a bug or intentional, was 1e-9f
+			bd.dL_dconfidence /= max(1 - bd.T_final, 1e-3f);
 
 			//++++++++++++GOF
 			for (int ch = 0; ch < CHANNELS*2; ++ch)
@@ -1561,7 +1650,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		{
 			return G;
 		};
-	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int global_id, float G, float t, const float* view2gaussian_j, float2 ray, DebugVisualization debugType, float3 normal_, float4 ABC_)
+	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int global_id, float G, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
 		{
 			const float4 con_o = conic_opacity[global_id];
 
@@ -1917,7 +2006,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 #endif
 			return true;
 		};
-	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, DebugVisualization debugType, int range, float3 o)
+	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{
 #ifdef DEBUG_OPACITY_FIELD
 			float diff = blend_data.opacity_final - blend_data.opacity;
@@ -1956,6 +2045,102 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		};
 
 	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, DebugVisualization::Disabled,
+		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
+		prep_function, store_function, blend_function, fin_function);
+}
+
+template <int32_t CHANNELS, int32_t N_EXTRA_FEATURES, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true>
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blendExtraFeaturesBackward(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	float focal_x, float focal_y, 
+	const float far_plane,
+	const float* view2gaussian,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ cov3Ds_inv,
+	const float* __restrict__ projmatrix_inv,
+	const float3* __restrict__ cam_pos,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ bg_color,
+	const float* __restrict__ extra_features,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ pixel_colors,
+	const float* __restrict__ dL_dpixels,
+	float* __restrict__ dL_dextra_features)
+{
+	constexpr uint2 debug_target_pixel = {500, 500};
+	// int num_blends = 0;
+	struct BlendData
+	{
+		uint32_t contributor{0};
+		float T;
+		float T_final;
+		//float final_extra_features[N_EXTRA_FEATURES];
+		float dL_dextra_features[N_EXTRA_FEATURES];
+	};
+
+	auto prep_function = [&](bool inside, const uint2& pixpos, const float3 ray_dir)
+		{
+			uint32_t pix_id = W * pixpos.y + pixpos.x;
+			BlendData bd;
+			bd.contributor = 0;
+			bd.T = 1.0f;
+			bd.T_final = inside ? final_Ts[pix_id] : 0;
+			//TODO: was this a bug or intentional, was 1e-9f
+			const float blend_normalization = 1.f/max(1 - bd.T_final, 1e-3f);
+			for(int ch = 0; ch < N_EXTRA_FEATURES; ch++)
+				bd.dL_dextra_features[ch] = inside ? dL_dpixels[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id]*blend_normalization : 0;
+
+			//++++++++++++GOF
+			/*
+			for (int ch = 0; ch < N_EXTRA_FEATURES; ++ch)
+			{
+				bd.final_extra_features[ch] = 0.f;
+			}
+			if (inside)
+			{
+				for (int ch = 0; ch < N_EXTRA_FEATURES; ++ch)
+				{
+						//TODO: even needed? should we normalize this?
+						bd.final_extra_features[ch] = pixel_colors[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id];
+				}
+			}
+			*/
+			//++++++++++++GOF
+				
+			return bd;
+		};
+	auto store_function = [](const uint2&, int coll_id, float G, float alpha, float depth)
+		{
+			return alpha;
+		};
+		//could use alpha right?
+	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
+		{
+			// accumulate the opacity up to the current contributor
+			float test_T = blend_data.T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}			
+			const float dchannel_dcolor = alpha * blend_data.T;
+			// TODO: consider using vectors and better loads?
+			for (int ch = 0; ch < N_EXTRA_FEATURES; ch++) {
+				//const float val = extra_features[id * N_EXTRA_FEATURES + ch];
+				atomicAdd(&(dL_dextra_features[id * N_EXTRA_FEATURES + ch]), dchannel_dcolor * blend_data.dL_dextra_features[ch]);
+			}
+
+			blend_data.T = test_T;
+			return true;
+		};
+	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
+		{		
+			return;
+		};
+
+	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, blend_function, fin_function);
 }

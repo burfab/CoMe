@@ -9,7 +9,7 @@
 
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
-
+using DebugVisualization = CudaRasterizer::DebugVisualization;
 __forceinline__ __device__ glm::mat3 computeInvCov3D(const glm::vec3& scale, const glm::vec4& rot,  float scale_modifier = 1.0f)
 {
 	// Create scaling matrix

@@ -23,6 +23,8 @@ add_library(CudaRasterizer
 	cuda_rasterizer/backward.cu
 	cuda_rasterizer/forward.h
 	cuda_rasterizer/forward.cu
+	cuda_rasterizer/extra_features.h
+	cuda_rasterizer/extra_features.cu
 	cuda_rasterizer/auxiliary.h
 	cuda_rasterizer/rasterizer_impl.cu
 	cuda_rasterizer/rasterizer_impl.h

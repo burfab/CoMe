@@ -49,6 +49,7 @@ RasterizeGaussiansCUDA(
 	const torch::Tensor &scales,
 	const torch::Tensor &rotations,
 	const torch::Tensor &confidences,
+	const torch::Tensor &extra_features,
 	const float scale_modifier,
 	const torch::Tensor &cov3D_precomp,
 	const torch::Tensor& view2gaussian_precomp,
@@ -74,14 +75,15 @@ RasterizeGaussiansCUDA(
 		AT_ERROR("means3D must have dimensions (num_points, 3)");
 	}
 
+	CudaRasterizer::SplattingSettings settings = settings_dict.get<CudaRasterizer::SplattingSettings>();
 	const int P = means3D.size(0);
 	const int H = image_height;
 	const int W = image_width;
-
+	
 	auto int_opts = means3D.options().dtype(torch::kInt32);
 	auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-	torch::Tensor out_color = torch::full({13, H, W}, 0.0, float_opts);
+	torch::Tensor out_color = torch::full({13 + std::max(settings.blend_extra_features, 0), H, W}, 0.0, float_opts);
 	torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
 	torch::Tensor max_weights = torch::full({P}, 0, means3D.options().dtype(torch::kFloat32));
 
@@ -103,8 +105,9 @@ RasterizeGaussiansCUDA(
 			M = sh.size(1);
 		}
 
-		CudaRasterizer::SplattingSettings settings = settings_dict.get<CudaRasterizer::SplattingSettings>();
 		CudaRasterizer::DebugVisualizationData debug_data = debug_dict.get<CudaRasterizer::DebugVisualizationData>();
+
+		if(settings.blend_extra_features != extra_features.size(1)) throw std::runtime_error("Incompatible extra features dimension in settings and extra features provided");
 
 		rendered = CudaRasterizer::Rasterizer::forward(
 			geomFunc,
@@ -115,6 +118,7 @@ RasterizeGaussiansCUDA(
 			W, H,
 			settings,
 			debug_data,
+			extra_features.contiguous().data<float>(),
 			means3D.contiguous().data<float>(),
 			sh.contiguous().data_ptr<float>(),
 			colors.contiguous().data<float>(),
@@ -142,7 +146,7 @@ RasterizeGaussiansCUDA(
 	return std::make_tuple(rendered, out_color, radii, max_weights, geomBuffer, binningBuffer, imgBuffer);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
 	const torch::Tensor &background,
 	const torch::Tensor &means3D,
@@ -152,6 +156,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	const torch::Tensor &scales,
 	const torch::Tensor &rotations,
 	const torch::Tensor &confidences,
+	const torch::Tensor &extra_features,
 	const float scale_modifier,
 	const torch::Tensor &cov3D_precomp,
 	const torch::Tensor& view2gaussian_precomp,
@@ -184,6 +189,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 		M = sh.size(1);
 	}
 
+	CudaRasterizer::SplattingSettings settings = settings_dict.get<CudaRasterizer::SplattingSettings>();
+
+	if(extra_features.size(1) != settings.blend_extra_features) throw std::runtime_error("Error ");
+
 	torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
 	torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
 	torch::Tensor dL_dcolors = torch::zeros({P, NUM_CHANNELS}, means3D.options());
@@ -194,18 +203,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	torch::Tensor dL_dscales = torch::zeros({P, 3}, means3D.options());
 	torch::Tensor dL_drotations = torch::zeros({P, 4}, means3D.options());
 	torch::Tensor dL_dconfidences = torch::zeros({P, 1}, means3D.options());
+	torch::Tensor dL_dextra_features = torch::zeros({settings.blend_extra_features == 0 ? 0 : P, extra_features.size(1)}, means3D.options());
 	torch::Tensor dL_dview2gaussian = torch::zeros({P, VIEW2GAUSSIAN_OFFSET}, means3D.options());
 
 
-	CudaRasterizer::SplattingSettings settings = settings_dict.get<CudaRasterizer::SplattingSettings>();
 
 
 	if (P != 0)
 	{
 		CudaRasterizer::Rasterizer::backward(P, degree, M, R,
 											 background.contiguous().data<float>(),
-											 W, H,
+											 W, H, 
 											 settings,
+											 extra_features.contiguous().data<float>(),
 											 means3D.contiguous().data<float>(),
 											 sh.contiguous().data<float>(),
 											 opacities.contiguous().data<float>(),
@@ -240,11 +250,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 											 dL_dscales.contiguous().data<float>(),
 											 dL_drotations.contiguous().data<float>(),
 											 dL_dconfidences.contiguous().data<float>(),
+											 dL_dextra_features.contiguous().data<float>(),
 											 dL_dview2gaussian.contiguous().data<float>(),
 											 debug);
 	}
 
-	return std::make_tuple(dL_dmeans2D,  dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dconfidences, dL_dview2gaussian);
+	return std::make_tuple(dL_dmeans2D,  dL_dcolors, dL_dopacity, dL_dmeans3D, dL_dcov3D, dL_dsh, dL_dscales, dL_drotations, dL_dconfidences, dL_dextra_features, dL_dview2gaussian);
 }
 
 torch::Tensor markVisible(

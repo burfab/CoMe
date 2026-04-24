@@ -11,7 +11,6 @@ from arguments import SplattingSettings, ModelParams, PipelineParams, get_combin
 from gaussian_renderer import GaussianModel
 import numpy as np
 import trimesh
-import tetranerf
 from tetranerf.utils.extension import cpp
 from utils.tetmesh import marching_tetrahedra
 import open3d as o3d

@@ -1014,6 +1014,8 @@ ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatt
 	}
 }
 
+
+
 void FORWARD::render_opacity(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
@@ -1752,3 +1754,5 @@ void FORWARD::PreprocessPoints(int PN, int D, int M,
 	//	printf("2D Point: %f %f\n", points2D[i].x, points2D[i].y);
 	//}
 }
+
+

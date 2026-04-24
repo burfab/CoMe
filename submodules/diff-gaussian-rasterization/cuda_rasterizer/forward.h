@@ -100,6 +100,35 @@ namespace FORWARD
 		float* out_color,
 		float* gt_color);
 
+	template <int32_t N_EXTRA_FEATURES> class ExtraFeaturesBlender {
+	// use a class for less clutter
+	public:
+          void blend(const dim3 grid, dim3 block, const uint2 *ranges,
+                     const SplattingSettings splatting_settings,
+                     const uint32_t *point_list, int W, int H, float focal_x,
+                     float focal_y, const float *extra_features,
+                     const float2 *means2D, const float *view2gaussian,
+                     const float *means3D, const float4 *cov3D_inv,
+                     const float *projmatrix_inv, const glm::vec3 *cam_pos,
+                     const float *colors, // = feature_ptr
+                     const float *depths, const float4 *conic_opacity,
+                     const float *bg_color,
+                     DebugVisualizationData &debugVisualization,
+                     float *out_color);
+        };
+
+extern template class ExtraFeaturesBlender<1>;
+extern template class ExtraFeaturesBlender<2>;
+extern template class ExtraFeaturesBlender<3>;
+extern template class ExtraFeaturesBlender<4>;
+extern template class ExtraFeaturesBlender<6>;
+extern template class ExtraFeaturesBlender<8>;
+extern template class ExtraFeaturesBlender<12>;
+extern template class ExtraFeaturesBlender<16>;
+
+
+
+
 	// Main rasterization method.
 	void render_opacity(
 		const dim3 grid, dim3 block,

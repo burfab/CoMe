@@ -25,6 +25,7 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, SplattingSettings, OptimizationParams, SplattingSettings, MeshingParams
 from utils.depth_utils import depths_to_points, depth_to_normal, central_diff
 from utils.vis_utils import gui_visualize, export_image
+from utils import segmentation_utils
 from scene.gaussian_model import build_scaling_rotation
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
 from decoupled_fused_ssim import fused_ssim
@@ -184,10 +185,17 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             splat_args.render_opacity = True
 
         gt_image = viewpoint_cam.original_image.cuda()
+        
+        gt_segmentation = viewpoint_cam.seg_mask.cuda()
         # not sure we need detach here
+        
+        render_segmentation = iteration % opt.contrastive_interval or iteration % opt.spatial_similarity_interval
+        splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
+        
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach())
         rendering, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
+        opacity = rendering[7]
         image = rendering[:3, :, :]
         
         # custom variance losses
@@ -198,6 +206,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         confidence_scaled_rgb_loss_mean = None
         confidence_log_term_mean = None
         confidence_neg_alpha_log_term_mean = None
+        
 
         # TODO: don't mean the SSIM
         if mesh.color_confidence and iteration >= mesh.color_confidence_from_iter:  
@@ -224,7 +233,30 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # TODO: confidence into a CUDA kernel for speed
         else:
             rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx)
+            
+            
+        seg_loss_obj = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
+        seg_loss_obj_3d = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
+        #Segmentation Loss
+        if render_segmentation:
+            gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
+            feature_map = rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:]
+            assert feature_map.shape[0] == gaussians.segmentation_dimension
+            
+            # Clustering Loss
+            if iteration % opt.contrastive_interval == 0:
+                feature_map = feature_map.permute(1, 2, 0)
+                feature_map = feature_map / (feature_map.norm(dim=-1, keepdim=True) + 1e-9)
+                gt_segmasks = gt_segmask.long()
+                id_unique_list, n_i_list = segmentation_utils.get_unique_id_list(gt_segmasks, opt.min_pixnum)
+                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, dim_features=gaussians.segmentation_dimension, lambda_val=opt.contrastive_lambda)
 
+            # Spatial-similarity Loss
+            if iteration % opt.spatial_similarity_interval == 0:
+                features3d = gaussians.get_extra_feature("fg")
+                seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians._xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
+            
+            
         # depth distortion regularization
         distortion_map = rendering[8, :, :]
         distortion_loss = distortion_map.mean()
@@ -260,7 +292,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 
         lambda_opacity_field = mesh.lambda_opacity_field if iteration >= mesh.distortion_from_iter else 0.0
-        opacity = rendering[7]
         opa_loss = (opacity - 0.5)**2
 
         #Ll1opacity_smoothness = central_diff(rendering[7][..., None]) * torch.exp(-nabla_I)
@@ -285,7 +316,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 opa_loss             * lambda_opacity_field + \
                 extent_loss          * lambda_extent + \
                 variance_loss        * lambda_variance + \
-                normal_variance_loss * lambda_normal_variance
+                normal_variance_loss * lambda_normal_variance + \
+                seg_loss_obj + \
+                seg_loss_obj_3d
 
         loss.backward()
         iter_end.record()
@@ -323,6 +356,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     confidence_scaled_rgb_loss_mean=confidence_scaled_rgb_loss_mean,
                     confidence_log_term_mean=confidence_log_term_mean,
                     confidence_neg_alpha_log_term_mean=confidence_neg_alpha_log_term_mean,
+                    seg_loss_obj_3d=None if iteration % opt.spatial_similarity_interval != 0 else seg_loss_obj_3d,
+                    seg_loss_obj= None if iteration % opt.contrastive_interval != 0 else seg_loss_obj
                 )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -431,6 +466,8 @@ def training_report(
     confidence_scaled_rgb_loss_mean=None,
     confidence_log_term_mean=None,
     confidence_neg_alpha_log_term_mean=None,
+    seg_loss_obj = None,
+    seg_loss_obj_3d = None,
 ):
     if tb_writer:
         tb_writer.add_scalar("train_loss/rgb_loss", rgb_loss.item(), iteration)
@@ -505,6 +542,20 @@ def training_report(
                 confidence_neg_alpha_log_term_mean.item(),
                 iteration,
             )
+            
+        if seg_loss_obj is not None:
+            tb_writer.add_scalar(
+                "segmentation_terms/loss_obj",
+                seg_loss_obj.item(),
+                iteration,
+            )
+        if seg_loss_obj_3d is not None:
+            tb_writer.add_scalar(
+                "segmentation_terms/loss_obj_3d",
+                seg_loss_obj_3d.item(),
+                iteration,
+            )
+            
 
 if __name__ == "__main__":
     # Set up command line argument parser

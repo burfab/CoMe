@@ -194,6 +194,7 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025
         self.confidence_lr = 0.00025
+        self.segmentation_lr = 1e-3
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001
@@ -205,6 +206,18 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.random_background = False
+        
+        self.contrastive_interval = 50
+        self.contrastive_lambda = 1e-6
+        self.min_pixnum = 100
+        self.spatial_similarity_interval = 100
+        self.k_pull = 2
+        self.k_push = 5
+        self.lambda_pull = 0.05
+        self.lambda_push = 0.15
+        self.reg_max_points = 300000
+        self.reg_sample_size = 1000  
+        
         
         super().__init__(parser, "Optimization Parameters")
 
@@ -254,6 +267,8 @@ class MeshingParams(ParamGroup):
         self.cap_max = -1
         self.noise_lr = 5e5
         self.min_opacity = 1./255.
+        #My Losses
+        self.lambda_background_loss = 0.05
         
         super().__init__(parser, "Meshing Parameters")
 

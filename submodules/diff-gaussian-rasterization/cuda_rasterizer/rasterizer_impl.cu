@@ -28,6 +28,7 @@
 namespace cg = cooperative_groups;
 
 #include "auxiliary.h"
+#include "extra_features.h"
 #include "forward.h"
 #include "backward.h"
 #include "stopthepop/stopthepop_common.cuh"
@@ -393,6 +394,7 @@ int CudaRasterizer::Rasterizer::forward(
 	const int width, int height,
 	const SplattingSettings splatting_settings,
 	DebugVisualizationData& debugVisualization,
+	const float* extra_features,
 	const float* means3D,
 	const float* shs,
 	const float* colors_precomp,
@@ -590,6 +592,72 @@ int CudaRasterizer::Rasterizer::forward(
 				out_color), debug)					
 		}
 
+		if (splatting_settings.blend_extra_features > 0 && 
+			(splatting_settings.sort_settings.sort_mode == SortMode::HIERARCHICAL || (splatting_settings.sort_settings.sort_mode == SortMode::GLOBAL && debugVisualization.type == DebugVisualization::Opacity)) 
+		) {
+		#define BLEND_ARGS\
+				tile_grid, block,\
+				imgState.ranges,\
+				splatting_settings,\
+				binningState.point_list,\
+				width, height,\
+				focal_x, focal_y,\
+				extra_features, \
+				geomState.means2D,\
+				view2gaussian,\
+				means3D,\
+				geomState.cov3D_inv,\
+				inv_viewprojmatrix,\
+				(glm::vec3*)cam_pos,\
+				feature_ptr,\
+				geomState.depths,\
+				geomState.conic_opacity,\
+				background,\
+				debugVisualization,\
+				out_color
+
+          switch (splatting_settings.blend_extra_features) {
+          case 1:
+            CHECK_CUDA(ExtraFeaturesBlender<1>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 2:
+            CHECK_CUDA(ExtraFeaturesBlender<2>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 3:
+            CHECK_CUDA(ExtraFeaturesBlender<3>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 4:
+            CHECK_CUDA(ExtraFeaturesBlender<4>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 6:
+            CHECK_CUDA(ExtraFeaturesBlender<6>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 8:
+            CHECK_CUDA(ExtraFeaturesBlender<8>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 12:
+            CHECK_CUDA(ExtraFeaturesBlender<12>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+          case 16:
+            CHECK_CUDA(ExtraFeaturesBlender<16>().blendForward(BLEND_ARGS),
+                       debug)
+            break;
+			default:
+			throw std::runtime_error("Unsupported number of extra features");
+          }
+		  #undef BLEND_ARGS
+
+
+	}
+
+
 	timer();
 
 	std::vector<std::pair<std::string, float>> timings;
@@ -624,6 +692,7 @@ void CudaRasterizer::Rasterizer::backward(
 	const float* background,
 	const int width, int height,
 	const SplattingSettings splatting_settings,
+	const float *extra_features,
 	const float* means3D,
 	const float* shs,
     const float* opacities,
@@ -657,6 +726,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dscale,
 	float* dL_drot,
 	float* dL_dconfidences,
+	float* dL_dextra_features,
 	float* dL_dview2gaussian,
 	bool debug)
 {
@@ -681,6 +751,70 @@ void CudaRasterizer::Rasterizer::backward(
 	// If we were given precomputed colors and not SHs, use them.
 	const float* color_ptr = (colors_precomp != nullptr) ? colors_precomp : geomState.rgb;
 	const float* view2gaussian_ptr = (view2gaussian_precomp != nullptr) ? view2gaussian_precomp : geomState.view2gaussian;
+	
+	if (splatting_settings.blend_extra_features > 0 && (splatting_settings.sort_settings.sort_mode == SortMode::HIERARCHICAL)) 
+	{
+		#define BLEND_ARGS\
+			tile_grid, block,\
+			imgState.ranges,\
+			splatting_settings,\
+			binningState.point_list,\
+			width, height,\
+			focal_x, focal_y,\
+			background,\
+			extra_features,\
+			geomState.means2D,\
+			geomState.cov3D_inv,\
+			inv_viewprojmatrix,\
+			(glm::vec3*)cam_pos,\
+			geomState.conic_opacity,\
+			view2gaussian_ptr,\
+			viewmatrix,\
+			imgState.accum_alpha,\
+			imgState.n_contrib,\
+			pixel_colors,\
+			dL_dpix,\
+			dL_dextra_features
+
+          switch (splatting_settings.blend_extra_features) {
+          case 1:
+            CHECK_CUDA(ExtraFeaturesBlender<1>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 2:
+            CHECK_CUDA(ExtraFeaturesBlender<2>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 3:
+            CHECK_CUDA(ExtraFeaturesBlender<3>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 4:
+            CHECK_CUDA(ExtraFeaturesBlender<4>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 6:
+            CHECK_CUDA(ExtraFeaturesBlender<6>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 8:
+            CHECK_CUDA(ExtraFeaturesBlender<8>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 12:
+            CHECK_CUDA(ExtraFeaturesBlender<12>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+          case 16:
+            CHECK_CUDA(ExtraFeaturesBlender<16>().blendBackward(BLEND_ARGS),
+                       debug)
+            break;
+			default:
+			throw std::runtime_error("Unsupported number of extra features");
+          }
+		  #undef BLEND_ARGS
+		}
+
 	CHECK_CUDA(BACKWARD::render(
 		tile_grid, block,
 		imgState.ranges,

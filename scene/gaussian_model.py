@@ -192,9 +192,13 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
 
         self.rotation_activation = torch.nn.functional.normalize
+        
+        self.segmentation_activation = torch.exp
+        self.segmentation_inverse_activation = torch.log
 
 
     def __init__(self, sh_degree : int, use_SBs : bool = False):
+        self.segmentation_dimension = 8
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
         self._xyz = torch.empty(0)
@@ -222,6 +226,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._confidence,
+            self._segmentation,
             self._opacity,
             self.max_radii2D,
             self.xyz_gradient_accum,
@@ -239,6 +244,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._confidence,
+        self._segmentation,
         self._opacity,
         self.max_radii2D, 
         xyz_gradient_accum, 
@@ -295,6 +301,10 @@ class GaussianModel:
     @property
     def get_confidence(self):
         return self._confidence
+    
+    @property
+    def get_segmentation(self):
+        return self.segmentation_activation(self._segmentation)
 
     @torch.no_grad()
     def compute_3D_filter(self, cameras, CUDA=True):
@@ -418,6 +428,12 @@ class GaussianModel:
         self._confidence = nn.Parameter(
             torch.zeros_like(self._opacity)
         ).requires_grad_(True)
+        #per-Gaussian segmentation
+        self._segmentation = nn.Parameter(
+            torch.rand((fused_point_cloud.shape[0], self.segmentation_dimension)).to(self._opacity.device).float()
+        ).requires_grad_(True)
+        
+        
 
     def training_setup(self, training_args, mesh_args, appearance_net):
         self.percent_dense = training_args.percent_dense
@@ -434,6 +450,7 @@ class GaussianModel:
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"},
             {'params': [self._confidence], 'lr': training_args.confidence_lr, "name": "confidence"},
+            {'params': [self._segmentation], 'lr': training_args.segmentation_lr, "name": "segmentation"},
 
         ]
         if appearance_net is not None:
@@ -489,6 +506,7 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
         l.append('confidence')
+        l.append('segmentation')
         l.append('filter_3D')
         return l
 
@@ -508,11 +526,12 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
         confidence = self._confidence.detach().cpu().numpy()
+        segmentation = self._segmentation.detach().cpu().numpy()
         filter_3D = self.filter_3D.detach().cpu().numpy()
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, confidence, filter_3D), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, confidence, segmentation, filter_3D), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -609,6 +628,11 @@ class GaussianModel:
         extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
         extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
         self.use_SBs = len(extra_f_names) in {12, 18, 24, 30}  
+        
+        segmentation_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("segmentation_")]
+        segmentation_names = sorted(segmentation_names, key = lambda x: int(x.split('_')[-1]))
+        self.segmentation_dimension = len(segmentation_names)
+        
 
         filter_3D = None
         if "filter_3D" in plydata.elements[0]:
@@ -620,7 +644,14 @@ class GaussianModel:
         if "confidence" in plydata.elements[0]:
             confidence = np.asarray(plydata.elements[0]["confidence"])[..., np.newaxis]
             self._confidence = nn.Parameter(torch.tensor(confidence, dtype=torch.float, device="cuda").requires_grad_(True))
-
+        
+        segmentation = None if self.segmentation_dimension == 0 else np.zeros((xyz.shape[0], self.segmentation_dimension))
+        for idx, attr_name in enumerate(segmentation_names):
+            segmentation[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            
+            
+        if self.segmentation_dimension > 0:
+            self._segmentation = nn.Parameter(torch.tensor(segmentation, dtype=torch.float, device="cuda").requires_grad_(True))
 
         if self.use_SBs:
             features_dc = np.zeros((xyz.shape[0], 3))        
@@ -638,6 +669,8 @@ class GaussianModel:
         
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            
+            
         # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         if self.use_SBs:
             features_extra = features_extra.reshape((features_extra.shape[0], len(extra_f_names)))
@@ -718,6 +751,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._confidence = optimizable_tensors["confidence"]
+        self._segmentation = optimizable_tensors["segmentation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
 
@@ -752,14 +786,16 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, reset_params=True):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, reset_params=True):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation,
-        "confidence" : new_confidence}
+        "confidence" : new_confidence,
+        "segmentation" : new_segmentation 
+        }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -769,6 +805,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._confidence = optimizable_tensors["confidence"]
+        self._segmentation = optimizable_tensors["segmentation"]
         if reset_params:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -812,7 +849,8 @@ class GaussianModel:
         
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_confidence = self._confidence[selected_pts_mask].repeat(N,1)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_confidence)
+        new_segmentation = self._segmentation[selected_pts_mask].repeat(N,1)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_confidence, new_segmentation)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -849,7 +887,8 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_confidence = self._confidence[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence)
+        new_segmentation = self._segmentation[selected_pts_mask]
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, abs_grad_for_densification=False, clone_with_sampling=False):
         grads = self.xyz_gradient_accum / self.denom
@@ -903,7 +942,9 @@ class GaussianModel:
             "opacity": self._opacity,
             "scaling" : self._scaling,
             "rotation" : self._rotation,
-            "confidence" : self._confidence}
+            "confidence" : self._confidence,
+            "segmentation" : self._segmentation
+            }
         optimizable_tensors = {}
         for group in self.optimizer.param_groups:
             # handle params for the appearance embedding
@@ -931,6 +972,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"] 
         self._confidence = optimizable_tensors["confidence"]
+        self._segmentation = optimizable_tensors["segmentation"]
         torch.cuda.empty_cache()
         return optimizable_tensors
     

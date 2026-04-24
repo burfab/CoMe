@@ -187,6 +187,7 @@ namespace CudaRasterizer
 		bool detach_alpha_extent;
 		bool include_alpha;
 		bool render_opacity;
+		int blend_extra_features;
 
 		bool consider_max_weight;
     };
@@ -237,6 +238,7 @@ namespace CudaRasterizer
             {"detach_alpha_extent", s.detach_alpha_extent},
             {"include_alpha", s.include_alpha},
             {"render_opacity", s.render_opacity},
+            {"blend_extra_features", s.blend_extra_features},
 
             {"consider_max_weight", s.consider_max_weight},
         };
@@ -275,6 +277,7 @@ namespace CudaRasterizer
         j.at("detach_alpha_extent").get_to(s.detach_alpha_extent);
         j.at("include_alpha").get_to(s.include_alpha);
         j.at("render_opacity").get_to(s.render_opacity);
+        j.at("blend_extra_features").get_to(s.blend_extra_features);
         j.at("consider_max_weight").get_to(s.consider_max_weight);
 
     }
@@ -342,6 +345,7 @@ namespace CudaRasterizer
 			const int width, int height,
 			const SplattingSettings splatting_settings,
 			DebugVisualizationData& debugVisualization,
+			const float* extra_features,
 			const float* means3D,
 			const float* shs,
 			const float* colors_precomp,
@@ -370,6 +374,7 @@ namespace CudaRasterizer
 			const float* background,
 			const int width, int height,
 			const SplattingSettings splatting_settings,
+			const float* extra_features,
 			const float* means3D,
 			const float* shs,
 			const float* opacities,
@@ -403,6 +408,7 @@ namespace CudaRasterizer
 			float* dL_dscale,
 			float* dL_drot,
 			float* dL_dconfidences,
+			float* dL_dextra_features,
 			float* dL_dview2gaussian,
 			bool debug);
 		
