@@ -130,6 +130,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 if custom_cam != None:
                     with torch.no_grad():
                         debugVis = DebugVisualization(**message["debug_data"])
+                        render_segmentation = message["custom_message"] == "segmentation"
+                        splat_args.blend_extra_features = gaussians.segmentation_dimension
                         net_image = render(custom_cam, gaussians, pipe, background, message["scaling_modifier"], splat_args=splat_args, debugVis=debugVis)["render"]
 
                     if debugVis.type == 0 or debugVis.type == DebugVisualizationType.CONFIDENCE:
@@ -143,9 +145,10 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                             render=net_image[:3],
                             color_variance=net_image[11:12],
                             normal_variance=net_image[12:13],
-                            other_args=message
+                            other_args=message,
+                            segmentation=None if not render_segmentation else net_image[13:],
                         )
-                        if message["render_appearance_embedding"]:
+                        if message["render_appearance_embedding"] or message["custom_message"] == "appearance":
                             image = net_image[:3]
                             image = appearance_embedding.appearance_mapping(image, message["camera_idx"])
                     else:

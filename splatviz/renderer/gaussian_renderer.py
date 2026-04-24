@@ -40,6 +40,7 @@ class GaussianRenderer(Renderer):
         background_color,
         video_cams=[],
         scaling_modifier=1,
+        custom_message:str="",
         img_normalize=False,
         use_splitscreen=False,
         highlight_border=False,

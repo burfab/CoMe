@@ -24,6 +24,7 @@ class RenderWidget(Widget):
         self.render_appearance_embedding = False
         self.use_mouse_pos = False
         self.scaling_modifier = 1
+        self.custom_message:str = ""
         self.depth_min_max = [0, 10000]
         self.resolution = 768 # start at a lower resolution for ssh-streaming
         self.background_color = torch.tensor([0.0, 0.0, 0.0])
@@ -56,6 +57,8 @@ class RenderWidget(Widget):
             _changed, self.resolution = imgui.input_int("##Resolution", self.resolution, 64)
             
             _, self.scaling_modifier = imgui.slider_float("Scaling Modifier", self.scaling_modifier, 0.001, 1.0)
+            
+            _, self.custom_message = imgui.input_text("Custom Message", self.custom_message)
             
             # max sh degree (to visualize diffuse)
             _, self.sh_degree = imgui.combo("Max SH Degree", self.sh_degree, ["0","1","2","3"])
@@ -275,6 +278,7 @@ class RenderWidget(Widget):
         viz.args.depth_min_max = self.depth_min_max
         viz.args.manual_normalization = self.manual_normalization
         viz.args.scaling_modifier = self.scaling_modifier
+        viz.args.custom_message = self.custom_message
         viz.args.sh_degree = self.sh_degree
         viz.args.render_appearance_embedding = self.render_appearance_embedding
         # debugging appearance embedding

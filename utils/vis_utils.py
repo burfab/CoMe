@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import matplotlib
 from utils.depth_utils import depth_to_normal, central_diff
+from utils import segmentation_utils
 from torchvision.utils import save_image
 from diff_gaussian_rasterization import DebugVisualizationType
 
@@ -90,6 +91,7 @@ def gui_visualize(
     color_variance,
     normal_variance,
     other_args,
+    segmentation=None
 ):
     indict = lambda key: key in other_args and str(other_args[key]).lower() == "true"
     
@@ -102,7 +104,11 @@ def gui_visualize(
     render_confidence = indict("render_confidence")
     render_color_variance = indict("render_color_variance")
     render_normal_variance = indict("render_normal_variance")
-    if render_alpha:
+    render_segmentation = other_args["custom_message"] == "segmentation"
+    if render_segmentation:
+        image = segmentation_utils.features_to_rgb_pca(segmentation)
+        return image
+    elif render_alpha:
         # magma colormap
         image = alpha.squeeze()
         cmap = matplotlib.colormaps.get_cmap('magma')

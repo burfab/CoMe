@@ -1,5 +1,50 @@
 import torch
 
+
+def features_to_rgb_pca(features: torch.Tensor) -> torch.Tensor:
+    """
+    Convert feature map (C, H, W) to RGB image using PCA in PyTorch.
+
+    Args:
+        features: torch.Tensor of shape (C, H, W)
+
+    Returns:
+        rgb_array: uint8 tensor of shape (H, W, 3)
+    """
+    assert features.ndim == 3, f"Expected (C, H, W), got {features.shape}"
+
+    C, H, W = features.shape
+
+    # Normalize each feature vector per pixel
+    # (C, H, W) -> norm over C
+    features = features / (torch.norm(features, dim=0, keepdim=True) + 1e-9)
+
+    # Reshape to (H*W, C)
+    X = features.view(C, -1).T  # (N, C), N = H*W
+
+    # Center data
+    X_mean = X.mean(dim=0, keepdim=True)
+    X_centered = X - X_mean
+
+    # PCA via SVD
+    # X_centered = U S Vh
+    U, S, Vh = torch.linalg.svd(X_centered, full_matrices=False)
+
+    # Take first 3 principal directions
+    components = Vh[:3]  # (3, C)
+
+    # Project to PCA space
+    X_pca = X_centered @ components.T  # (N, 3)
+
+    # Reshape back to image
+    pca_result = X_pca.view(H, W, 3).permute(2,0,1)
+
+    # Normalize to [0, 255]
+    pca_min = pca_result.min()
+    pca_max = pca_result.max()
+    pca_normalized = (pca_result - pca_min) / (pca_max - pca_min + 1e-9)
+    return pca_normalized
+
 #currently bg is 0, i want bg to be 1, and 0 to be at border of currently != 0 segmentations
 def set_bg_to_one_and_class_borders_to_zero(gt_segmask: torch.Tensor) -> torch.Tensor:
     """
