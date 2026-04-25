@@ -15,6 +15,52 @@ import math
 from arguments import ModelParams, PipelineParams, OptimizationParams, SplattingSettings
 from torchvision.utils import save_image
 from utils.vis_utils import apply_depth_colormap
+from utils import segmentation_utils
+import torch.nn.functional as F
+
+def select_diverse_prototypes(features, k):
+    # features: (N, C) already normalized
+
+    selected = torch.zeros(features.shape[0], dtype=torch.bool).cuda()
+
+    # pick first: highest norm (or random)
+    idx = torch.argmax(features.norm(dim=1))
+    selected[idx] = True
+
+    for _ in range(k - 1):
+        selected_feats = features[selected,:]  # (m, C)
+
+        sim = torch.nn.CosineSimilarity(2)(features[~selected], selected_feats.unsqueeze(1))
+        min_dist = (1 - sim).min(dim=0).values  # cosine distance
+
+        idx = torch.argmax(min_dist)
+        features[idx]
+        selected[idx] = True
+
+    return features[selected]  # (k, C)
+
+
+def find_foreground_object(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, splat_args, top_k, min_pixnum=100):
+    render_path = os.path.join(model_path, name, "ours_{}".format(iteration))
+    
+    splat_args.blend_extra_features = gaussians.segmentation_dimension
+    with torch.no_grad():
+        for _, view in enumerate(tqdm(views, desc="Rendering progress")):
+            
+            rendering = render(view, gaussians, pipeline, background, splat_args=splat_args#, kernel_size=kernel_size
+                               )["render"]
+            
+            gt_segmentation = view.seg_mask.cuda()
+            gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
+            gt_segmask = gt_segmask.long()
+            feature_map = rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:]
+            torch.save(feature_map.detach().cpu(), f"/tmp/feats_{view.uid}.pth")
+            torch.save(gt_segmask.detach().cpu(), f"/tmp/gt_{view.uid}.pth")
+            assert feature_map.shape[0] == gaussians.segmentation_dimension
+            
+            
+            
+    splat_args.blend_extra_features = 0
 
         
 def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, splat_args, voxel_size):
@@ -118,6 +164,7 @@ def extract_mesh(dataset : ModelParams, iteration : int, pipeline : PipelinePara
         
         cams = train_cameras
         gaussians.compute_3D_filter(cams)
+        find_foreground_object(dataset.model_path, "test", iteration, cams, gaussians, pipeline, background, kernel_size, splat_args, 15)
         tsdf_fusion(dataset.model_path, "test", iteration, cams, gaussians, pipeline, background, kernel_size, splat_args, voxel_size=voxel_size)
 
 if __name__ == "__main__":

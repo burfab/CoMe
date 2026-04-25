@@ -104,9 +104,14 @@ def gui_visualize(
     render_confidence = indict("render_confidence")
     render_color_variance = indict("render_color_variance")
     render_normal_variance = indict("render_normal_variance")
-    render_segmentation = other_args["custom_message"] == "segmentation"
+    render_segmentation = other_args["custom_message"].startswith("segmentation")
     if render_segmentation:
-        image = segmentation_utils.features_to_rgb_pca(segmentation)
+        if other_args["custom_message"].endswith("_orth"):
+            image = segmentation_utils.features_to_rgb_random_orth_proj(segmentation)
+        elif other_args["custom_message"].endswith("_pca"):
+            image = segmentation_utils.features_to_rgb_pca(segmentation)
+        else:
+            image = segmentation_utils.features_to_rgb_random_orth_proj(segmentation)
         return image
     elif render_alpha:
         # magma colormap

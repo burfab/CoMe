@@ -130,7 +130,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 if custom_cam != None:
                     with torch.no_grad():
                         debugVis = DebugVisualization(**message["debug_data"])
-                        render_segmentation = message["custom_message"] == "segmentation"
+                        render_segmentation = message["custom_message"].startswith("segmentation")
                         splat_args.blend_extra_features = gaussians.segmentation_dimension
                         net_image = render(custom_cam, gaussians, pipe, background, message["scaling_modifier"], splat_args=splat_args, debugVis=debugVis)["render"]
 
@@ -242,7 +242,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         seg_loss_obj_3d = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
         #Segmentation Loss
         if render_segmentation:
-            gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
+            #gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
+            gt_segmask = gt_segmentation+1
             feature_map = rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:]
             assert feature_map.shape[0] == gaussians.segmentation_dimension
             

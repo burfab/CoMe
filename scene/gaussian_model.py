@@ -506,7 +506,8 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
         l.append('confidence')
-        l.append('segmentation')
+        for i in range(self.segmentation_dimension):
+            l.append(f'segmentation_{i}')
         l.append('filter_3D')
         return l
 

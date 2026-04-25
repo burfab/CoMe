@@ -146,7 +146,7 @@ def process_folder(src_dir: Path, dst_dir: Path,recon, cv_cameras, interpolation
             raise IOError(f"Failed to write: {dst_path}")
 
 
-def write_cameras_json(path: Path, recon: pycolmap.Reconstruction, cv_cameras: dict, images_out_dir: Path):
+def write_cameras_json(path: Path, recon: pycolmap.Reconstruction, cv_cameras: dict, images_out_dir: Path, has_segmentation:bool):
     frames = []
     cameras = []
     for _, img in sorted(recon.images.items(), key=lambda kv: kv[1].name):
@@ -169,6 +169,7 @@ def write_cameras_json(path: Path, recon: pycolmap.Reconstruction, cv_cameras: d
             "image": image_name,
             "image_path": f"images/{image_name}",
             "mask_path": f"masks/{image_name}",
+            "segmentation_path": f"segmentation/{image_name}",
             "id": int(ID),
             "R": R_wc.tolist(),
             "T": t_wc.tolist(),
@@ -223,9 +224,14 @@ def main():
 
     images_in = input_dir / "images"
     masks_in = input_dir / "masks"
+    segmentation_in = input_dir / "segmentation"
+    
+    has_segmentation = os.path.exists(segmentation_in)
+        
 
     images_out = output_dir / "images"
     masks_out = output_dir / "masks"
+    segmentation_out = output_dir / "segmentation"
     images_out.mkdir(parents=True, exist_ok=True)
     masks_out.mkdir(parents=True, exist_ok=True)
 
@@ -237,13 +243,19 @@ def main():
 
     process_folder(images_in, images_out, recon,cv_cameras, interpolation=cv2.INTER_LINEAR)
     process_folder(masks_in, masks_out, recon,cv_cameras, interpolation=cv2.INTER_NEAREST)
+    if has_segmentation: 
+        process_folder(segmentation_in, segmentation_out, recon,cv_cameras, interpolation=cv2.INTER_NEAREST)
 
-    write_cameras_json(output_dir / "cameras.json", recon, cv_cameras, images_out)
+    write_cameras_json(output_dir / "cameras.json", recon, cv_cameras, images_out, has_segmentation)
     write_points3D_ply(output_dir / "points3D.ply", recon)
 
     print("Done.")
     print(f"Images:  {images_out}")
     print(f"Masks:   {masks_out}")
+    if has_segmentation: 
+        print(f"Segmentation:   {segmentation_out}")
+    else:
+        print(f"Segmentation:   Not provided")
     print(f"Cameras: {output_dir / 'cameras.json'}")
     print(f"Points:  {output_dir / 'points3D.ply'}")
 

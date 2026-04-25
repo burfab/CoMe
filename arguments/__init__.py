@@ -211,9 +211,9 @@ class OptimizationParams(ParamGroup):
         self.contrastive_lambda = 1e-6
         self.min_pixnum = 100
         self.spatial_similarity_interval = 100
-        self.k_pull = 2
+        self.k_pull = 2 #2
         self.k_push = 5
-        self.lambda_pull = 0.05
+        self.lambda_pull = 0.05 #0.05
         self.lambda_push = 0.15
         self.reg_max_points = 300000
         self.reg_sample_size = 1000  

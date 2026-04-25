@@ -1,5 +1,24 @@
 import torch
 
+FEATURES_RANDOM_ORTH_PROJ = None
+
+def features_to_rgb_random_orth_proj(features: torch.Tensor) -> torch.Tensor:
+    global FEATURES_RANDOM_ORTH_PROJ
+
+    C, M, N = features.shape
+
+    if FEATURES_RANDOM_ORTH_PROJ is None:
+        device = features.device
+
+        Q, _ = torch.linalg.qr(torch.randn(C, C, device=device))
+        FEATURES_RANDOM_ORTH_PROJ = Q[:, :3]  # (C, 3)
+
+    x = features.permute(1, 2, 0).reshape(-1, C)
+    rgb = x @ FEATURES_RANDOM_ORTH_PROJ
+    rgb = rgb.view(M, N, 3).permute(2, 0, 1)
+
+    return rgb
+
 
 def features_to_rgb_pca(features: torch.Tensor) -> torch.Tensor:
     """
@@ -55,8 +74,7 @@ def set_bg_to_one_and_class_borders_to_zero(gt_segmask: torch.Tensor) -> torch.T
     x = gt_segmask.clone()
 
     # Start by turning background into 1
-    out = x.clone()
-    out[x == 0] = 1
+    out = x.clone()+1
 
     # Compare with 4-neighbors
     up    = torch.zeros_like(x, dtype=torch.bool)

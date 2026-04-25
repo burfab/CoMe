@@ -25,11 +25,14 @@ def loadCam(args, id, cam_info, resolution_scale):
     orig_w, orig_h = image.shape[1], image.shape[0]
     
     dir_name = os.path.dirname(os.path.dirname(cam_info.image)) 
-    if os.path.exists(os.path.join(dir_name, "masks")):
-        mask_file = os.path.join(dir_name, "masks", os.path.basename(cam_info.image))
-        segmask = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED) 
-    else:
-        segmask = None
+    
+    for directory in ["segmentation", "masks"]:
+        if os.path.exists(os.path.join(dir_name, directory)):
+            mask_file = os.path.join(dir_name, directory, os.path.basename(cam_info.image))
+            segmask = cv2.imread(mask_file, cv2.IMREAD_UNCHANGED) 
+            break
+        else:
+            segmask = None
 
     if args.resolution in [1, 2, 4, 8]:
         resolution = round(orig_w/(resolution_scale * args.resolution)), round(orig_h/(resolution_scale * args.resolution))
