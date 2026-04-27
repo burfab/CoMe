@@ -79,6 +79,14 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     scene = Scene(dataset, gaussians, MCMC_init=mesh.cap_max != -1)
     trainCameras = scene.getTrainCameras().copy() 
     
+    segmentation_classes_set = set()
+    for c in scene.getTrainCameras():
+        uniques_seg_mask = torch.unique(c.seg_mask.cuda().detach()).cpu().tolist()
+        for seg_class in uniques_seg_mask: segmentation_classes_set.add(seg_class)
+    
+    segmentation_network = segmentation_utils.Segmenter(gaussians.segmentation_dimension, len(segmentation_classes_set)).cuda()
+    segmentation_network_optim = torch.optim.AdamW(segmentation_network.parameters(),opt.segmentation_network_lr, weight_decay=1e-4)
+    
     if mesh.use_vastgaussian_appearance:
         appearance_embedding = VastGaussianAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
     elif mesh.use_ssimdecoupled_appearance:
@@ -88,9 +96,11 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         appearance_embedding = AppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
     gaussians.training_setup(opt, mesh, appearance_embedding)
     if checkpoint:
-        (model_params, first_iter, (_appearance_embedding, _appearance_net)) = torch.load(checkpoint)
+        (model_params, first_iter, (_appearance_embedding, _appearance_net), (_segmentation_network, _segmentation_network_optim)) = torch.load(checkpoint)
         appearance_embedding.restore(_appearance_embedding, _appearance_net)
         gaussians.restore(model_params, opt, mesh, appearance_embedding)
+        segmentation_network = segmentation_utils.Segmenter.from_checkpoint(_segmentation_network)
+        segmentation_network_optim.load_state_dict(_segmentation_network_optim)
         
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -147,6 +157,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                             normal_variance=net_image[12:13],
                             other_args=message,
                             segmentation=None if not render_segmentation else net_image[13:],
+                            segmentation_network = segmentation_network
                         )
                         if message["render_appearance_embedding"] or message["custom_message"] == "appearance":
                             image = net_image[:3]
@@ -188,8 +199,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             splat_args.render_opacity = True
 
         gt_image = viewpoint_cam.original_image.cuda()
-        
-        gt_segmentation = viewpoint_cam.seg_mask.cuda()
         # not sure we need detach here
         
         render_segmentation = iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0
@@ -240,13 +249,18 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             
         seg_loss_obj = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
         seg_loss_obj_3d = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
+        seg_network_loss = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
         #Segmentation Loss
         if render_segmentation:
             #gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
-            gt_segmask = gt_segmentation+1
+            gt_segmentation = viewpoint_cam.seg_mask.cuda().squeeze(0).long()
+            gt_segmask = gt_segmentation
             feature_map = rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:]
             assert feature_map.shape[0] == gaussians.segmentation_dimension
             
+            if iteration >= opt.segmentation_network_first_step:
+                y_seg_network = segmentation_network(torch.clamp_min(feature_map.detach().unsqueeze(0),1e-6).log())
+                seg_network_loss = torch.nn.functional.cross_entropy(y_seg_network , gt_segmask.unsqueeze(0))
             # Clustering Loss
             if iteration % opt.contrastive_interval == 0:
                 feature_map = feature_map.permute(1, 2, 0)
@@ -324,7 +338,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 seg_loss_obj + \
                 seg_loss_obj_3d
 
-        loss.backward()
+        loss.backward(retain_graph=True)
+        seg_network_loss.backward()
+        
         iter_end.record()
 
         with torch.no_grad():
@@ -365,7 +381,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration, appearance_embedding.capture())
+                scene.save(iteration, appearance_embedding.capture(), segmentation_network.capture())
 
             # Densification (AbsGrad or MCMC)
             temp_splat_args = copy.deepcopy(splat_args)
@@ -384,13 +400,17 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # Optimizer step
             if iteration < opt.iterations:
                 gaussians.optimizer.step()
-                gaussians.optimizer.zero_grad(set_to_none = True)
                 
+                if iteration >= opt.segmentation_network_first_step:
+                    segmentation_network_optim.step()
+                
+                gaussians.optimizer.zero_grad(set_to_none = True)
+                segmentation_network_optim.zero_grad(set_to_none = True)
                 densifier.postfix(xyz_lr=xyz_lr)
             
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration, appearance_embedding.capture()), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save((gaussians.capture(), iteration, appearance_embedding.capture(), (segmentation_network.capture(), segmentation_network_optim.state_dict())), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     end_event = time.time() 
     

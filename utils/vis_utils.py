@@ -91,7 +91,8 @@ def gui_visualize(
     color_variance,
     normal_variance,
     other_args,
-    segmentation=None
+    segmentation=None,
+    segmentation_network = None
 ):
     indict = lambda key: key in other_args and str(other_args[key]).lower() == "true"
     
@@ -106,7 +107,25 @@ def gui_visualize(
     render_normal_variance = indict("render_normal_variance")
     render_segmentation = other_args["custom_message"].startswith("segmentation")
     if render_segmentation:
-        if other_args["custom_message"].endswith("_orth"):
+        if other_args["custom_message"].find("_class") != -1:
+            image = segmentation_network(torch.clamp_min(segmentation.unsqueeze(0),1e-6).log())
+            image = torch.softmax(image,dim=1)
+            class_idx = other_args["custom_message"][other_args["custom_message"].rindex("s"):]
+            if len(class_idx) == 1: 
+                classes = image.squeeze(0).argmax(dim=0)
+                assert len(classes.shape) == 2
+                cmap = matplotlib.colormaps.get_cmap('tab20')
+                image = torch.tensor(cmap(classes.detach().cpu().numpy()), device="cuda").float().permute(-1,0,1)[:3]  # good for discrete labels
+                return image
+            else: 
+                class_idx = int(class_idx[1:])
+                if class_idx < segmentation.shape[0]:
+                    image = segmentation_network(torch.clamp_min(segmentation.unsqueeze(0),1e-6).log())
+                    image = image[0, class_idx:class_idx+1,...].repeat(3,1,1)
+                    return image
+                else:
+                    return render
+        elif other_args["custom_message"].endswith("_orth"):
             image = segmentation_utils.features_to_rgb_random_orth_proj(segmentation)
         elif other_args["custom_message"].endswith("_pca"):
             image = segmentation_utils.features_to_rgb_pca(segmentation)

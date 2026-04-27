@@ -11,6 +11,7 @@ from gaussian_renderer import GaussianModel
 import numpy as np
 import open3d as o3d
 import open3d.core as o3c
+import cv2
 import math
 from arguments import ModelParams, PipelineParams, OptimizationParams, SplattingSettings
 from torchvision.utils import save_image
@@ -38,32 +39,63 @@ def select_diverse_prototypes(features, k):
         selected[idx] = True
 
     return features[selected]  # (k, C)
-
-
-def find_foreground_object(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, splat_args, top_k, min_pixnum=100):
+    
+    
+def train_segmentation_model(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, splat_args, top_k, min_pixnum=100):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration))
     
     splat_args.blend_extra_features = gaussians.segmentation_dimension
-    with torch.no_grad():
-        for _, view in enumerate(tqdm(views, desc="Rendering progress")):
+    segmenter = segmentation_utils.Segmenter(gaussians.segmentation_dimension, 4).to(gaussians._xyz.device)
+    optim = torch.optim.AdamW(segmenter.parameters(), lr=1e-3, weight_decay=1e-4)
+    batch_size = 1
+    num_iters = 2000
+    display_class = 0
+    cv2.namedWindow("WINDOW_SEGMENTATION", cv2.WINDOW_NORMAL)
+    for i in enumerate(tqdm(range(0, num_iters, batch_size), desc="Segmentation train progress")):
+        inputs = []
+        targets = []
+        for j in range(batch_size):
+            with torch.no_grad():
+                rand_index = random.randint(0, len(views)-1)
+                view = views[rand_index]
+                rendering = render(view, gaussians, pipeline, background, splat_args=splat_args)["render"]
+                gt_segmentation = view.seg_mask.cuda()
+                gt_segmentation = gt_segmentation.detach().long()
+                feature_map = torch.clamp_min(rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:].detach(),1e-6).log()
+                inputs.append(feature_map)
+                targets.append(gt_segmentation.squeeze())
+        
+        y = segmenter(torch.stack(inputs,dim=0))
+        loss = torch.nn.functional.cross_entropy(y, torch.stack(targets, dim=0),reduction="mean", label_smoothing=0.05)
+        loss.backward()
+        print(f"Loss: {loss.item(): 3.5f}   \r", end="")
+        optim.step()
+        optim.zero_grad()
+        
+        preds = torch.nn.functional.softmax(y, dim=1)
+        im = (preds[0, display_class%segmenter.n_classes].detach().cpu().numpy().squeeze() * 255).astype(np.uint8)
+        cv2.imshow("WINDOW_SEGMENTATION", im)
+        
+        key = cv2.waitKey(1)
+        if key == ord(' '): display_class+=1
+        #torch.save(feature_map.detach().cpu(), f"/tmp/feats_{view.uid}.pth")
+        #torch.save(gt_segmask.detach().cpu(), f"/tmp/gt_{view.uid}.pth")
+        assert feature_map.shape[0] == gaussians.segmentation_dimension
             
-            rendering = render(view, gaussians, pipeline, background, splat_args=splat_args#, kernel_size=kernel_size
-                               )["render"]
-            
-            gt_segmentation = view.seg_mask.cuda()
-            gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
-            gt_segmask = gt_segmask.long()
-            feature_map = rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:]
-            torch.save(feature_map.detach().cpu(), f"/tmp/feats_{view.uid}.pth")
-            torch.save(gt_segmask.detach().cpu(), f"/tmp/gt_{view.uid}.pth")
-            assert feature_map.shape[0] == gaussians.segmentation_dimension
-            
-            
+    
+    key = 0
+    while key != 27:
+        key = cv2.waitKey(-1)
+        if key == ord(' '): display_class+=1
+        im = (preds[0, display_class%segmenter.n_classes].detach().cpu().numpy().squeeze() * 255).astype(np.uint8)
+        cv2.imshow("WINDOW_SEGMENTATION", im)
+    cv2.destroyAllWindows()
             
     splat_args.blend_extra_features = 0
+    return segmenter
 
         
-def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, splat_args, voxel_size):
+def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, background, kernel_size, splat_args, voxel_size, seg_network=None):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration))
 
     makedirs(render_path, exist_ok=True)
@@ -84,6 +116,13 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
     
     with torch.no_grad():
         index = 0
+        
+        ignore_class = -1
+        if not seg_network is None: 
+            splat_args.blend_extra_features = gaussians.segmentation_dimension
+            ignore_class = 0
+        
+        
         for _, view in enumerate(tqdm(views, desc="Rendering progress")):
             
             rendering = render(view, gaussians, pipeline, background, splat_args=splat_args#, kernel_size=kernel_size
@@ -94,6 +133,13 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             rgb = rendering[:3, :, :]
             max_depth = torch.max(rendering[6, :, :])
             min_depth = torch.min(rendering[6, :, :])
+            min_depth = torch.min(rendering[6, :, :])
+            
+            if seg_network:
+                feature_map_logits = torch.clamp_min(rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:].detach(),1e-6).log()
+                mask_segmentation = seg_network(feature_map_logits.unsqueeze(0)).squeeze(0).argmax(0,keepdim=True) != ignore_class
+                depth[~mask_segmentation] = 0
+            
             
             save_image(apply_depth_colormap(depth.permute(1,2,0), None, min_depth, max_depth).permute(-1,0,1), f'depths/out_depth{index}.png')
             save_image(rgb, f'depths/rgb_{index}.png')
@@ -101,7 +147,8 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             index += 1
             
             if view.gt_alpha_mask is not None:
-               depth[(view.gt_alpha_mask < ALPHA_THRESH)] = 0
+                assert(False)
+                depth[(view.gt_alpha_mask < ALPHA_THRESH)] = 0
             
             depth[(alpha < ALPHA_THRESH)] = 0
             
@@ -146,6 +193,8 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             
 def extract_mesh(dataset : ModelParams, iteration : int, pipeline : PipelineParams, splat_args, voxel_size: float):
     with torch.no_grad():
+        seg_network_path = os.path.join(os.path.join(dataset.model_path, "point_cloud", f"iteration_{iteration}", "segmentation_network.pth"))
+        seg_network = segmentation_utils.Segmenter.from_checkpoint(torch.load(seg_network_path)).cuda()
         dataset.init_type = "sfm"
         dataset.depths = ""
         gaussians = GaussianModel(dataset.sh_degree)
@@ -164,8 +213,7 @@ def extract_mesh(dataset : ModelParams, iteration : int, pipeline : PipelinePara
         
         cams = train_cameras
         gaussians.compute_3D_filter(cams)
-        find_foreground_object(dataset.model_path, "test", iteration, cams, gaussians, pipeline, background, kernel_size, splat_args, 15)
-        tsdf_fusion(dataset.model_path, "test", iteration, cams, gaussians, pipeline, background, kernel_size, splat_args, voxel_size=voxel_size)
+        tsdf_fusion(dataset.model_path, "test", iteration, cams, gaussians, pipeline, background, kernel_size, splat_args, voxel_size=voxel_size, seg_network=seg_network)
 
 if __name__ == "__main__":
     # Set up command line argument parser

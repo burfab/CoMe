@@ -19,6 +19,36 @@ def features_to_rgb_random_orth_proj(features: torch.Tensor) -> torch.Tensor:
 
     return rgb
 
+class Segmenter(torch.nn.Module):
+    def __init__(self, feature_dim, n_classes, hidden_dim=16):
+        super().__init__()
+        self.W0 = torch.nn.Conv2d(feature_dim, hidden_dim, kernel_size=1, padding=0, stride=1)
+        self.A0 = torch.nn.ReLU()
+        self.W1 = torch.nn.Conv2d(hidden_dim+feature_dim, n_classes, kernel_size=1, padding=0, stride=1)
+        self.n_classes = n_classes
+        self.hidden_dim = hidden_dim
+        self.feature_dim = feature_dim
+    def forward(self, feature_map):
+        x = (self.W0(feature_map))
+        x = (self.A0(x))
+        x = (self.W1(torch.cat((x,feature_map),dim=1)))
+        return x# x.T.reshape((self.n_classes, *feature_map.shape[1:]))
+    
+    @classmethod
+    def from_checkpoint(cls, d, device="cuda"):
+        model = cls(d["feature_dim"], d["n_classes"], d["hidden_dim"]).to(device)
+        model.load_state_dict(d["state_dict"])
+        return model
+        
+    def capture(self):
+        return {
+            "state_dict": {k: v.cpu() for k, v in self.state_dict().items()},
+            "feature_dim": self.feature_dim,
+            "n_classes": self.n_classes,
+            "hidden_dim": self.hidden_dim,
+        }
+
+
 
 def features_to_rgb_pca(features: torch.Tensor) -> torch.Tensor:
     """
@@ -272,11 +302,6 @@ def variance_in_feature_clusters(segmask, features, id_unique_list, dim_features
     
 def get_unique_id_list(segmask, min_pixnum):
     id_unique_list, n_i_list_ = torch.unique(segmask, return_counts=True)
-
-    # Remove id 0 (related to borders)        
-    if id_unique_list[0] == 0:
-        id_unique_list = id_unique_list[1:]
-        n_i_list_ = n_i_list_[1:]
 
     # Remove small clusters
     id_unique_list = id_unique_list[n_i_list_ > min_pixnum]

@@ -1725,7 +1725,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				sum_D_i += D_i;
 			}
 			//// we need to divide by T, because later this is multiplied by T
+			#define DETACH_ALPHA_COLOR_VARIANCE
+			#ifndef DETACH_ALPHA_COLOR_VARIANCE
 			dL_dalpha += (variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_variance))/(blend_data.T+0.000001f);
+			#endif //DETACH_ALPHA_COLOR_VARIANCE
 			// +++++++++Variance Loss ++++++++++
 
 			// confidence gradient
@@ -1775,7 +1778,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				blend_data.remaining_normal_variance -= dchannel_dcolor * D_i;
 				sum_D_i += D_i;
 			}
+
+			#define DETACH_ALPHA_NORMAL_VARIANCE
+			#ifndef DETACH_ALPHA_NORMAL_VARIANCE
 			dL_dalpha += (normal_variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_normal_variance))/(blend_data.T+0.000001f);
+			#endif //DETACH_ALPHA_NORMAL_VARIANCE
 			// +++++++++ Normal Variance Loss ++++++++++
 			
 			// float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + 1e-7);

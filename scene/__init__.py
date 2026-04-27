@@ -98,13 +98,15 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, MCMC_init=MCMC_init)
 
-    def save(self, iteration, appearance_embedding):
+    def save(self, iteration, appearance_embedding, segmentation_network):
         import torch
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
         try:
             with open(os.path.join(point_cloud_path, "appearance_embedding.pth"), 'wb') as file:
                 torch.save(appearance_embedding, file)
+            with open(os.path.join(point_cloud_path, "segmentation_network.pth"), 'wb') as file:
+                torch.save(segmentation_network, file)
         except Exception as e:
             print(f"Error saving appearance embedding: {e}")
 
