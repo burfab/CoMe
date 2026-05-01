@@ -107,8 +107,9 @@ def gui_visualize(
     render_normal_variance = indict("render_normal_variance")
     render_segmentation = other_args["custom_message"].startswith("segmentation")
     if render_segmentation:
+        segmentation = torch.clamp_min(segmentation,1e-6).log()
         if other_args["custom_message"].find("_class") != -1:
-            image = segmentation_network(torch.clamp_min(segmentation.unsqueeze(0),1e-6).log())
+            image = segmentation_network(segmentation.unsqueeze(0))
             image = torch.softmax(image,dim=1)
             class_idx = other_args["custom_message"][other_args["custom_message"].rindex("s"):]
             if len(class_idx) == 1: 
@@ -120,7 +121,7 @@ def gui_visualize(
             else: 
                 class_idx = int(class_idx[1:])
                 if class_idx < segmentation.shape[0]:
-                    image = segmentation_network(torch.clamp_min(segmentation.unsqueeze(0),1e-6).log())
+                    image = segmentation_network(segmentation.unsqueeze(0))
                     image = image[0, class_idx:class_idx+1,...].repeat(3,1,1)
                     return image
                 else:
@@ -181,12 +182,14 @@ def gui_visualize(
         depth_normal, _ = depth_to_normal(render_cam, depth)
         
         # to view space
-        w2c = render_cam.world_view_transform[:3,:3]
-        depth_normal = depth_normal @ w2c
+        view_space_normal = True
+        if view_space_normal:
+            w2c = render_cam.world_view_transform[:3,:3]
+            depth_normal = depth_normal @ w2c
         
         depth_normal = depth_normal.permute(2, 0, 1)
         
-        return (depth_normal + 1) / 2
+        return (-depth_normal + 1) / 2
     elif render_normal:
         normals_normalized = -torch.nn.functional.normalize(normal, p=2, dim=0)
         return (normals_normalized + 1) / 2

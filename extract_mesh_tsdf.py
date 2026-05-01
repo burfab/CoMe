@@ -117,10 +117,10 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
     with torch.no_grad():
         index = 0
         
-        ignore_class = -1
+        ignore_classes = []
         if not seg_network is None: 
             splat_args.blend_extra_features = gaussians.segmentation_dimension
-            ignore_class = 0
+            ignore_classes = [0,2]
         
         
         for _, view in enumerate(tqdm(views, desc="Rendering progress")):
@@ -137,8 +137,10 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             
             if seg_network:
                 feature_map_logits = torch.clamp_min(rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:].detach(),1e-6).log()
-                mask_segmentation = seg_network(feature_map_logits.unsqueeze(0)).squeeze(0).argmax(0,keepdim=True) != ignore_class
-                depth[~mask_segmentation] = 0
+                segmentation = seg_network(feature_map_logits.unsqueeze(0)).squeeze(0).argmax(0,keepdim=True)
+                for ignore_class in ignore_classes:
+                    mask_segmentation = segmentation != ignore_class
+                    depth[~mask_segmentation] = 0
             
             
             save_image(apply_depth_colormap(depth.permute(1,2,0), None, min_depth, max_depth).permute(-1,0,1), f'depths/out_depth{index}.png')

@@ -41,6 +41,7 @@ class GaussianRenderer(Renderer):
         video_cams=[],
         scaling_modifier=1,
         custom_message:str="",
+        deform_time_point:float=-1.0,
         img_normalize=False,
         use_splitscreen=False,
         highlight_border=False,

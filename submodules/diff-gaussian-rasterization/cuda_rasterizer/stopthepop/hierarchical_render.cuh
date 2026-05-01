@@ -1725,7 +1725,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				sum_D_i += D_i;
 			}
 			//// we need to divide by T, because later this is multiplied by T
-			#define DETACH_ALPHA_COLOR_VARIANCE
+			//#define DETACH_ALPHA_COLOR_VARIANCE
 			#ifndef DETACH_ALPHA_COLOR_VARIANCE
 			dL_dalpha += (variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_variance))/(blend_data.T+0.000001f);
 			#endif //DETACH_ALPHA_COLOR_VARIANCE
@@ -1779,7 +1779,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				sum_D_i += D_i;
 			}
 
-			#define DETACH_ALPHA_NORMAL_VARIANCE
+			//#define DETACH_ALPHA_NORMAL_VARIANCE
 			#ifndef DETACH_ALPHA_NORMAL_VARIANCE
 			dL_dalpha += (normal_variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_normal_variance))/(blend_data.T+0.000001f);
 			#endif //DETACH_ALPHA_NORMAL_VARIANCE

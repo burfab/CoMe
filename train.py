@@ -26,6 +26,7 @@ from arguments import ModelParams, PipelineParams, SplattingSettings, Optimizati
 from utils.depth_utils import depths_to_points, depth_to_normal, central_diff
 from utils.vis_utils import gui_visualize, export_image
 from utils import segmentation_utils
+from utils import deform_utils
 from scene.gaussian_model import build_scaling_rotation
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
 from decoupled_fused_ssim import fused_ssim
@@ -83,9 +84,34 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     for c in scene.getTrainCameras():
         uniques_seg_mask = torch.unique(c.seg_mask.cuda().detach()).cpu().tolist()
         for seg_class in uniques_seg_mask: segmentation_classes_set.add(seg_class)
+        
+    segmentation_prototypes = torch.nn.Parameter(
+        torch.randn(len(segmentation_classes_set), gaussians.segmentation_dimension, device="cuda")
+    )
+
+    with torch.no_grad():
+        segmentation_prototypes.copy_(
+            torch.nn.functional.normalize(segmentation_prototypes, dim=-1)
+        )
     
     segmentation_network = segmentation_utils.Segmenter(gaussians.segmentation_dimension, len(segmentation_classes_set)).cuda()
-    segmentation_network_optim = torch.optim.AdamW(segmentation_network.parameters(),opt.segmentation_network_lr, weight_decay=1e-4)
+    segmentation_network_optim = torch.optim.AdamW(
+        [
+            {"params": segmentation_network.parameters(),
+            "lr": opt.segmentation_network_lr,
+            "weight_decay": 1e-4},
+
+            {"params": [segmentation_prototypes],
+            "lr": 1e-3,
+            "weight_decay": 0.0},   # 👈 no decay here
+        ]
+    )
+    
+    number_views_for_deform_model = np.max([c.uid for c in trainCameras]).item()+1
+    
+    deform_cfg = deform_utils.make_deform_config(gaussians, scene, opt, number_views_for_deform_model)
+    deform_model = deform_utils.DeformModel(deform_cfg) 
+    deform_model.training_setting()
     
     if mesh.use_vastgaussian_appearance:
         appearance_embedding = VastGaussianAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
@@ -96,11 +122,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         appearance_embedding = AppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
     gaussians.training_setup(opt, mesh, appearance_embedding)
     if checkpoint:
-        (model_params, first_iter, (_appearance_embedding, _appearance_net), (_segmentation_network, _segmentation_network_optim)) = torch.load(checkpoint)
-        appearance_embedding.restore(_appearance_embedding, _appearance_net)
+        (model_params, first_iter, (_appearance_embedding), (_segmentation_network, _segmentation_network_optim), _deform_model) = torch.load(checkpoint, weights_only=False)
+        appearance_embedding.restore(_appearance_embedding)
         gaussians.restore(model_params, opt, mesh, appearance_embedding)
         segmentation_network = segmentation_utils.Segmenter.from_checkpoint(_segmentation_network)
         segmentation_network_optim.load_state_dict(_segmentation_network_optim)
+        deform_model = deform_utils.DeformModel.restore(_deform_model, first_iter)
         
 
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
@@ -140,9 +167,19 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 if custom_cam != None:
                     with torch.no_grad():
                         debugVis = DebugVisualization(**message["debug_data"])
+                        deform_time = message.get("deform_time_point", -1.0)
+                        deformation = deform_model.deformation(gaussians, deform_time) if deform_time >= 0 else deform_utils.Deformation()
+                        
                         render_segmentation = message["custom_message"].startswith("segmentation")
                         splat_args.blend_extra_features = gaussians.segmentation_dimension
-                        net_image = render(custom_cam, gaussians, pipe, background, message["scaling_modifier"], splat_args=splat_args, debugVis=debugVis)["render"]
+                        
+                        gaussians_mask = None
+                        if message["custom_message"] == "no_bg_gaussians":
+                            with torch.no_grad():
+                                gaussians_classified = segmentation_utils.classify_gaussians(gaussians, segmentation_network).argmax(-1, keepdim=True)
+                                gaussians_mask = (gaussians_classified == 1) | (gaussians_classified == 3)
+                        
+                        net_image = render(custom_cam, gaussians, pipe, background, message["scaling_modifier"], splat_args=splat_args, debugVis=debugVis, deformation=deformation, gaussians_mask = gaussians_mask)["render"]
 
                     if debugVis.type == 0 or debugVis.type == DebugVisualizationType.CONFIDENCE:
                         image = gui_visualize(
@@ -201,10 +238,14 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         gt_image = viewpoint_cam.original_image.cuda()
         # not sure we need detach here
         
-        render_segmentation = iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0
+        render_segmentation = (iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0)
         splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
         
-        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach())
+        if iteration >= opt.deform_first_step:
+            deformation = deform_model.deformation(gaussians, viewpoint_cam.uid/(number_views_for_deform_model-1))
+        else: deformation = deform_utils.Deformation()
+        
+        render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach(), deformation=deformation)
         rendering, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
 
         opacity = rendering[7]
@@ -245,8 +286,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # TODO: confidence into a CUDA kernel for speed
         else:
             rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx)
-            
-            
+        
         seg_loss_obj = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
         seg_loss_obj_3d = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
         seg_network_loss = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
@@ -263,16 +303,16 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 seg_network_loss = torch.nn.functional.cross_entropy(y_seg_network , gt_segmask.unsqueeze(0))
             # Clustering Loss
             if iteration % opt.contrastive_interval == 0:
-                feature_map = feature_map.permute(1, 2, 0)
-                feature_map = feature_map / (feature_map.norm(dim=-1, keepdim=True) + 1e-9)
+                feature_map = torch.clamp_min(feature_map.permute(1, 2, 0), 1e-6).log()
                 gt_segmasks = gt_segmask.long()
-                id_unique_list, n_i_list = segmentation_utils.get_unique_id_list(gt_segmasks, opt.min_pixnum)
-                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, dim_features=gaussians.segmentation_dimension, lambda_val=opt.contrastive_lambda)
+                id_unique_list, n_i_list = segmentation_utils.get_unique_id_list(gt_segmasks, opt.min_pixnum, segmentation_classes_set)
+                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_prototypes,lambda_val=opt.contrastive_lambda)
 
             # Spatial-similarity Loss
             if iteration % opt.spatial_similarity_interval == 0:
-                features3d = gaussians.get_segmentation
+                features3d = torch.clamp_min(gaussians.get_segmentation,1e-6).log()
                 seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
+                
             
             
         # depth distortion regularization
@@ -335,9 +375,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 extent_loss          * lambda_extent + \
                 variance_loss        * lambda_variance + \
                 normal_variance_loss * lambda_normal_variance + \
+                (mesh.opacity_reg * torch.abs(gaussians.get_opacity).mean() if mesh.opacity_reg > 0 else 0.0) + \
+                (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
+                (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
                 seg_loss_obj + \
-                seg_loss_obj_3d
-
+                seg_loss_obj_3d 
+                
         loss.backward(retain_graph=True)
         seg_network_loss.backward()
         
@@ -381,7 +424,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration, appearance_embedding.capture(), segmentation_network.capture())
+                scene.save(iteration, appearance_embedding.capture(), segmentation_network.capture(), deform_model.capture())
+                
 
             # Densification (AbsGrad or MCMC)
             temp_splat_args = copy.deepcopy(splat_args)
@@ -403,14 +447,17 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 
                 if iteration >= opt.segmentation_network_first_step:
                     segmentation_network_optim.step()
-                
+                    
+                deform_model.optimizer_step(iteration)
+                    
+                deform_model.optimizer_zero_grad(set_to_none = True)
                 gaussians.optimizer.zero_grad(set_to_none = True)
                 segmentation_network_optim.zero_grad(set_to_none = True)
                 densifier.postfix(xyz_lr=xyz_lr)
             
-            if (iteration in checkpoint_iterations):
+            if (iteration in checkpoint_iterations) and iteration != first_iter:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
-                torch.save((gaussians.capture(), iteration, appearance_embedding.capture(), (segmentation_network.capture(), segmentation_network_optim.state_dict())), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+                torch.save((gaussians.capture(), iteration, appearance_embedding.capture(), (segmentation_network.capture(), segmentation_network_optim.state_dict()), deform_model.capture()), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
     end_event = time.time() 
     

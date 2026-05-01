@@ -21,6 +21,7 @@ from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.reloc_utils import compute_relocation_cuda
+from utils.deform_utils import Deformation
 from diff_gaussian_rasterization._C import compute_filter_3d
 from typing import List
 from einops import einsum
@@ -116,11 +117,15 @@ class GaussianModel:
         coef = torch.sqrt(det1 / det2)
         return opacity * coef[..., None]
     
-    def get_view2gaussian(self, viewmatrix):
+    def get_view2gaussian(self, viewmatrix, deformation=Deformation()):
         r = self._rotation
         norm = torch.sqrt(r[:,0]*r[:,0] + r[:,1]*r[:,1] + r[:,2]*r[:,2] + r[:,3]*r[:,3])
-
         q = r / norm[:, None]
+        
+        xyz = self.get_xyz
+        scales = self.get_scaling_with_3D_filter
+        
+        xyz, q, scales = deformation.apply(xyz, q, scales, self.scaling_activation)
         
         R = torch.zeros((q.size(0), 3, 3), device='cuda')
 
@@ -140,7 +145,6 @@ class GaussianModel:
         R[:, 2, 2] = 1 - 2 * (x*x + y*y)
     
         rots = R
-        xyz = self.get_xyz
         N = xyz.shape[0]
         G2W = torch.zeros((N, 4, 4), device='cuda')
         G2W[:, :3, :3] = rots # TODO check if we need to transpose here
@@ -163,7 +167,6 @@ class GaussianModel:
         V2G = V2G.transpose(2, 1).contiguous()
         
         # precompute results to reduce computation and IO
-        scales = self.get_scaling_with_3D_filter
         S_inv_square = 1.0 / (scales ** 2)
         R = V2G[:, :3, :3].transpose(1, 2)
         t2 = V2G[:, 3:, :3]

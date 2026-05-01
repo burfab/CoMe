@@ -16,8 +16,9 @@ from scene.gaussian_model import GaussianModel
 from arguments import PipelineParams
 from utils.sh_utils import eval_sh
 from utils.sb_utils import eval_sb
+from utils.deform_utils import Deformation
 
-def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, splat_args: ExtendedSettings = None, debugVis : DebugVisualization = DebugVisualization(), gt_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, splat_args: ExtendedSettings = None, debugVis : DebugVisualization = DebugVisualization(), gt_color = None, deformation: Deformation = Deformation(), gaussians_mask=None):
     """
     Render the scene. 
     
@@ -73,11 +74,16 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
     # scaling / rotation by the rasterizer.
     cov3D_precomp = None
     rotations = pc.get_rotation
+    
+    
+    means3D, rotations, scales = deformation.apply(means3D, rotations, scales, pc.scaling_activation)
+    assert cov3D_precomp is None, "Not implemented together with deformation"
+    
 
     view2gaussian_precomp = None
     # pipe.compute_view2gaussian_python = True
     if pipe.compute_view2gaussian_python:
-        view2gaussian_precomp = pc.get_view2gaussian(raster_settings.viewmatrix)
+        view2gaussian_precomp = pc.get_view2gaussian(raster_settings.viewmatrix, deformation)
     
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -86,7 +92,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -95,7 +101,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
             # shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             shs_view = pc.get_features.view(-1, spherical_betas_paramscount)
             shs_view = shs_view[:, :(3 + 6 * pc.active_sh_degree)]
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)) 
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)) 
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True) 
             # sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             sb2rgb = eval_sb(shs_view, dir_pp_normalized)
@@ -110,7 +116,11 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
     # get confidence
     confidences = torch.exp(pc.get_confidence)
     segmentation = torch.zeros((0,0)).float().to(confidences.device).requires_grad_(False) if splat_args.blend_extra_features == 0 else pc.get_segmentation
-
+    
+    if gaussians_mask is not None:
+        opacity = gaussians_mask * opacity
+        
+        
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, max_weights = rasterizer(
         means3D = means3D,
@@ -137,7 +147,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
             "max_weights": max_weights}
 
 def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
-                  splat_args: ExtendedSettings = None, debug_data : DebugVisualization = None):
+                  splat_args: ExtendedSettings = None, debug_data : DebugVisualization = None, deformation=Deformation()):
     """
     Render the scene. 
     
@@ -195,11 +205,15 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
     # scaling / rotation by the rasterizer.
     cov3D_precomp = None
     rotations = pc.get_rotation
+    
+    
+    means3D, rotations, scales = deformation.apply(means3D, rotations, scales, pc.scaling_activation)
+    assert cov3D_precomp is None, "Not implemented together with deformation"
 
     view2gaussian_precomp = None
     # pipe.compute_view2gaussian_python = True
     if pipe.compute_view2gaussian_python:
-        view2gaussian_precomp = pc.get_view2gaussian(raster_settings.viewmatrix)
+        view2gaussian_precomp = pc.get_view2gaussian(raster_settings.viewmatrix, deformation)
     
     # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
     # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
@@ -208,7 +222,7 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
     if override_color is None:
         if pipe.convert_SHs_python:
             shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
             sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
@@ -217,7 +231,7 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
             # shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
             shs_view = pc.get_features.view(-1, spherical_betas_paramscount)
             shs_view = shs_view[:, :(3 + 6 * pc.active_sh_degree)]
-            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)) 
+            dir_pp = (means3D - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)) 
             dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True) 
             # sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
             sb2rgb = eval_sb(shs_view, dir_pp_normalized)

@@ -48,6 +48,12 @@ class Segmenter(torch.nn.Module):
             "hidden_dim": self.hidden_dim,
         }
 
+def classify_gaussians(gaussians, segmentation_network):
+    #(1, N, FDIM) -> (FDIM, N, 1) -> (1, FDIM, N, 1)
+    features_gaussians = gaussians.get_segmentation.expand(1,-1,-1).permute(2,1,0).unsqueeze(0)
+    segmentation_gaussians = segmentation_network(torch.clamp_min(features_gaussians.detach(), 1e-6).log()).squeeze(0).squeeze(-1)
+    segmentation_gaussians = torch.softmax(segmentation_gaussians, dim=-1)
+    return segmentation_gaussians.permute(1,0)
 
 
 def features_to_rgb_pca(features: torch.Tensor) -> torch.Tensor:
@@ -126,7 +132,7 @@ def set_bg_to_one_and_class_borders_to_zero(gt_segmask: torch.Tensor) -> torch.T
     return out 
 
     
-def contrastive_2d_loss(segmask, features, id_unique_list, n_i_list, dim_features=4, lambda_val=1e-4):
+def contrastive_2d_loss(segmask, log_features, id_unique_list, n_i_list, prototypes,lambda_val=1e-4, lambda_prototypes=0.9):
     """
     Compute the contrastive clustering loss for a 2D feature map.
 
@@ -139,30 +145,44 @@ def contrastive_2d_loss(segmask, features, id_unique_list, n_i_list, dim_feature
 
     :return: loss value.
     """
-    n_p = id_unique_list.shape[0] # Number of ids
+    n_p = len(id_unique_list) # Number of ids
+    
+    non_zero_clusters = 0
+    for i in range(n_p): 
+        if n_i_list[i] > 0: non_zero_clusters+=1
+        
 
-    f_mean_per_cluster = torch.zeros((n_p, dim_features)).cuda()
-    phi_per_cluster = torch.zeros((n_p, 1)).cuda()
-            
+    f_mean_per_cluster = torch.zeros((non_zero_clusters, log_features.shape[-1])).cuda()
+    non_zero_prototypes = torch.zeros((non_zero_clusters, log_features.shape[-1])).cuda()
+    t = torch.ones(non_zero_clusters, device=f_mean_per_cluster.device, dtype=torch.float32) * 0.1
+    
+    j = 0
     for i in range(n_p):
+        if n_i_list[i] == 0: continue
         mask = (segmask == id_unique_list[i]).squeeze()
-        f_mean_per_cluster[i, ...] = torch.mean(features[mask,:], dim=0, keepdim=True)
-        phi_per_cluster[i] = torch.norm(features[mask, :] - f_mean_per_cluster[i], dim=1, keepdim=True).sum() / (n_i_list[i] * torch.log(n_i_list[i] + 100))
+        #f_mean_per_cluster[j, ...] = torch.mean(features[mask,:], dim=0, keepdim=True)
+        non_zero_prototypes[j,...] = prototypes[i,...]
+        j+=1
             
-    phi_per_cluster = torch.clip(phi_per_cluster * 10, min=0.1, max=1.0)
-    phi_per_cluster = phi_per_cluster.detach()
-    loss_per_cluster = torch.zeros(n_p).cuda()
+    #f_mean_norm_per_cluster = torch.functional.norm(f_mean_per_cluster, dim=-1, keepdim=True)
+    f_mean_per_cluster = torch.nn.functional.normalize(non_zero_prototypes, dim=-1)
+    features_normalized = torch.nn.functional.normalize(log_features, dim=-1)
+    sim_per_cluster = torch.zeros(n_p).cuda()
+    
+    def similarity(fs, mu):
+        return (fs * mu).sum(-1)
             
+    j = 0
     for i in range(n_p):
-        f_mean = f_mean_per_cluster[i]
-        phi = phi_per_cluster[i]
-        mask = (segmask == id_unique_list[i]).squeeze()
-        f_ij = features[mask, :] # shape (ni, 16)
-        num = torch.exp(torch.matmul(f_ij, f_mean) / (phi + 1e-6)) # dim (ni)
-        den = torch.sum(torch.exp(torch.matmul(f_ij, f_mean_per_cluster.transpose(-1, -2)) / (phi_per_cluster.transpose(-1, -2) + 1e-6)), dim=1) # dim (n_i)
-        loss_per_cluster[i] = torch.sum(torch.log(num / (den + 1e-6)))
+        if n_i_list[i] == 0: continue
+        fs_normalized = features_normalized[segmask == id_unique_list[i]]
+        #similarity((N,1,8) , (1, K, 8)) = (N,K)
+        sim_all = (similarity(fs_normalized.unsqueeze(1), f_mean_per_cluster)/t.unsqueeze(0))
+        sim_pos = sim_all[:, j]
+        sim_per_cluster[i] = (sim_pos - torch.logsumexp(sim_all, dim=-1)).mean()
+        j+=1
             
-    loss_obj = - lambda_val * torch.mean(loss_per_cluster)
+    loss_obj = - lambda_val * torch.mean(sim_per_cluster)
     return loss_obj
 
 def spatial_loss(xyz, features, k_pull=2, k_push=5, lambda_pull=0.05, lambda_push=0.15, max_points=200000, sample_size=800):
@@ -300,11 +320,20 @@ def variance_in_feature_clusters(segmask, features, id_unique_list, dim_features
     return torch.mean(variance_per_cluster) 
     
     
-def get_unique_id_list(segmask, min_pixnum):
+def get_unique_id_list(segmask, min_pixnum, set_of_ids):
     id_unique_list, n_i_list_ = torch.unique(segmask, return_counts=True)
+    
+    labels = []
+    cnt_per_label = []
+    for i in range(len(id_unique_list)):
+        labels.append(id_unique_list[i].item())
+        if n_i_list_[i] < min_pixnum: cnt_per_label.append(0)
+        else: cnt_per_label.append(n_i_list_[i].item())
+    
+    not_included = set_of_ids.difference(set(labels))
+    labels = labels + list(not_included)
+    cnt_per_label = cnt_per_label + [0]*len(not_included)
+    
+        
 
-    # Remove small clusters
-    id_unique_list = id_unique_list[n_i_list_ > min_pixnum]
-    n_i_list = n_i_list_[n_i_list_ > min_pixnum]
-
-    return id_unique_list, n_i_list 
+    return labels, cnt_per_label
