@@ -196,7 +196,7 @@ class OptimizationParams(ParamGroup):
         self.confidence_lr = 0.00025
         self.segmentation_lr = 1e-3
         self.segmentation_network_lr = 1e-3
-        self.segmentation_network_first_step = 1500
+        self.segmentation_network_first_step = 0
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
         self.rotation_lr = 0.001

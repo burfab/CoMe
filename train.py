@@ -84,26 +84,14 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     for c in scene.getTrainCameras():
         uniques_seg_mask = torch.unique(c.seg_mask.cuda().detach()).cpu().tolist()
         for seg_class in uniques_seg_mask: segmentation_classes_set.add(seg_class)
-        
-    segmentation_prototypes = torch.nn.Parameter(
-        torch.randn(len(segmentation_classes_set), gaussians.segmentation_dimension, device="cuda")
-    )
-
-    with torch.no_grad():
-        segmentation_prototypes.copy_(
-            torch.nn.functional.normalize(segmentation_prototypes, dim=-1)
-        )
     
     segmentation_network = segmentation_utils.Segmenter(gaussians.segmentation_dimension, len(segmentation_classes_set)).cuda()
-    segmentation_network_optim = torch.optim.AdamW(
+    segmentation_network_optim = torch.optim.Adam(
         [
-            {"params": segmentation_network.parameters(),
-            "lr": opt.segmentation_network_lr,
-            "weight_decay": 1e-4},
-
-            {"params": [segmentation_prototypes],
-            "lr": 1e-3,
-            "weight_decay": 0.0},   # 👈 no decay here
+            {
+                "params": segmentation_network.parameters(),
+                "lr": opt.segmentation_network_lr,
+            }
         ]
     )
     
@@ -299,18 +287,19 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             assert feature_map.shape[0] == gaussians.segmentation_dimension
             
             if iteration >= opt.segmentation_network_first_step:
-                y_seg_network = segmentation_network(torch.clamp_min(feature_map.detach().unsqueeze(0),1e-6).log())
-                seg_network_loss = torch.nn.functional.cross_entropy(y_seg_network , gt_segmask.unsqueeze(0))
+                #y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(torch.clamp_min(feature_map.detach().unsqueeze(0),1e-6).log(), True)
+                y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(feature_map.detach().unsqueeze(0), True)
+                seg_network_loss = torch.nn.functional.cross_entropy(y_seg_network , gt_segmask.unsqueeze(0)) + seg_network_reg * 1e-4
             # Clustering Loss
             if iteration % opt.contrastive_interval == 0:
-                feature_map = torch.clamp_min(feature_map.permute(1, 2, 0), 1e-6).log()
+                feature_map = feature_map.permute(1, 2, 0)
                 gt_segmasks = gt_segmask.long()
                 id_unique_list, n_i_list = segmentation_utils.get_unique_id_list(gt_segmasks, opt.min_pixnum, segmentation_classes_set)
-                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_prototypes,lambda_val=opt.contrastive_lambda)
+                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_network.segmentation_prototypes,lambda_val=opt.contrastive_lambda)
 
             # Spatial-similarity Loss
             if iteration % opt.spatial_similarity_interval == 0:
-                features3d = torch.clamp_min(gaussians.get_segmentation,1e-6).log()
+                features3d = gaussians.get_segmentation
                 seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
                 
             

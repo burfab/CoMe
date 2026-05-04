@@ -1,6 +1,7 @@
 import torch
 from scene import Scene
 import os
+import copy
 from os import makedirs
 from gaussian_renderer import render
 import random
@@ -123,7 +124,12 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             ignore_classes = [0,2]
         
         
-        for _, view in enumerate(tqdm(views, desc="Rendering progress")):
+        views_subsampled = []
+        sdf_trunc = 6.0
+        #for i in range(0, len(views), 10): views_subsampled.append(views[i])
+        views_subsampled = views
+        cv2.namedWindow("WIN", cv2.WINDOW_NORMAL)
+        for _, view in enumerate(tqdm(views_subsampled, desc="Rendering progress")):
             
             rendering = render(view, gaussians, pipeline, background, splat_args=splat_args#, kernel_size=kernel_size
                                )["render"]
@@ -133,14 +139,20 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             rgb = rendering[:3, :, :]
             max_depth = torch.max(rendering[6, :, :])
             min_depth = torch.min(rendering[6, :, :])
-            min_depth = torch.min(rendering[6, :, :])
             
             if seg_network:
                 feature_map_logits = torch.clamp_min(rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:].detach(),1e-6).log()
                 segmentation = seg_network(feature_map_logits.unsqueeze(0)).squeeze(0).argmax(0,keepdim=True)
+                gt = (view.original_image.cpu().detach().numpy().transpose(1,2,0) * 255).astype(np.uint8)
                 for ignore_class in ignore_classes:
                     mask_segmentation = segmentation != ignore_class
                     depth[~mask_segmentation] = 0
+                    
+                    mask_segmentation_big = cv2.resize(mask_segmentation.squeeze().detach().cpu().numpy().astype(np.uint8) * 255,(gt.shape[1], gt.shape[0]))
+                    gt[~(mask_segmentation_big > 0),:] = gt[~(mask_segmentation_big>0), :] * 0.3
+                    
+                cv2.imshow("WIN", gt)
+                cv2.waitKey(1)
             
             
             save_image(apply_depth_colormap(depth.permute(1,2,0), None, min_depth, max_depth).permute(-1,0,1), f'depths/out_depth{index}.png')
@@ -181,16 +193,35 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             extrinsic = o3d.core.Tensor(extrinsic, o3d.core.Dtype.Float64)#.to(o3d_device)
             
             frustum_block_coords = vbg.compute_unique_block_coordinates(
-                o3d_depth, intrinsic, extrinsic, 1.0, 6.0)
+                o3d_depth, intrinsic, extrinsic, 1.0, float(sdf_trunc))
 
             vbg.integrate(frustum_block_coords, o3d_depth, o3d_color, intrinsic,
-                          intrinsic, extrinsic, 1.0, 6.0)
+                          intrinsic, extrinsic, 1.0, float(sdf_trunc))
             
         print("Extract Mesh")
         mesh = vbg.extract_triangle_mesh().to_legacy()
         print(f"Mesh Extracted: {render_path}/tsdf.ply")
         # write mesh
         o3d.io.write_triangle_mesh(f"{render_path}/tsdf.ply", mesh)
+        print("Cluster connected triangles")
+        with o3d.utility.VerbosityContextManager(
+                o3d.utility.VerbosityLevel.Debug) as cm:
+            triangle_clusters, cluster_n_triangles, cluster_area = (
+                mesh.cluster_connected_triangles())
+        triangle_clusters = np.asarray(triangle_clusters)
+        cluster_n_triangles = np.asarray(cluster_n_triangles)
+        cluster_area = np.asarray(cluster_area) 
+                
+        mesh_0 = copy.deepcopy(mesh)
+        triangles_to_remove = cluster_n_triangles[triangle_clusters] < (cluster_n_triangles.max() * 0.25)
+        mesh_0.remove_triangles_by_mask(triangles_to_remove)
+        o3d.io.write_triangle_mesh(f"{render_path}/tsdf_largest_component.ply", mesh_0)
+        o3d.visualization.draw_geometries([mesh_0]) 
+        mesh_0 = mesh_0.remove_unreferenced_vertices()
+        mesh_simplified = mesh_0.simplify_quadric_decimation(target_number_of_triangles=30_000)
+        o3d.io.write_triangle_mesh(f"{render_path}/tsdf_largest_component_down.ply", mesh_simplified)
+        
+        
             
             
 def extract_mesh(dataset : ModelParams, iteration : int, pipeline : PipelineParams, splat_args, voxel_size: float):

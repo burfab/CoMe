@@ -196,8 +196,8 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
         
-        self.segmentation_activation = torch.exp
-        self.segmentation_inverse_activation = torch.log
+        self.segmentation_activation = lambda x: x
+        self.segmentation_inverse_activation = lambda x: x
 
 
     def __init__(self, sh_degree : int, use_SBs : bool = False):
@@ -403,7 +403,8 @@ class GaussianModel:
         if MCMC_init:
             scales = torch.log(torch.sqrt(dist2)*0.1)[...,None].repeat(1, 3)
         else:
-            scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3) 
+            #renders faster if we initialize bigger
+            scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)  * 2
             
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1

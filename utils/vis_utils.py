@@ -107,7 +107,6 @@ def gui_visualize(
     render_normal_variance = indict("render_normal_variance")
     render_segmentation = other_args["custom_message"].startswith("segmentation")
     if render_segmentation:
-        segmentation = torch.clamp_min(segmentation,1e-6).log()
         if other_args["custom_message"].find("_class") != -1:
             image = segmentation_network(segmentation.unsqueeze(0))
             image = torch.softmax(image,dim=1)
@@ -120,8 +119,7 @@ def gui_visualize(
                 return image
             else: 
                 class_idx = int(class_idx[1:])
-                if class_idx < segmentation.shape[0]:
-                    image = segmentation_network(segmentation.unsqueeze(0))
+                if class_idx < image.shape[1]:
                     image = image[0, class_idx:class_idx+1,...].repeat(3,1,1)
                     return image
                 else:

@@ -20,23 +20,32 @@ def features_to_rgb_random_orth_proj(features: torch.Tensor) -> torch.Tensor:
     return rgb
 
 class Segmenter(torch.nn.Module):
-    def __init__(self, feature_dim, n_classes, hidden_dim=16):
+    def __init__(self, feature_dim, n_classes):
         super().__init__()
-        self.W0 = torch.nn.Conv2d(feature_dim, hidden_dim, kernel_size=1, padding=0, stride=1)
-        self.A0 = torch.nn.ReLU()
-        self.W1 = torch.nn.Conv2d(hidden_dim+feature_dim, n_classes, kernel_size=1, padding=0, stride=1)
+        segmentation_prototypes = torch.nn.Parameter(
+            torch.nn.functional.normalize(
+            torch.randn(n_classes, feature_dim, device="cuda"),
+                dim=-1)
+        )
+        self.segmentation_prototypes = segmentation_prototypes
         self.n_classes = n_classes
-        self.hidden_dim = hidden_dim
         self.feature_dim = feature_dim
+    def forward_with_reg_loss(self, feature_map, compute_reg_loss=False):
+        W = torch.nn.functional.normalize(self.segmentation_prototypes, dim=-1)
+        features_normalized = torch.nn.functional.normalize(feature_map, dim=1)
+        #(B, 1, F, H, W) * (B, C, F, 1, 1)
+        sim = ((features_normalized.unsqueeze(1) - W.reshape(*W.shape,1,1).unsqueeze(0))**2).mean(dim=-3)
+        orth_constraint = torch.tensor(0.0, dtype=torch.float32, device=feature_map.device, requires_grad=True)
+        if compute_reg_loss:
+            orth_constraint = (((W @ W.T) - torch.eye(self.n_classes, device=W.device, dtype=W.dtype))**2).sum()
+            pass
+        return -sim,orth_constraint
     def forward(self, feature_map):
-        x = (self.W0(feature_map))
-        x = (self.A0(x))
-        x = (self.W1(torch.cat((x,feature_map),dim=1)))
-        return x# x.T.reshape((self.n_classes, *feature_map.shape[1:]))
+        return self.forward_with_reg_loss(feature_map, False)[0]
     
     @classmethod
     def from_checkpoint(cls, d, device="cuda"):
-        model = cls(d["feature_dim"], d["n_classes"], d["hidden_dim"]).to(device)
+        model = cls(d["feature_dim"], d["n_classes"]).to(device)
         model.load_state_dict(d["state_dict"])
         return model
         
@@ -45,7 +54,6 @@ class Segmenter(torch.nn.Module):
             "state_dict": {k: v.cpu() for k, v in self.state_dict().items()},
             "feature_dim": self.feature_dim,
             "n_classes": self.n_classes,
-            "hidden_dim": self.hidden_dim,
         }
 
 def classify_gaussians(gaussians, segmentation_network):
@@ -170,7 +178,7 @@ def contrastive_2d_loss(segmask, log_features, id_unique_list, n_i_list, prototy
     sim_per_cluster = torch.zeros(n_p).cuda()
     
     def similarity(fs, mu):
-        return (fs * mu).sum(-1)
+        return -((fs - mu)**2).mean(-1)
             
     j = 0
     for i in range(n_p):
@@ -225,18 +233,16 @@ def spatial_loss(xyz, features, k_pull=2, k_push=5, lambda_pull=0.05, lambda_pus
     faraway_preds = features[faraway_indices_tensor]
 
     # Compute cosine similarity
-    cos = torch.nn.CosineSimilarity(dim=-1, eps=1e-10)
+    def similarity(x, y):
+        return -((x-y)**2).mean(dim=-1)
     
-    pull_loss = cos(sample_preds.unsqueeze(1).expand(-1, k_pull, -1), neighbor_preds) #more similar of they are close
-    
-    push_loss =  cos(sample_preds.unsqueeze(1).expand(-1, k_push, -1), faraway_preds) #less similar if they are far away
+    pull_loss = similarity(sample_preds.unsqueeze(1).expand(-1, k_pull, -1), neighbor_preds) #more similar of they are close
+    push_loss =  similarity(sample_preds.unsqueeze(1).expand(-1, k_push, -1), faraway_preds) #less similar if they are far away
     
     # Total loss
 
-    loss = (
-        lambda_pull * torch.sigmoid(1.0 - pull_loss.mean()) +
-        lambda_push * torch.sigmoid(push_loss.mean())
-    )
+    loss = (lambda_pull * -pull_loss.mean() + lambda_push * push_loss.mean())
+    
     
     return loss
 
