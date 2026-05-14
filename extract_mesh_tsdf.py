@@ -102,7 +102,7 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
     makedirs(render_path, exist_ok=True)
     o3d_device = o3d.core.Device("CUDA:0")
     # = 0.002
-    ALPHA_THRESH=0.5
+    ALPHA_THRESH=0.1
     
     vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=('tsdf', 'weight', 'color'),
@@ -140,8 +140,8 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
             max_depth = torch.max(rendering[6, :, :])
             min_depth = torch.min(rendering[6, :, :])
             
-            if seg_network:
-                feature_map_logits = torch.clamp_min(rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:].detach(),1e-6).log()
+            if seg_network is not None and False:
+                feature_map_logits = gaussians.segmentation_inverse_activation(rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:].detach())
                 segmentation = seg_network(feature_map_logits.unsqueeze(0)).squeeze(0).argmax(0,keepdim=True)
                 gt = (view.original_image.cpu().detach().numpy().transpose(1,2,0) * 255).astype(np.uint8)
                 for ignore_class in ignore_classes:
@@ -165,6 +165,7 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
                 depth[(view.gt_alpha_mask < ALPHA_THRESH)] = 0
             
             depth[(alpha < ALPHA_THRESH)] = 0
+            if depth[depth != 0].numel() < depth.numel() * 0.1: continue 
             
             W = view.image_width
             H = view.image_height

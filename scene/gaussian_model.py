@@ -11,7 +11,7 @@
 
 import torch
 import numpy as np
-from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
+from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation, get_reset_expon_lr_func
 from torch import nn
 import os
 from utils.system_utils import mkdir_p
@@ -22,6 +22,7 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from utils.reloc_utils import compute_relocation_cuda
 from utils.deform_utils import Deformation
+from utils import densify_utils 
 from diff_gaussian_rasterization._C import compute_filter_3d
 from typing import List
 from einops import einsum
@@ -196,8 +197,8 @@ class GaussianModel:
 
         self.rotation_activation = torch.nn.functional.normalize
         
-        self.segmentation_activation = lambda x: x
-        self.segmentation_inverse_activation = lambda x: x
+        self.segmentation_activation = torch.exp
+        self.segmentation_inverse_activation = lambda x: torch.log(x.clamp_min(1e-6))
 
 
     def __init__(self, sh_degree : int, use_SBs : bool = False):
@@ -218,6 +219,25 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.filter_3D = torch.tensor([0.003,0.003,0.003]).cuda()
+        self.tmp_radii = None 
+        
+        
+        
+          
+        # [NEW] Online Accumulation Tensors
+        self.accum_eta = torch.empty(0)
+        self.accum_view_count = torch.empty(0)
+        self.max_eta_3ch = torch.empty(0)
+        self.accum_weights_valid = torch.empty(0)
+        self.densify_count = torch.empty(0)  # Track how many times GS has been normally densified
+        
+        # [NEW] Multiview Consistency Attributes
+        self.eta_high_count = torch.empty(0)   # Count of views with high eta
+        self.eta_high_sum_3ch = torch.empty(0) # Sum of eta_3ch for high eta views
+        self.eta_mid_count = torch.empty(0)    # Count of views with mid eta
+        self.eta_mid_sum_3ch = torch.empty(0)  # Sum of eta_3ch for mid eta views
+        self.eta_low_count = torch.empty(0)    # Count of views with low eta 
+        
         self.setup_functions()
 
     def capture(self):
@@ -379,9 +399,14 @@ class GaussianModel:
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
-    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, MCMC_init : bool):
+    def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, MCMC_init : bool, add_bbox: bool):
         self.spatial_lr_scale = spatial_lr_scale
+        
+        if add_bbox: pcd = densify_utils.add_bbox_faces(pcd)
+        
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
+        
+        
 
         if self.use_SBs:
             pcd_color = torch.tensor(np.asarray(pcd.colors)).float().cuda()
@@ -401,10 +426,9 @@ class GaussianModel:
         dist2 = torch.clamp_min(distCUDA2(torch.from_numpy(np.asarray(pcd.points)).float().cuda()), 0.0000001)
         
         if MCMC_init:
-            scales = torch.log(torch.sqrt(dist2)*0.1)[...,None].repeat(1, 3)
+            scales = self.scaling_inverse_activation(torch.sqrt(dist2)*0.1)[...,None].repeat(1, 3)
         else:
-            #renders faster if we initialize bigger
-            scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 3)  * 2
+            scales = self.scaling_inverse_activation(torch.sqrt(dist2))[...,None].repeat(1, 3) 
             
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
@@ -434,7 +458,7 @@ class GaussianModel:
         ).requires_grad_(True)
         #per-Gaussian segmentation
         self._segmentation = nn.Parameter(
-            torch.rand((fused_point_cloud.shape[0], self.segmentation_dimension)).to(self._opacity.device).float()
+            torch.randn((fused_point_cloud.shape[0], self.segmentation_dimension)).to(self._opacity.device).float()
         ).requires_grad_(True)
         
         
@@ -445,6 +469,24 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        
+        
+       
+        # [NEW] Online Accumulation Tensors
+        self.accum_eta = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.accum_view_count = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_eta_3ch = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self.accum_weights_valid = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.densify_count = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
+        
+        # [NEW] Multiview Consistency Attributes
+        self.eta_high_count = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.eta_high_sum_3ch = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self.eta_mid_count = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.eta_mid_sum_3ch = torch.zeros((self.get_xyz.shape[0], 3), device="cuda")
+        self.eta_low_count = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+ 
+        
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -466,10 +508,26 @@ class GaussianModel:
 
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
-        self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
-                                                    lr_final=training_args.position_lr_final*self.spatial_lr_scale,
-                                                    lr_delay_mult=training_args.position_lr_delay_mult,
-                                                    max_steps=training_args.position_lr_max_steps)
+        
+        if training_args.position_lr_reset_interval <= 0: 
+            self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
+                                                            lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                            lr_delay_mult=training_args.position_lr_delay_mult,
+                                                            max_steps=training_args.position_lr_max_steps)
+        else:
+            reset_value = (
+                training_args.position_lr_init + 
+                training_args.position_lr_reset_interval * 
+                (training_args.position_lr_init - training_args.position_lr_final) / 
+                training_args.position_lr_max_steps * 
+                self.spatial_lr_scale
+            ) 
+            self.xyz_scheduler_args = get_reset_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
+                                                              reset_step=training_args.position_lr_reset_interval, 
+                                                              reset_lr_init=reset_value,
+                                                            lr_final=training_args.position_lr_final*self.spatial_lr_scale,
+                                                            lr_delay_mult=training_args.position_lr_delay_mult,
+                                                            max_steps=training_args.position_lr_max_steps)
         
         self.appearance_scheduler_args = get_expon_lr_func(
             lr_init=mesh_args.appearance_lr_init,
@@ -545,6 +603,10 @@ class GaussianModel:
         opacities_new = inverse_sigmoid(self.get_opacity * val)
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+        
+    def reset_confidence(self):
+        optimizable_tensors = self.replace_tensor_to_optimizer(torch.zeros_like(self._confidence), "confidence")
+        self._confidence = optimizable_tensors["confidence"]
 
     def reset_opacity(self):
         # reset opacity by considering 3D filter
@@ -766,6 +828,29 @@ class GaussianModel:
         
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        
+        if self.tmp_radii is not None:
+            self.tmp_radii = self.tmp_radii[valid_points_mask]
+        
+        if self.filter_3D is not None and self.filter_3D.numel() > 0:
+            self.filter_3D = self.filter_3D[valid_points_mask]
+        
+         # [NEW] Prune Accumulators
+        if self.accum_eta.numel() > 0:
+            self.accum_eta = self.accum_eta[valid_points_mask]
+            self.accum_view_count = self.accum_view_count[valid_points_mask]
+            self.max_eta_3ch = self.max_eta_3ch[valid_points_mask]
+            self.accum_weights_valid = self.accum_weights_valid[valid_points_mask]
+        if self.densify_count.numel() > 0:
+            self.densify_count = self.densify_count[valid_points_mask]
+        # [NEW] Prune Multiview Consistency Attributes
+        if self.eta_high_count.numel() > 0:
+            self.eta_high_count = self.eta_high_count[valid_points_mask]
+            self.eta_high_sum_3ch = self.eta_high_sum_3ch[valid_points_mask]
+            self.eta_mid_count = self.eta_mid_count[valid_points_mask]
+            self.eta_mid_sum_3ch = self.eta_mid_sum_3ch[valid_points_mask]
+            self.eta_low_count = self.eta_low_count[valid_points_mask] 
+        
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -791,7 +876,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, reset_params=True):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter3d,reset_params=True):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -799,7 +884,7 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         "confidence" : new_confidence,
-        "segmentation" : new_segmentation 
+        "segmentation" : new_segmentation,
         }
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
@@ -811,12 +896,419 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
         self._confidence = optimizable_tensors["confidence"]
         self._segmentation = optimizable_tensors["segmentation"]
+        if self.tmp_radii is None:
+            self.tmp_radii = torch.zeros((self.get_xyz.shape[0] - new_tmp_radii.shape[0]), device="cuda")
+        self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii)) 
+        
+        if self.filter_3D is not None and self.filter_3D.numel() > 0:
+            self.filter_3D = torch.cat((self.filter_3D, new_filter3d), dim=0) 
+        
         if reset_params:
             self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.xyz_gradient_accum_abs_max = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
             self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+            
+        # [NEW] Resize Accumulators (Append zeros for new points)
+        # Note: We append zeros because new points haven't been seen yet.
+        n_new = new_xyz.shape[0]
+        self.accum_eta = torch.cat((self.accum_eta, torch.zeros(n_new, device="cuda")))
+        self.accum_view_count = torch.cat((self.accum_view_count, torch.zeros(n_new, device="cuda")))
+        self.max_eta_3ch = torch.cat((self.max_eta_3ch, torch.zeros((n_new, 3), device="cuda")))
+        self.accum_weights_valid = torch.cat((self.accum_weights_valid, torch.zeros(n_new, device="cuda")))
+        # Note: densify_count appends zeros, caller may overwrite with inherited values
+        self.densify_count = torch.cat((self.densify_count, torch.zeros(n_new, dtype=torch.int32, device="cuda")))
+        # [NEW] Resize Multiview Consistency Attributes
+        self.eta_high_count = torch.cat((self.eta_high_count, torch.zeros(n_new, device="cuda")))
+        self.eta_high_sum_3ch = torch.cat((self.eta_high_sum_3ch, torch.zeros((n_new, 3), device="cuda")))
+        self.eta_mid_count = torch.cat((self.eta_mid_count, torch.zeros(n_new, device="cuda")))
+        self.eta_mid_sum_3ch = torch.cat((self.eta_mid_sum_3ch, torch.zeros((n_new, 3), device="cuda")))
+        self.eta_low_count = torch.cat((self.eta_low_count, torch.zeros(n_new, device="cuda")))
+ 
+            
+    def densify_and_split_structgs(self, metric_mask, max_eta_3ch=None, scale_power=1.0):
+        """
+        Splits Gaussians with Analytic Anisotropic 3-Channel Guidance.
+        UPDATED: Computes kx, ky, kz separately based on sampling theory.
+        k ~ sqrt(eta) reflects the sampling rate required to resolve the frequency violation.
+        
+        Args:
+            scale_power: Exponent for scale division (new_scale = old_scale / k^scale_power).
+                         1.0 = linear division, 2.0 = more aggressive shrinking.
+        """
+        new_xyz_list = []
+        new_f_dc_list = []
+        new_f_rest_list = []
+        new_opacity_list = []
+        new_scaling_list = []
+        new_rotation_list = []
+        new_confidence_list = []
+        new_segmentation_list = []
+        new_radii_list = []
+        new_filter_3D_list = []
+        
+        # [NEW] Accumulators for new stats
+        new_accum_eta_list = []
+        new_accum_view_count_list = []
+        new_max_eta_3ch_list = []
+        new_densify_count_list = []  # Inherit parent's count + 1
+
+        n_total = self.get_xyz.shape[0]
+        
+        # Handle Padding
+        if metric_mask.shape[0] < n_total:
+            padding = torch.zeros(n_total - metric_mask.shape[0], dtype=torch.bool, device="cuda")
+            metric_mask = torch.cat((metric_mask, padding))
+            
+        if max_eta_3ch is not None and max_eta_3ch.shape[0] < n_total:
+            padding = torch.zeros((n_total - max_eta_3ch.shape[0], 3), device="cuda")
+            max_eta_3ch = torch.cat((max_eta_3ch, padding))
+            
+        # Indices of points to split
+        split_indices = torch.nonzero(metric_mask).squeeze(1)
+        # Handle single-point case: ensure split_indices is always 1D
+        if split_indices.dim() == 0:
+            split_indices = split_indices.unsqueeze(0)
+        if split_indices.numel() == 0:
+            return
+
+        # Prepare parameters for split candidates
+        current_scales = self.get_scaling[split_indices]
+        current_rots = self._rotation[split_indices]
+        current_xyz = self.get_xyz[split_indices]
+        
+        # --- Determine k (splits per axis) ---
+        if max_eta_3ch is not None:
+            # Frequency-based splitting
+            etavals = max_eta_3ch[split_indices] # [K, 3]
+            
+            # Sampling Theory:
+            # eta is the frequency energy ratio (~ (sigma * omega_max)^2 ).
+            # To resolve the aliasing, we need to reduce sigma by factor k such that sigma_new * omega_max <= 1.
+            # sigma_new = sigma / k => (sigma/k)^2 * omega^2 <= 1 => eta / k^2 <= 1 => k >= sqrt(eta).
+            
+            # We calculate k separately for each axis.
+            # Clamp min=2 (no split) and max=8 (limit VRAM usage).
+            ks = torch.sqrt(torch.clamp(etavals, min=1.0)).ceil().int()
+            # ks = etavals.ceil().int()
+            ks = torch.clamp(ks, min=1)
+            
+        else:
+            # Gradient-based split fallback (Standard 3DGS behavior)
+            # Splits the longest axis by a factor of 2 (creates 2 gaussians)
+            # Here we simulate that by setting k=2 on the max axis.
+            max_scale_vals, max_scale_indices = torch.max(current_scales, dim=1)
+            ks = torch.ones((current_scales.shape[0], 3), dtype=torch.int, device="cuda")
+            ks.scatter_(1, max_scale_indices.unsqueeze(1), 2)
+        
+        # Group by configuration of (kx, ky, kz)
+        # --- Analytic Split Logic (Vectorized) ---
+        # Total splits N = kx * ky * kz
+        N_per_point = ks.prod(dim=1) # [M]
+        
+        # Repeat parent attributes for each child
+        # [Sum(N), ...]
+        repeats = N_per_point
+        
+        # 1. Expand Parent Attributes
+        # new_scaling = self.scaling_inverse_activation(current_scales / ks.float()).repeat_interleave(repeats, dim=0)
+        new_scaling = self.scaling_inverse_activation(current_scales / ks.float()**scale_power).repeat_interleave(repeats, dim=0)
+        new_rotation = current_rots.repeat_interleave(repeats, dim=0)
+        new_features_dc = self._features_dc[split_indices].repeat_interleave(repeats, dim=0)
+        new_features_rest = self._features_rest[split_indices].repeat_interleave(repeats, dim=0)
+        new_opacity = self._opacity[split_indices].repeat_interleave(repeats, dim=0)
+        new_radii = self.tmp_radii[split_indices].repeat_interleave(repeats, dim=0)
+        new_filter_3D = self.filter_3D[split_indices].repeat_interleave(repeats, dim=0)
+        new_densify_count = (self.densify_count[split_indices] + 1).repeat_interleave(repeats)
+        new_confidence = self._confidence[split_indices].repeat_interleave(repeats, dim=0)
+        new_segmentation = self._segmentation[split_indices].repeat_interleave(repeats, dim=0)
+
+        # 2. Generate Grid Coordinates
+        # We need to generate indices (ix, iy, iz) for each child j of parent p
+        # where 0 <= ix < kx_p, etc.
+        
+        # create a flat range of indices [0, 1, ..., Sum(N)-1]
+        total_children = repeats.sum()
+        # computes start index for each parent in the flattened array
+        # starts[i] = sum(N[:i])
+        starts = torch.cumsum(repeats, dim=0) - repeats
+        
+        # expand starts to match children: [0, 0, ..., 0, 1, 1, ..., 1] 
+        # (but we want the start index value)
+        starts_expanded = starts.repeat_interleave(repeats)
+        
+        # local_index = global_index - start_index_of_parent
+        child_indices = torch.arange(total_children, device="cuda") - starts_expanded
+        
+        # Retrieve repeated k values for modulo operations
+        ks_repeated = ks.repeat_interleave(repeats, dim=0) # [Sum(N), 3]
+        kx_r = ks_repeated[:, 0]
+        ky_r = ks_repeated[:, 1]
+        kz_r = ks_repeated[:, 2]
+        
+        # Decode (ix, iy, iz) from child_indices
+        # index = ix * (ky*kz) + iy * kz + iz 
+        # This follows the meshgrid order (indexing='ij') where Z varies fastest
+        iz = child_indices % kz_r
+        iy = (child_indices // kz_r) % ky_r
+        ix = child_indices // (ky_r * kz_r)
+        
+        # Convert integer indices to centered coordinates
+        # coord = i - (k-1)/2.0
+        grid_x = ix.float() - (kx_r.float() - 1.0) / 2.0
+        grid_y = iy.float() - (ky_r.float() - 1.0) / 2.0
+        grid_z = iz.float() - (kz_r.float() - 1.0) / 2.0
+        
+        grid_flat = torch.stack([grid_x, grid_y, grid_z], dim=1) # [Sum(N), 3]
+        
+        # 3. Compute Offsets
+        # divisions = sigma_new * sqrt(12)
+        # sigma_new = sigma_old / k
+        # We already computed new scales (pre-activation), but we need the raw sigma_new for offset calc.
+        # current_scales is [M, 3]. 
+        scales_repeated = current_scales.repeat_interleave(repeats, dim=0)
+        stds_new_repeated = scales_repeated / ks_repeated.float()
+        separations = stds_new_repeated * (12**0.5)
+        
+        local_offsets = separations * grid_flat # [Sum(N), 3]
+        
+        # 4. Rotate Offsets
+        # rots_sub = current_rots.repeat_interleave(repeats, dim=0) -> new_rotation (already computed)
+        R_sub = build_rotation(new_rotation)
+        
+        # bmm needs [B, 3, 3] x [B, 3, 1] -> [B, 3, 1]
+        # local_offsets.unsqueeze(-1) is [Sum(N), 3, 1]
+        world_offsets = torch.bmm(R_sub, local_offsets.unsqueeze(-1)).squeeze(-1)
+        
+        new_xyz = current_xyz.repeat_interleave(repeats, dim=0) + world_offsets
+
+        # 5. Append to lists (now just single tensors)
+        new_xyz_list.append(new_xyz)
+        new_scaling_list.append(new_scaling)
+        new_rotation_list.append(new_rotation)
+        new_f_dc_list.append(new_features_dc)
+        new_f_rest_list.append(new_features_rest)
+        new_opacity_list.append(new_opacity)
+        new_radii_list.append(new_radii)
+        new_confidence_list.append(new_confidence)
+        new_segmentation_list.append(new_segmentation)
+        new_filter_3D_list.append(new_filter_3D)
+        new_densify_count_list.append(new_densify_count)
+        
+        # Accumulators (zeros)
+        n_new_total_sub = new_xyz.shape[0]
+        new_accum_eta_list.append(torch.zeros(n_new_total_sub, device="cuda"))
+        new_accum_view_count_list.append(torch.zeros(n_new_total_sub, device="cuda"))
+        new_max_eta_3ch_list.append(torch.zeros((n_new_total_sub, 3), device="cuda"))
+
+        # Prune Original Points
+        total_prune_mask = torch.zeros(n_total, dtype=torch.bool, device="cuda")
+        total_prune_mask[split_indices] = True
+        
+        if len(new_xyz_list) > 0:
+            self.densification_postfix(
+                torch.cat(new_xyz_list),
+                torch.cat(new_f_dc_list),
+                torch.cat(new_f_rest_list),
+                torch.cat(new_opacity_list),
+                torch.cat(new_scaling_list),
+                torch.cat(new_rotation_list),
+                torch.cat(new_confidence_list),
+                torch.cat(new_segmentation_list),
+                torch.cat(new_radii_list),
+                torch.cat(new_filter_3D_list)
+            )
+
+            n_new_total = self.get_xyz.shape[0]
+            n_added = n_new_total - n_total
+            
+            # [NEW] Update densify_count for new children (inherited count + 1)
+            # densification_postfix appends zeros, we overwrite with inherited values
+            self.densify_count = torch.cat((self.densify_count[:n_total], torch.cat(new_densify_count_list)))
+            
+            full_prune_filter = torch.cat((total_prune_mask, torch.zeros(n_added, device="cuda", dtype=bool)))
+            self.prune_points(full_prune_filter)
+
+    def expand_undersized_gs(self, tau_expand, max_eta_3ch):
+        """
+        Analytically expands undersized Gaussians to the exact correct scale.
+        
+        Theory:
+        - eta = (sigma * omega)^2 where sigma is scale, omega is max spatial frequency
+        - To satisfy Nyquist (eta = 1): sigma_target = sigma_old / sqrt(eta)
+        - In log-space: log(sigma_target) = log(sigma_old) - 0.5 * log(eta)
+        """
+        if max_eta_3ch is None:
+            return
+
+        # Identify undersized axes (eta < tau_expand and eta > 0)
+        undersized_mask = (max_eta_3ch < tau_expand) & (max_eta_3ch > 0)
+        
+        if not undersized_mask.any():
+            return
+
+        with torch.no_grad():
+            # Direct analytical update: log_scale_new = log_scale_old - 0.5 * log(eta)
+            # This makes eta_new = 1.0 exactly
+            eta_vals = torch.clamp(max_eta_3ch[undersized_mask], min=1e-6)
+            delta_log_scale = -0.5 * torch.log(eta_vals)  # Direct correction
+            
+            delta = torch.zeros_like(self._scaling)
+            delta[undersized_mask] = delta_log_scale
+            
+            new_scaling = self._scaling + delta
+            
+            # Replace in optimizer
+            optimizable_tensors = self.replace_tensor_to_optimizer(new_scaling, "scaling")
+            self._scaling = optimizable_tensors["scaling"] 
+            
+            
+    def densify_and_clone_structgs(self, metric_mask, filter):
+        selected_pts_mask = torch.logical_and(metric_mask, filter)
+        
+        new_xyz = self._xyz[selected_pts_mask]
+        new_features_dc = self._features_dc[selected_pts_mask]
+        new_features_rest = self._features_rest[selected_pts_mask]
+        new_opacities = self._opacity[selected_pts_mask]
+        new_scaling = self._scaling[selected_pts_mask]
+        new_rotation = self._rotation[selected_pts_mask]
+        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_filter_3D = self.filter_3D[selected_pts_mask]
+        new_confidence = self._confidence[selected_pts_mask]
+        new_segmentation = self._segmentation[selected_pts_mask]
+        
+        # [NEW] Clone inherits parent's densify_count (no increment)
+        parent_counts = self.densify_count[selected_pts_mask]
+        n_old = self.get_xyz.shape[0]
+
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter_3D)
+        
+        # Overwrite the zeros appended by densification_postfix with inherited counts
+        n_new = new_xyz.shape[0]
+        self.densify_count[n_old:n_old+n_new] = parent_counts
+
+
+    def densify_and_prune_structgs(self, max_screen_size, min_opacity, extent, radii, args, 
+                                 importance_score=None, pruning_score=None, 
+                                 custom_split_mask=None, custom_prune_mask=None, 
+                                 viewspace_points_indices=None,
+                                 max_eta_3ch=None, use_abs_grad=False
+                                 ): 
+        conf_split = torch.clamp(torch.exp(self._confidence).squeeze(-1), min=1e-6, max=1.0).detach()
+        densify_grad_threshold_fixed = args.densify_grad_threshold / conf_split
+        
+        grad_vars = (self.xyz_gradient_accum / self.denom)
+        grad_vars[grad_vars.isnan()] = 0.0
+        self.tmp_radii = radii
+
+        grads_abs = (self.xyz_gradient_accum_abs / self.denom)
+        grads_abs[grads_abs.isnan()] = 0.0
+        
+        ratio = (torch.norm(grad_vars, dim=-1) >= densify_grad_threshold_fixed).float().mean()
+        Q = torch.quantile(grads_abs.reshape(-1), 1 - ratio)
+
+        # if this value is absurdly high (as it is, we effectively will not use absolute gradients)
+        if not use_abs_grad:
+            Q = 1e4
+        if (Q == 0).item():
+            assert(False)
+        
+        Q_fixed = Q / conf_split
+        
+        grad_qualifiers = torch.where(torch.norm(grad_vars, dim=-1) >= densify_grad_threshold_fixed, True, False)
+        grad_qualifiers_abs = torch.where(torch.norm(grads_abs, dim=-1) >= Q_fixed, True, False)
+         
+        
+        
+        # --- MERGING RULES ---
+        full_split_mask = torch.zeros_like(grad_qualifiers, dtype=torch.bool)
+        full_prune_mask = torch.zeros_like(grad_qualifiers, dtype=torch.bool)
+        
+        if custom_split_mask is not None:
+            if viewspace_points_indices is not None:
+                full_split_mask[viewspace_points_indices] = custom_split_mask
+            else:
+                full_split_mask = custom_split_mask
+            
+        if custom_prune_mask is not None:
+            if viewspace_points_indices is not None:
+                full_prune_mask[viewspace_points_indices] = custom_prune_mask
+            else:
+                full_prune_mask = custom_prune_mask
+
+        clone_qualifiers = torch.max(self.get_scaling, dim=1).values <= args.percent_dense*extent
+        split_qualifiers = torch.max(self.get_scaling, dim=1).values > args.percent_dense*extent
+
+        final_split_mask = torch.logical_and(
+            torch.logical_or(full_split_mask, grad_qualifiers_abs), 
+            split_qualifiers
+        )
+        
+        final_clone_mask = torch.logical_and(
+            torch.logical_or(full_split_mask, grad_qualifiers), 
+            # grad_qualifiers,
+            clone_qualifiers
+        )
+
+        # 4. Execute Split/Clone
+        metric_mask = importance_score > args.importance_score_threshold if importance_score is not None else torch.ones_like(final_clone_mask)
+
+        self.densify_and_clone_structgs(metric_mask, final_clone_mask)
+        
+        # Call Analytic Split
+        combined_split_mask = torch.logical_and(metric_mask, final_split_mask)
+        self.densify_and_split_structgs(combined_split_mask, max_eta_3ch=max_eta_3ch, scale_power=args.ks_scale_power)
+
+        # --- Pruning ---
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
+        
+        # Apply custom prune mask
+        n_new = prune_mask.shape[0]
+        n_old = full_prune_mask.shape[0]
+        if n_new > n_old:
+            padding = torch.zeros(n_new - n_old, dtype=torch.bool, device="cuda")
+            full_prune_mask = torch.cat([full_prune_mask, padding])
+            
+        prune_mask = torch.logical_or(prune_mask, full_prune_mask)
+
+        if pruning_score is not None:
+            scores = 1 - pruning_score 
+            to_remove = torch.sum(prune_mask)
+            remove_budget = int(0.5 * to_remove)
+
+            if remove_budget:
+                n_init_points = self.get_xyz.shape[0]
+                padded_importance = torch.zeros((n_init_points), dtype=torch.float32)
+                padded_importance[:scores.shape[0]] = 1 / (1e-6 + scores.squeeze())
+                selected_pts_mask = torch.zeros_like(padded_importance, dtype=bool, device="cuda")
+                sampled_indices = torch.multinomial(padded_importance, remove_budget, replacement=False)
+                selected_pts_mask[sampled_indices] = True
+                final_prune = torch.logical_and(prune_mask, selected_pts_mask)
+                self.prune_points(final_prune)
+        else:
+            self.prune_points(prune_mask)
+        
+        opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.8))
+        optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
+        self._opacity = optimizable_tensors["opacity"]
+        tmp_radii = self.tmp_radii
+        self.tmp_radii = None
+
+        torch.cuda.empty_cache() 
+        
+    def final_prune_structgs(self, min_opacity, pruning_score = None):
+        """Final-stage pruning: remove Gaussians based on opacity and multi-view consistency.
+        In the final stage we remove Gaussians that have low opacity or that are flagged by
+        our multi-view reconstruction consistency metric (provided as `pruning_score`)."""
+        prune_mask = (self.get_opacity < min_opacity).squeeze() 
+        scores_mask = pruning_score > 0.9
+        final_prune = torch.logical_or(prune_mask, scores_mask)
+        self.prune_points(final_prune) 
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
@@ -855,7 +1347,11 @@ class GaussianModel:
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_confidence = self._confidence[selected_pts_mask].repeat(N,1)
         new_segmentation = self._segmentation[selected_pts_mask].repeat(N,1)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_confidence, new_segmentation)
+        
+        new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_filter_3D = self.filter_3D[selected_pts_mask].repeat(N, 1)
+        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter_3D)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -893,9 +1389,15 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
         new_confidence = self._confidence[selected_pts_mask]
         new_segmentation = self._segmentation[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation)
+        
+        new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_filter_3D = self.filter_3D[selected_pts_mask] 
+        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter_3D)
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, abs_grad_for_densification=False, clone_with_sampling=False):
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, abs_grad_for_densification=False, clone_with_sampling=False):
+        self.tmp_radii = radii
+ 
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
@@ -928,7 +1430,12 @@ class GaussianModel:
         self.prune_points(prune_mask)
         
         prune = self._xyz.shape[0]        
+        
+        tmp_radii = self.tmp_radii
+        self.tmp_radii = None 
+        
         torch.cuda.empty_cache()
+        
         return clone - before, split - clone, split - prune
     
 

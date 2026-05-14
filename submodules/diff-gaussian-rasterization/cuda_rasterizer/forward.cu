@@ -221,6 +221,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	float * cov2Ds,
 	bool prefiltered)
 {
 #define RETURN_OR_INACTIVE() if constexpr(TILE_BASED_CULLING && LOAD_BALANCING) { active = false; } else { return; }
@@ -300,7 +301,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	float det, convolution_scaling_factor;
 	glm::vec3 cov2D = dilateCov2D(cov, splatting_settings.proper_ewa_scaling, det, convolution_scaling_factor);
-	if (det == 0.0f)
+
+        if (det == 0.0f)
 		RETURN_OR_INACTIVE();
 
 	// Invert covariance (EWA algorithm)
@@ -328,6 +330,19 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	const glm::mat4 viewproj_mat = loadMatrix4x4(projmatrix);
 	const glm::vec3 p_proj = world2ndc(mean3D, viewproj_mat);
 	const float2 mean2D = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+
+
+	// Store raw 2D covariance for Python access
+	if(cov2Ds){
+          cov2Ds[idx * 7 + 0] = cov2D.x;
+          cov2Ds[idx * 7 + 1] = cov2D.y;
+          cov2Ds[idx * 7 + 2] = cov2D.z;
+          cov2Ds[idx * 7 + 3] = mean2D.x;
+          cov2Ds[idx * 7 + 4] = mean2D.y;
+          cov2Ds[idx * 7 + 5] = p_view.z;
+          cov2Ds[idx * 7 + 6] = 0.0f;
+        }
+
 
 	uint2 rect_min, rect_max;
 	float2 bb_center;
@@ -893,6 +908,7 @@ void FORWARD::render(
 	float* final_T, //= accum_alpha
 	uint32_t* n_contrib,
 	float* max_weights,
+	float* cov2Ds,
 	const float* bg_color,
 	DebugVisualizationData& debugVisualization,
 	float* out_color,
@@ -959,7 +975,7 @@ void FORWARD::render(
 	else if (splatting_settings.sort_settings.sort_mode == SortMode::HIERARCHICAL)
 	{
 #define CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT) sortGaussiansRayHierarchicalCUDA_forward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, EXACT_DEPTH, DEBUG, CONSIDER_MAX_WEIGHT><<<grid, {16, 4, 4}>>>( \
-ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, debugVisualization.type, out_color, gt_color)
+ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
 #define CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH) if (splatting_settings.consider_max_weight) { CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, true); } else { CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, false); }
 
 #define CALL_HIER_EXACT_DEPTH(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG) if (splatting_settings.exact_depth) { CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, true); } else { CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, false); }
@@ -1137,6 +1153,7 @@ void FORWARD::preprocess(int P, int D, int M,
 	float4* conic_opacity,
 	const dim3 grid,
 	uint32_t* tiles_touched,
+	float* cov2Ds,
 	bool prefiltered)
 {
 #define PREPROCESS_CALL_DEBUG(TBC, LB, ENABLE_DEBUG_VIZ) \
@@ -1172,6 +1189,7 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity, \
 		grid, \
 		tiles_touched, \
+		cov2Ds, \
 		prefiltered \
 		);
 	

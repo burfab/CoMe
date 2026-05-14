@@ -53,6 +53,54 @@ def PILtoTorch(pil_image, resolution):
         return resized_image.permute(2, 0, 1)
     else:
         return resized_image.unsqueeze(dim=-1).permute(2, 0, 1)
+    
+def get_reset_expon_lr_func(
+lr_init, 
+lr_final, 
+reset_step, 
+reset_lr_init, 
+lr_delay_steps=0, 
+lr_delay_mult=1.0, 
+max_steps=1000000
+):
+    """
+    Exponential decay that resets at reset_step to reset_lr_init, 
+    then decays to lr_final by max_steps.
+    """
+    
+    def helper(step):
+        if step < 0 or (lr_init == 0.0 and lr_final == 0.0):
+            return 0.0
+
+        # Determine phase
+        if step < reset_step:
+            # Phase 1: Initial decay
+            current_lr_init = lr_init
+            # We treat the first phase as if it's aiming for lr_final over max_steps
+            t = np.clip(step / max_steps, 0, 1)
+        else:
+            # Phase 2: Reset and faster decay
+            current_lr_init = reset_lr_init
+            # Recalculate 't' to start from 0 at reset_step and hit 1 at max_steps
+            # This makes the decay "faster" because it has less time to reach lr_final
+            t = np.clip((step - reset_step) / (max_steps - reset_step), 0, 1)
+
+        # Learning rate delay logic (standard reverse cosine)
+        if lr_delay_steps > 0 and step < lr_delay_steps:
+            delay_rate = lr_delay_mult + (1 - lr_delay_mult) * np.sin(
+                0.5 * np.pi * np.clip(step / lr_delay_steps, 0, 1)
+            )
+        else:
+            delay_rate = 1.0
+
+        # Log-linear interpolation (Exponential decay)
+        # Using current_lr_init which changes after reset_step
+        log_lerp = np.exp(np.log(current_lr_init) * (1 - t) + np.log(lr_final) * t)
+        
+        return delay_rate * log_lerp
+
+    return helper 
+    
 
 def get_expon_lr_func(
     lr_init, lr_final, lr_delay_steps=0, lr_delay_mult=1.0, max_steps=1000000

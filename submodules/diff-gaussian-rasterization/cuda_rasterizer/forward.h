@@ -55,6 +55,7 @@ namespace FORWARD
 		float4* conic_opacity,
 		const dim3 grid,
 		uint32_t* tiles_touched,
+		float * cov2Ds,
 		bool prefiltered);
 
 	void duplicate(int P,
@@ -95,6 +96,7 @@ namespace FORWARD
 		float* final_T,
 		uint32_t* n_contrib,
 		float* max_weights,
+		float* cov2Ds,
 		const float* bg_color,
 		DebugVisualizationData& debugVisualization,
 		float* out_color,

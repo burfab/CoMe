@@ -11,6 +11,9 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
+constexpr float SIGMA_MUL = 2.67f;
+
+
 template<typename T, size_t S>
 __device__ void initArray(T(&arr)[S], T v = 0)
 {
@@ -982,6 +985,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
 	float* __restrict__ max_weights,
+	float* __restrict__ cov2Ds,
 	CudaRasterizer::DebugVisualization debugType,
 	float* __restrict__ out_color,
 	float* __restrict__ gt_color)
@@ -1060,12 +1064,13 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 			[[maybe_unused]] const float CC = ABC_.z;
 
 			float test_T = blend_data.T * (1.0f - alpha);
-			if (test_T < 0.0001f)
-			{
-				return false;
+			// Keep track of max transmittance for this Gaussian
+			if(cov2Ds){
+				atomicMax((int *)&cov2Ds[id * 7 + 6],
+						__float_as_int(blend_data.T));
 			}
 
-			blend_data.blend_contributor++;
+                        blend_data.blend_contributor++;
 			const float weight = alpha * blend_data.T;
 
 			// only do this when enabled to reduce memory pressure
@@ -1115,18 +1120,19 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
             {
 				if constexpr (EXACT_DEPTH) {
 					if (test_T < 0.5f) {
-						float Fp = (-0.5/(blend_data.T*conic_opacity[id].w)) + (1.0f/conic_opacity[id].w);
-						float con = CC + 2 * logf(Fp);
-						// why does this need to be abs?
-						// TODO: new formulation with variance along the Gaussian
-						float disc = abs(BB*BB - 4* AA*(con));
-						float median_t = sqrtf(disc + 1e-9);
-
-						// TODO: can we somehow scrap fminf
-						// -BB, 1/2A are always positive (experiments)
-						// median_t is always positive, due to being the sqrt of a positive nmber - only this one makes sense
-						median_t = (-BB - median_t)/2.0f/AA;
-						blend_data.depth = median_t;
+						// Regularization strength
+						float lambda = 1;   // tune this
+						const float t0 = t;
+						float mu = -BB/(2.0*AA);
+						float inv_A = 1.f/AA;
+						float sigma = sqrtf(inv_A);
+						// Original coefficients (as in your setup)
+						float Fp = (-0.5f / (blend_data.T * conic_opacity[id].w)) + (1.0f / conic_opacity[id].w);
+						float log_fp = logf(Fp);
+						float offset = sqrtf(fmaxf(0.f,-2.f * log_fp * inv_A));
+						float clamped_offset = fminf(offset, SIGMA_MUL * sigma);
+						float t_star = mu - clamped_offset;
+						blend_data.depth = t_star;
 					}
 					else {
 						blend_data.depth = t;
@@ -1137,7 +1143,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 				}
 				blend_data.max_contributor++;
             }
-			else {
+			else{
 				// TODO: test if t* < t
 				// if so, we have an issue
 				float alpha_point = alpha;
@@ -1199,6 +1205,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 
 			blend_data.T = test_T;
 
+
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}
 			return true;
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
@@ -1213,7 +1224,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 			// add variance of blended background color
 			for(int ch = 0; ch < CHANNELS; ch++)
 			{
-				blend_data.variance += blend_data.T * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
+				//CHANGED VARIANCE BEHAVIOUR
+				//blend_data.variance += blend_data.T * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
 			}
 			// +++++++++Variance Loss ++++++++++
 
@@ -1332,10 +1344,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 		{
 			// accumulate the opacity up to the current contributor
 			float test_T = blend_data.T * (1.0f - alpha);
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}
 
 			const float weight = alpha * blend_data.T;
 			// TODO: consider using vectors and better loads?
@@ -1346,6 +1354,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 
 
 			blend_data.T = test_T;
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}
 			return true;
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
@@ -1426,8 +1438,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			if (++blend_data.current_contributor > blend_data.max_contributor) {
 				return false;
 			}
-
 			float alpha_point = alpha;
+
 			if (t > blend_data.max_depth) {
 				[[maybe_unused]] const float AA = ABC_.x;
 				[[maybe_unused]] const float BB = ABC_.y;
@@ -1474,7 +1486,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 }
 
 
-template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true>
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false>
 __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_backward(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
@@ -1662,10 +1674,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 
 			const float alpha = min(0.99f, con_o.w * G);
 			float test_T = blend_data.T * (1.0f - alpha);
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}			
 			//++++++++++++GOF		
 
 			// NDC mapping is taken from 2DGS paper, please check here https://arxiv.org/pdf/2403.17888.pdf
@@ -1804,17 +1812,39 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				// blend_data.depth_global_id = global_id;
 				// blend_data.dt_dA = BB / (2 * AA * AA);
 				// blend_data.dt_dB = -1.f / (2 * AA);
+#define CORRECT_EXACT_DEPTH_GRAD
 #ifdef CORRECT_EXACT_DEPTH_GRAD
-				float Fp = (-0.5/(blend_data.T*ABC_.w)) + (1.0f/ABC_.w);
-				float con = CC + 2 * logf(Fp);
-				// why does this need to be abs?
-				// TODO: new formulation with variance along the Gaussian
-				float disc = abs(BB*BB - 4* AA*(con));
-				float median_t = sqrtf(disc + 1e-9);
+				// --- 1. Forward Re-evaluation (Re-calculate values for gradients) ---
+				float inv_A = 1.f / AA;
+				float mu = -BB * 0.5f * inv_A;
+				
+				float Fp = (-0.5f / (blend_data.T * ABC_.w)) + (1.0f / ABC_.w);
+				float log_fp = logf(Fp);
+				// We use a small epsilon for the sqrt to keep the gradient from exploding
+				float inner = -2.f * log_fp * inv_A;
+				float offset = sqrtf(fmaxf(1e-8f, inner));
 
-				dL_dA += blend_data.dL_dmax_depth * (BB * BB - 2 * AA * (con)) / (median_t * 2 * AA * AA);
-				dL_dB += blend_data.dL_dmax_depth * t / median_t;
-				dL_dC += blend_data.dL_dmax_depth / median_t; 
+				// --- 2. STE Gradient Logic ---
+				// We treat t = mu - offset as differentiable everywhere, 
+				// ignoring the SIGMA_MUL clamp's derivative (STE).
+				
+				float dL_dt_total = blend_data.dL_dmax_depth;
+
+				// d_mu/dA = B / (2 * A^2)
+				// d_mu/dB = -1 / (2 * A)
+				dL_dA += dL_dt_total * (BB * 0.5f * inv_A * inv_A);
+				dL_dB += dL_dt_total * (-0.5f * inv_A);
+
+				// d_offset/dA = d/dA (sqrt(-2 * log_fp * A^-1))
+				//             = 0.5 * (inner)^-0.5 * (2 * log_fp * A^-2)
+				// Simplified: = offset / (-2.0f * AA)
+				// We apply the negative sign from: t = mu - offset
+				dL_dA += dL_dt_total * (0.5f * offset * inv_A);
+
+				// Note on dL_dC: 
+				// In the variance formulation (mu/sigma), depth is usually 
+				// decoupled from the 2D normalization constant C. 
+				// If your forward t_star doesn't use CC, dL_dC is 0.
 #endif
 			}
 
@@ -1822,6 +1852,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			
 			// here, the depth of the Gaussian is larger than the depth of the pixel
 			float alpha_point = 0.f;
+
+
 			if (t > blend_data.max_depth) {
 				// TODO: propagate gradient to AA, BB, CC directly
 				float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
@@ -2011,6 +2043,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
                }
             }
 #endif
+
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}			
 			return true;
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
@@ -2128,10 +2165,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 		{
 			// accumulate the opacity up to the current contributor
 			float test_T = blend_data.T * (1.0f - alpha);
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}			
 			const float dchannel_dcolor = alpha * blend_data.T;
 			// TODO: consider using vectors and better loads?
 			for (int ch = 0; ch < N_EXTRA_FEATURES; ch++) {
@@ -2140,6 +2173,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			}
 
 			blend_data.T = test_T;
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}			
 			return true;
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)

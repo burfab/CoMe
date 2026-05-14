@@ -39,16 +39,35 @@ def depth_to_normal(view, depth):
     return output, points
 
 threshold = 2
-def central_diff(image):
+def central_diff(image, ignore_inval = None):
     """
         image
     """
     output = torch.zeros_like(image)[:,:,0]
+    
     dx = torch.cat([image[2:, 1:-1] - image[:-2, 1:-1]], dim=0)
     dy = torch.cat([image[1:-1, 2:] - image[1:-1, :-2]], dim=1)
     
-    #w = torch.clamp_max(1.0 / (dx*dx + dy*dy), 2.0).detach()
-    #boundary_mask = torch.abs(dx[0,:]) > threshold | torch.abs(dy[0,:]) > threshold
-    output[1:-1, 1:-1] = torch.norm(dx, dim=-1) + torch.norm(dy, dim=-1)
+    if ignore_inval is not None:
+        ignore_inval = ignore_inval.reshape(1,1,-1)
+        valid_dx = (
+            ~(image[2:, 1:-1] == ignore_inval).all(-1) &
+            ~(image[:-2, 1:-1] == ignore_inval).all(-1)
+        )
+
+        valid_dy = (
+            ~(image[1:-1, 2:] == ignore_inval).all(-1) &
+            ~(image[1:-1, :-2] == ignore_inval).all(-1)
+        )
+
+        output[1:-1, 1:-1] = (
+            torch.norm(dx, dim=-1) * valid_dx +
+            torch.norm(dy, dim=-1) * valid_dy
+        )
+    else:
+        output[1:-1, 1:-1] = (
+            torch.norm(dx, dim=-1) +
+            torch.norm(dy, dim=-1)
+        )
     return output
 

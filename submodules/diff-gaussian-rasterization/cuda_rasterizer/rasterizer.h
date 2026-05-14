@@ -367,6 +367,7 @@ namespace CudaRasterizer
 			float* gt_color,
 			int* radii = nullptr,
 			float* max_weights = nullptr,
+			float* cov2Ds = nullptr,
 			bool debug = false);
 
 		static void backward(

@@ -24,7 +24,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], skip_train=False, skip_test=False, MCMC_init=False):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], skip_train=False, skip_test=False, MCMC_init=False, add_bbox_faces=False):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -96,7 +96,7 @@ class Scene:
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"))
         else:
-            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, MCMC_init=MCMC_init)
+            self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent, MCMC_init=MCMC_init, add_bbox=add_bbox_faces)
 
     def save(self, iteration, appearance_embedding, segmentation_network, deform_model):
         import torch

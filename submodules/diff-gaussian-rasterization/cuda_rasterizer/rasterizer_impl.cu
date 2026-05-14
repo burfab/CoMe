@@ -416,6 +416,7 @@ int CudaRasterizer::Rasterizer::forward(
 	float* gt_color,
 	int* radii,
 	float* max_weights,
+	float* cov2D,
 	bool debug)
 {
 	static Timer timer({ "FW Preprocess", "FW Render", "FW Opacity" });
@@ -480,6 +481,7 @@ int CudaRasterizer::Rasterizer::forward(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
+		cov2D,
 		prefiltered
 	), debug)
 
@@ -559,6 +561,7 @@ int CudaRasterizer::Rasterizer::forward(
 		imgState.accum_alpha,
 		imgState.n_contrib,
 		max_weights,
+		cov2D,
 		background,
 		debugVisualization,
 		out_color,
@@ -1203,6 +1206,7 @@ int CudaRasterizer::Rasterizer::integrate(
 		geomState.conic_opacity,
 		tile_grid,
 		geomState.tiles_touched,
+		nullptr,
 		prefiltered
 	), debug)
 

@@ -22,7 +22,10 @@ conn = None
 addr = None
 
 listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
+import atexit
 def init(wish_host, wish_port):
     global host, port, listener
     host = wish_host
@@ -30,7 +33,8 @@ def init(wish_host, wish_port):
     listener.bind((host, port))
     listener.listen()
     listener.settimeout(0)
-
+    atexit.register(listener.close) 
+    
 def try_connect():
     global conn, addr, listener
     try:

@@ -188,14 +188,15 @@ class SplattingSettings():
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
         self.iterations = 30_000
-        self.position_lr_init = 0.00016
+        self.position_lr_init = 0.00016 * 3
+        self.position_lr_reset_interval = 2000
         self.position_lr_final = 0.0000016
-        self.position_lr_delay_mult = 0.01
+        self.position_lr_delay_mult = 0.01 / 3
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0025
-        self.confidence_lr = 0.00025
-        self.segmentation_lr = 1e-3
-        self.segmentation_network_lr = 1e-3
+        self.feature_lr = 0.0025 * 3
+        self.confidence_lr = 0.00025 * 3
+        self.segmentation_lr = 1e-3 
+        self.segmentation_network_lr = 1e-4
         self.segmentation_network_first_step = 0
         self.opacity_lr = 0.05
         self.scaling_lr = 0.005
@@ -221,8 +222,49 @@ class OptimizationParams(ParamGroup):
         self.k_push = 5
         self.lambda_pull = 0.05 #0.05
         self.lambda_push = 0.15
-        self.reg_max_points = 300000
+        self.reg_max_points = 100000
         self.reg_sample_size = 5000  
+        
+        
+        # frequency parameters
+        self.lambda_l2 = 2.0
+        self.lambda_tone=0.
+        self.lambda_freq = 0.01 # Frequency-based loss weight
+        self.st_levels = 4
+        self.st_mode = "v1" # "v1" or "v2"
+        
+        self.freq_grad_threshold = 0.00002
+        self.importance_score_threshold = 0.5
+        self.min_contribution_threshold = 0.1
+        self.importance_error_threshold = 0.06
+        self.add_bbox_faces = False
+        self.warmup_densification = False
+        self.camera_sampling = "fps"
+        
+        # expansion parameters
+        self.tau_expand = 1.0
+        self.adaptive_clone = False # [NEW] Enable frequency-aware scale expansion before cloning
+        self.expansion_speed = 0.1
+        self.ks_scale_power = 1.0  # Exponent for scale division when splitting (new_scale = old_scale / k^scale_power)
+        
+        # initialization parameters
+        self.sample_far_plane = False
+        self.far_plane_dist = 10.0
+        self.far_plane_res = 32
+        self.densification_window_width = 200  # Number of iterations to run densification per window
+        self.freq_opacity_threshold = 0.05
+        self.freq_transmittance_threshold = 0.0
+        self.batch_size = 1  # Number of cameras to accumulate gradients from before optimizer step
+        self.split_ratio_threshold = 0.8
+        self.prune_ratio_threshold = 0.8
+        self.eta_compute_mode = "wavelength" # "wavelength" or "projection"
+        
+        # Multi-clone parameters
+        self.clone_target_eta = 1.0  # Target eta for low-frequency areas (lower = more clones)
+        self.scale_rotation_scheduler = False
+        self.max_clones_per_axis = 8 # Maximum number of clones per axis
+        self.adam_eps_order = 8
+ 
         
         
         super().__init__(parser, "Optimization Parameters")
@@ -241,7 +283,7 @@ class MeshingParams(ParamGroup):
         # color confidence (default settings)
         self.color_confidence = False
         self.color_confidence_max = 0.075
-        self.color_confidence_from_iter = 500
+        self.color_confidence_from_iter = 1500
 
         # custom variance losses
         self.lambda_variance = 0.0

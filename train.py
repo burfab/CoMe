@@ -27,6 +27,7 @@ from utils.depth_utils import depths_to_points, depth_to_normal, central_diff
 from utils.vis_utils import gui_visualize, export_image
 from utils import segmentation_utils
 from utils import deform_utils
+from utils import densify_utils
 from scene.gaussian_model import build_scaling_rotation
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
 from decoupled_fused_ssim import fused_ssim
@@ -34,7 +35,7 @@ import numpy as np
 from scene.appearance_network import AppearanceEmbedding, VastGaussianAppearanceEmbedding, SSIMDecoupledAppearanceEmbedding
 from functools import partial
 import copy
-from scene.densifier import AbsGradDensifier, MCMCDensifier, MSv2AbsGradDensifier
+from scene.densifier import AbsGradDensifier, MCMCDensifier, MSv2AbsGradDensifier, CustomDensifier
 import warnings
 
 RED = '\033[31m'
@@ -77,7 +78,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     # TODO: reintroduce tensorboard to log how many Gaussians we densify, etc.
     tb_writer = prepare_output_and_logger(dataset, splat_args, opt, pipe, mesh)
     gaussians = GaussianModel(dataset.sh_degree, use_SBs=pipe.convert_SBs_python)
-    scene = Scene(dataset, gaussians, MCMC_init=mesh.cap_max != -1)
+    scene = Scene(dataset, gaussians, MCMC_init=mesh.cap_max != -1, add_bbox_faces=opt.add_bbox_faces)
     trainCameras = scene.getTrainCameras().copy() 
     
     segmentation_classes_set = set()
@@ -102,12 +103,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     deform_model.training_setting()
     
     if mesh.use_vastgaussian_appearance:
-        appearance_embedding = VastGaussianAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
+        appearance_embedding = VastGaussianAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim, lambda_l2=opt.lambda_l2)
     elif mesh.use_ssimdecoupled_appearance:
-        appearance_embedding = SSIMDecoupledAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
+        appearance_embedding = SSIMDecoupledAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim, lambda_l2=opt.lambda_l2)
     else:
         warnings.warn("Unknown appearance embedding, using default (No Appearance Embedding)")
-        appearance_embedding = AppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim)
+        appearance_embedding = AppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim, lambda_l2=opt.lambda_l2)
     gaussians.training_setup(opt, mesh, appearance_embedding)
     if checkpoint:
         (model_params, first_iter, (_appearance_embedding), (_segmentation_network, _segmentation_network_optim), _deform_model) = torch.load(checkpoint, weights_only=False)
@@ -122,7 +123,10 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
     # TODO: same strategy as for the appearance embedding
-    if mesh.use_msv2_simplification:
+    
+    if True:
+        densifier = CustomDensifier(gaussians, opt, mesh, dataset, pipe, scene.cameras_extent)
+    elif mesh.use_msv2_simplification:
         densifier = MSv2AbsGradDensifier(gaussians, opt, mesh, dataset, pipe)
     elif mesh.cap_max == -1:
         densifier = AbsGradDensifier(gaussians, opt, mesh, dataset, pipe)
@@ -140,12 +144,44 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     # at first, we don't need the opacity
     splat_args.render_opacity = False
     
+    structure_tensor_cache = densify_utils.precompute_structure_tensors(scene, opt.st_mode, opt.st_levels)
+    
+    class BatchStats:
+        # [NEW] Batch Training: accumulate gradients from multiple cameras
+        def __init__(self, max_batch_size, device="cuda"):
+            self.batch_loss = 0.0
+            self.batch_rgb_loss = 0.0
+            self.last_radii = None
+            self.last_visibility_filter = None
+            self.batch_size = 0
+            self.max_batch_size = max_batch_size
+        def complete(self):
+            return self.batch_size == self.max_batch_size
+        def on_frame(self, loss, rgb_loss, radii, visibility_filter):
+            self.batch_loss += loss.item()
+            self.batch_rgb_loss += rgb_loss.item()
+            self.last_radii = radii
+            self.last_visibility_filter = visibility_filter
+            self.batch_size+=1
+            
+    
+    masks_selfgenerated = {}
+    
+    
+    batch = None
+    
+    for iteration in checkpoint_iterations: assert (iteration % opt.batch_size) == 0, "Must be a multiple of batch size"
+        
+    
     gaussians.compute_3D_filter(cameras=trainCameras, CUDA=not pipe.compute_filter3D_python)
     viewpoint_stack = None
     ema_loss_for_log = 0.0
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
     for iteration in range(first_iter, opt.iterations + 1):        
+        if batch is None or batch.complete():
+            batch = BatchStats(opt.batch_size,gaussians.get_xyz.device)
+        
         if network_gui.conn == None:
             network_gui.try_connect()
         while network_gui.conn != None:
@@ -200,6 +236,26 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             except Exception as e:
                 print(e)
                 network_gui.conn = None
+                
+        bg = torch.rand((3), device="cuda") if opt.random_background else background
+        if iteration == mesh.distortion_from_iter:
+            with torch.no_grad():
+                all_cameras = scene.getTrainCameras().copy()
+                import cv2
+                splat_args_exact_depth = splat_args.exact_depth
+                cv2.namedWindow("MASK", cv2.WINDOW_NORMAL)
+                for c in tqdm(all_cameras):
+                    splat_args.render_opacity = True
+                    splat_args.exact_depth = False
+                    render_pkg = render(c, gaussians, pipe, bg, splat_args=splat_args, gt_color=None, deformation=deform_utils.Deformation())
+                    mask = render_pkg["render"][7]
+                    masks_selfgenerated[c.uid] = torch.nn.functional.sigmoid((mask-0.1)*20).detach().cpu()
+                    cv2.imshow("MASK",(masks_selfgenerated[c.uid].numpy()*255).astype(np.uint8))
+                    cv2.waitKey(1)
+                cv2.destroyAllWindows()
+                splat_args.exact_depth = splat_args_exact_depth
+                gaussians.reset_confidence()
+                
 
         iter_start.record()
 
@@ -210,16 +266,20 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
+        # Pop from the start of the FPS-sorted list
         if not viewpoint_stack:
             viewpoint_stack = scene.getTrainCameras().copy()
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
-        else:
-            viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+            if opt.camera_sampling == "fps":
+                viewpoint_stack = densify_utils.sampling_cameras(viewpoint_stack, mode="fps", num_cams=len(viewpoint_stack))
+            else:
+                import random
+                random.shuffle(viewpoint_stack)
+        viewpoint_cam = viewpoint_stack.pop(0)
+        if len(viewpoint_stack) == 0: viewpoint_stack = None
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        bg = torch.rand((3), device="cuda") if opt.random_background else background
         if iteration > mesh.distortion_from_iter and mesh.lambda_opacity_field > 0.0:
             splat_args.render_opacity = True
 
@@ -234,10 +294,14 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         else: deformation = deform_utils.Deformation()
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach(), deformation=deformation)
-        rendering, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+        rendering, viewspace_point_tensor, visibility_filter, radii, cov2D = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["cov2D"]
 
         opacity = rendering[7]
         image = rendering[:3, :, :]
+        gt_segmentation = viewpoint_cam.seg_mask.cuda().squeeze(0).long()
+        
+        mask = (masks_selfgenerated[viewpoint_cam.uid] if iteration >= (mesh.distortion_from_iter+0) else (gt_segmentation > 0).float().detach()).cuda()
+        mask = mask #* (mask > 0.5)
         
         # custom variance losses
         variance = rendering[11, :, :]
@@ -248,7 +312,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         confidence_log_term_mean = None
         confidence_neg_alpha_log_term_mean = None
         
-
+        gt_image = gt_image * mask + bg[:, None, None] * (1-mask)
+        
         # TODO: don't mean the SSIM
         if mesh.color_confidence and iteration >= mesh.color_confidence_from_iter:  
 
@@ -264,7 +329,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # Gradient w.r.t. confidence: rgb_loss_og - alpha/confidence
             # At confidence=1e-3: alpha/confidence = 0.2/1e-3 = 200 (reasonable)
             # At confidence=1e-6: alpha/confidence = 0.2/1e-6 = 200,000 (problematic)
-            rgb_loss = pp_rgb_loss * confidence - alpha * torch.log(confidence)
+            rgb_loss = (pp_rgb_loss * confidence - alpha * torch.log(confidence))
 
             # Confidence-specific terms for TensorBoard diagnostics.
             confidence_pp_rgb_loss_mean = pp_rgb_loss.mean()
@@ -281,24 +346,23 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         #Segmentation Loss
         if render_segmentation:
             #gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
-            gt_segmentation = viewpoint_cam.seg_mask.cuda().squeeze(0).long()
             gt_segmask = gt_segmentation
             feature_map = rendering[-gaussians.segmentation_dimension:rendering.shape[0],:,:]
             assert feature_map.shape[0] == gaussians.segmentation_dimension
             
             if iteration >= opt.segmentation_network_first_step:
                 #y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(torch.clamp_min(feature_map.detach().unsqueeze(0),1e-6).log(), True)
-                y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(feature_map.detach().unsqueeze(0), True)
-                seg_network_loss = torch.nn.functional.cross_entropy(y_seg_network , gt_segmask.unsqueeze(0)) + seg_network_reg * 1e-4
+                y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(gaussians.segmentation_inverse_activation(feature_map).unsqueeze(0), True)
+                seg_network_loss = segmentation_utils.structured_hinge_segmentation(gt_image.unsqueeze(0).detach(), y_seg_network, gt_segmask.unsqueeze(0))*1e-3 + seg_network_reg * 1e-4
             # Clustering Loss
-            if iteration % opt.contrastive_interval == 0:
-                feature_map = feature_map.permute(1, 2, 0)
+            if iteration % opt.contrastive_interval == 0 and False:
+                feature_map = (gaussians.segmentation_inverse_activation(feature_map)).permute(1, 2, 0)
                 gt_segmasks = gt_segmask.long()
                 id_unique_list, n_i_list = segmentation_utils.get_unique_id_list(gt_segmasks, opt.min_pixnum, segmentation_classes_set)
-                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_network.segmentation_prototypes,lambda_val=opt.contrastive_lambda)
+                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_network.get_prototypes(),lambda_val=opt.contrastive_lambda)
 
             # Spatial-similarity Loss
-            if iteration % opt.spatial_similarity_interval == 0:
+            if iteration % opt.spatial_similarity_interval == 0 and False:
                 features3d = gaussians.get_segmentation
                 seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
                 
@@ -313,11 +377,17 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         if depth.isnan().sum() > 0:
             print("DEPTH IS NAN!!!!!")
             depth[depth.isnan()] = 0.0
+        
+        
         depth_normal, _ = depth_to_normal(viewpoint_cam, depth[None, ...])
         depth_normal = depth_normal.permute(2, 0, 1)
 
         render_normal = rendering[3:6, :, :]
         render_normal = torch.nn.functional.normalize(render_normal, p=2, dim=0)
+        
+        mask_no_normal1 = (depth_normal == torch.zeros_like(depth_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
+        mask_no_normal2 = (render_normal == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
+        mask_no_normal = mask_no_normal1 | mask_no_normal2
         
         # c2w = (viewpoint_cam.world_view_transform.T).inverse()
         # if we only need the rotation, why bother with the inverse
@@ -325,35 +395,37 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         normal2 = c2w[:3, :3] @ render_normal.reshape(3, -1)
         render_normal_world = normal2.reshape(3, *render_normal.shape[1:])
         
-        nabla_I = central_diff(viewpoint_cam.original_image.permute(1,2,0)).cuda()
+        nabla_I = central_diff(gt_image.permute(1,2,0)).cuda()
         
         normal_error = (1 - (render_normal_world * depth_normal).sum(dim=0))
-        depth_normal_loss = normal_error.mean()
+        depth_normal_loss = (normal_error * (~mask_no_normal.squeeze(0) * mask)).mean()
         
         lambda_distortion = mesh.lambda_distortion if iteration >= mesh.distortion_from_iter else 0.0
         lambda_depth_normal = mesh.lambda_depth_normal if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff(render_normal_world.permute(1,2,0)) * torch.exp(-nabla_I)
-        normal_loss = normal_loss.mean()
+        normal_loss = central_diff(render_normal_world.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal_world[:,0,0])) * torch.exp(-nabla_I)
+        normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 
         lambda_opacity_field = mesh.lambda_opacity_field if iteration >= mesh.distortion_from_iter else 0.0
-        opa_loss = (opacity - 0.5)**2
+        opa_loss = ((opacity - 0.5)*mask)**2
 
         #Ll1opacity_smoothness = central_diff(rendering[7][..., None]) * torch.exp(-nabla_I)
         opa_loss = opa_loss.mean()
         
         lambda_extent = mesh.lambda_extent if iteration >= mesh.distortion_from_iter else 0.0
         extent_loss = rendering[9]
-        extent_loss = extent_loss.mean()
+        extent_loss = (extent_loss*mask).mean()
         
         rgb_loss_mean = rgb_loss.mean()
         
         lambda_variance = mesh.lambda_variance if iteration >= mesh.variance_from_iter else 0.0
         lambda_normal_variance = mesh.lambda_normal_variance if iteration >= mesh.normal_variance_from_iter else 0.0
-        variance_loss = variance.mean()
-        normal_variance_loss = normal_variance.mean()
+        variance_loss = (variance*mask).mean()
+        normal_variance_loss = (normal_variance*mask).mean()
+        
+        #freq_loss = densify_utils.frequency_loss_simple(image, structure_tensor_cache[viewpoint_cam.image_name])
         
         # Final loss
         loss =  rgb_loss_mean + \
@@ -368,21 +440,35 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
                 (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
                 seg_loss_obj + \
-                seg_loss_obj_3d 
+                seg_loss_obj_3d
+                #freq_loss * opt.lambda_freq
                 
         loss.backward(retain_graph=True)
         seg_network_loss.backward()
         
-        iter_end.record()
-
+        
+        
+        # [NEW] Online Accumulation (per camera in batch)
+        
+        batch.on_frame(loss, rgb_loss_mean, radii, visibility_filter)
         with torch.no_grad():
-            # Progress bar
-            ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Size": f"{len(gaussians._xyz)}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
+            if iteration < opt.densify_until_iter and iteration % 10 == 0:
+                densify_utils.update_freq_stats_online(viewpoint_cam, gaussians, cov2D, visibility_filter, structure_tensor_cache, viewspace_point_tensor=viewspace_point_tensor, grad_threshold= opt.freq_grad_threshold, transmittance_threshold=opt.freq_transmittance_threshold, opacity_threshold=opt.freq_opacity_threshold, eta_compute_mode=opt.eta_compute_mode) 
+        
+        
+        
+        batch_complete_or_last_iter = batch.complete() or iteration == opt.iterations
+        
+        iter_end.record()
+        with torch.no_grad():
+            if batch_complete_or_last_iter:
+                # Progress bar
+                ema_loss_for_log = 0.4 * (batch.batch_loss/max(batch.batch_size, 1)) + 0.6 * ema_loss_for_log
+                if (iteration//min(opt.batch_size,5)) % 10 == 0:
+                    progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}", "Size": f"{len(gaussians._xyz)}"})
+                    progress_bar.update(10)
+                if iteration == opt.iterations:
+                    progress_bar.close()
 
             # Log and save
             if iteration % 10 == 0 or iteration == opt.iterations:
@@ -417,33 +503,34 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 
 
             # Densification (AbsGrad or MCMC)
-            temp_splat_args = copy.deepcopy(splat_args)
-            temp_splat_args.consider_max_weight = True
-            render_simp = partial(render, pipe=pipe, bg_color=background, splat_args=temp_splat_args)
-            densifier.densify(
-                iteration=iteration,
-                visibility_filter=visibility_filter,
-                radii=radii,
-                viewspace_point_tensor=viewspace_point_tensor,
-                cameras_extent=scene.cameras_extent,
-                trainCameras=trainCameras,
-                render_simp=render_simp
-            )
+            if batch_complete_or_last_iter:
+                temp_splat_args = copy.deepcopy(splat_args)
+                temp_splat_args.consider_max_weight = True
+                render_simp = partial(render, pipe=pipe, bg_color=background, splat_args=temp_splat_args)
+                densifier.densify(
+                    iteration=iteration,
+                    visibility_filter=visibility_filter,
+                    radii=radii,
+                    viewspace_point_tensor=viewspace_point_tensor,
+                    cameras_extent=scene.cameras_extent,
+                    trainCameras=trainCameras,
+                    render_simp=render_simp
+                )
 
-            # Optimizer step
-            if iteration < opt.iterations:
-                gaussians.optimizer.step()
-                
-                if iteration >= opt.segmentation_network_first_step:
-                    segmentation_network_optim.step()
+                # Optimizer step
+                if iteration < opt.iterations:
+                    gaussians.optimizer.step()
                     
-                deform_model.optimizer_step(iteration)
-                    
-                deform_model.optimizer_zero_grad(set_to_none = True)
-                gaussians.optimizer.zero_grad(set_to_none = True)
-                segmentation_network_optim.zero_grad(set_to_none = True)
-                densifier.postfix(xyz_lr=xyz_lr)
-            
+                    if iteration >= opt.segmentation_network_first_step:
+                        segmentation_network_optim.step()
+                        
+                    deform_model.optimizer_step(iteration)
+                        
+                    deform_model.optimizer_zero_grad(set_to_none = True)
+                    gaussians.optimizer.zero_grad(set_to_none = True)
+                    segmentation_network_optim.zero_grad(set_to_none = True)
+                    densifier.postfix(xyz_lr=xyz_lr)
+            #Not entirely correct with batch size, just make sure its a multiple of batch size
             if (iteration in checkpoint_iterations) and iteration != first_iter:
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration, appearance_embedding.capture(), (segmentation_network.capture(), segmentation_network_optim.state_dict()), deform_model.capture()), scene.model_path + "/chkpnt" + str(iteration) + ".pth")

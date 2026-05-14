@@ -30,16 +30,26 @@ class Segmenter(torch.nn.Module):
         self.segmentation_prototypes = segmentation_prototypes
         self.n_classes = n_classes
         self.feature_dim = feature_dim
+        
+        
+    def get_prototypes(self):
+        #return torch.nn.functional.normalize(torch.cat([torch.zeros(1,self.feature_dim,device=self.segmentation_prototypes.device),self.segmentation_prototypes],dim=0), dim=-1)
+        return torch.nn.functional.normalize(self.segmentation_prototypes, dim=-1)
+        
     def forward_with_reg_loss(self, feature_map, compute_reg_loss=False):
-        W = torch.nn.functional.normalize(self.segmentation_prototypes, dim=-1)
+        W = self.get_prototypes()
         features_normalized = torch.nn.functional.normalize(feature_map, dim=1)
-        #(B, 1, F, H, W) * (B, C, F, 1, 1)
-        sim = ((features_normalized.unsqueeze(1) - W.reshape(*W.shape,1,1).unsqueeze(0))**2).mean(dim=-3)
-        orth_constraint = torch.tensor(0.0, dtype=torch.float32, device=feature_map.device, requires_grad=True)
+
+        # cosine similarity logits
+        scale = 10
+        sim = scale * torch.einsum('bchw,kc->bkhw', features_normalized, W)
+
+        orth_constraint = torch.tensor(0.0, device=feature_map.device)
         if compute_reg_loss:
-            orth_constraint = (((W @ W.T) - torch.eye(self.n_classes, device=W.device, dtype=W.dtype))**2).sum()
             pass
-        return -sim,orth_constraint
+            #orth_constraint = ((W @ W.T - torch.eye(self.n_classes, device=W.device))**2).sum()
+
+        return sim, orth_constraint
     def forward(self, feature_map):
         return self.forward_with_reg_loss(feature_map, False)[0]
     
@@ -55,6 +65,54 @@ class Segmenter(torch.nn.Module):
             "feature_dim": self.feature_dim,
             "n_classes": self.n_classes,
         }
+        
+def structured_hinge_segmentation(
+    image,        # (B, 3, H, W)
+    logits,       # (B, C, H, W)
+    target,       # (B, H, W)
+    margin=1.0,
+    lambda_smooth=1.0,
+    beta=None
+):
+    assert image.dtype == torch.float32
+    assert logits.dtype == torch.float32
+    B, C, H, W = logits.shape
+    image = image.detach()
+
+    # -----------------------
+    # 1. Pixel-wise hinge (unary term)
+    # -----------------------
+    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, C)
+    target_flat = target.view(-1)
+
+    idx = torch.arange(logits_flat.shape[0], device=logits.device)
+
+    correct = logits_flat[idx, target_flat][:, None]
+
+    loss = torch.clamp(logits_flat - correct + margin, min=0)
+    loss[idx, target_flat] = 0
+    unary_loss = loss.max(dim=1)[0].mean()
+
+    #edge aware smoothness
+    diff_x = image[:, :, :, 1:] - image[:, :, :, :-1]
+    diff_y = image[:, :, 1:, :] - image[:, :, :-1, :]
+    if beta == None: beta = 1.0 / ((diff_x.detach().pow(2).mean() + diff_y.detach().pow(2).mean()) + 1e-8)
+    
+    weight_x = torch.exp(-beta * (diff_x ** 2).sum(1))
+    weight_y = torch.exp(-beta * (diff_y ** 2).sum(1))
+
+    dx = ((logits[:,:,:, 1:] - logits[:,:,:,:-1]) ** 2).sum(1)
+    dy = ((logits[:,:,1:,:] - logits[:,:,:-1,:]) ** 2).sum(1)
+
+    smoothness_loss = (
+        (weight_x.squeeze(1) * dx).mean() +
+        (weight_y.squeeze(1) * dy).mean()
+    )
+
+    # -----------------------
+    # 3. Combine
+    # -----------------------
+    return unary_loss + lambda_smooth * smoothness_loss
 
 def classify_gaussians(gaussians, segmentation_network):
     #(1, N, FDIM) -> (FDIM, N, 1) -> (1, FDIM, N, 1)
@@ -173,12 +231,12 @@ def contrastive_2d_loss(segmask, log_features, id_unique_list, n_i_list, prototy
         j+=1
             
     #f_mean_norm_per_cluster = torch.functional.norm(f_mean_per_cluster, dim=-1, keepdim=True)
-    f_mean_per_cluster = torch.nn.functional.normalize(non_zero_prototypes, dim=-1)
-    features_normalized = torch.nn.functional.normalize(log_features, dim=-1)
+    f_mean_per_cluster = non_zero_prototypes#torch.nn.functional.normalize(non_zero_prototypes, dim=-1)
+    features_normalized = torch.nn.functional.normalize(log_features, dim=-1) 
     sim_per_cluster = torch.zeros(n_p).cuda()
     
     def similarity(fs, mu):
-        return -((fs - mu)**2).mean(-1)
+        return ((fs * mu)**2).sum(-1)
             
     j = 0
     for i in range(n_p):
@@ -214,6 +272,7 @@ def spatial_loss(xyz, features, k_pull=2, k_push=5, lambda_pull=0.05, lambda_pus
         xyz = xyz[indices]
         features = features[indices]
 
+    features = torch.nn.functional.normalize(features, dim=-1) 
     # Randomly sample points for which we'll compute the loss
     indices = torch.randperm(xyz.size(0))[:sample_size]
     sample_xyz = xyz[indices]
@@ -233,15 +292,15 @@ def spatial_loss(xyz, features, k_pull=2, k_push=5, lambda_pull=0.05, lambda_pus
     faraway_preds = features[faraway_indices_tensor]
 
     # Compute cosine similarity
-    def similarity(x, y):
-        return -((x-y)**2).mean(dim=-1)
+    def loss(x, y):
+        return ((x-y)**2).mean(dim=-1)
     
-    pull_loss = similarity(sample_preds.unsqueeze(1).expand(-1, k_pull, -1), neighbor_preds) #more similar of they are close
-    push_loss =  similarity(sample_preds.unsqueeze(1).expand(-1, k_push, -1), faraway_preds) #less similar if they are far away
+    pull_loss = loss(sample_preds.unsqueeze(1).expand(-1, k_pull, -1), neighbor_preds) #more similar of they are close
+    push_loss =  2-loss(sample_preds.unsqueeze(1).expand(-1, k_push, -1), faraway_preds) #less similar if they are far away
     
     # Total loss
 
-    loss = (lambda_pull * -pull_loss.mean() + lambda_push * push_loss.mean())
+    loss = (lambda_pull * pull_loss.mean() + lambda_push * push_loss.mean())
     
     
     return loss

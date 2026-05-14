@@ -92,12 +92,14 @@ class AppearanceNetv2(AppearanceNetwork):
         return x
 
 class AppearanceEmbedding(nn.Module):
-    def __init__(self, num_views: int, lambda_ssim: float = 0.2):
+    def __init__(self, num_views: int, lambda_ssim: float = 0.2, lambda_l2:float=0.0):
         super().__init__()
         self.num_view = num_views
         self.l1_loss = nn.L1Loss(reduction='none')
+        self.l2_loss = nn.MSELoss(reduction='none')
         self.ssim_loss = partial(ssim, size_average=False)
         self.lambda_ssim = lambda_ssim
+        self.lambda_l2 = lambda_l2
         self._init_kwargs = {"num_views": num_views, "lambda_ssim": lambda_ssim}
 
     def forward(self, image, gt_image, view_idx):
@@ -137,8 +139,8 @@ class AppearanceEmbedding(nn.Module):
         return instance
 
 class VastGaussianAppearanceEmbedding(AppearanceEmbedding):
-    def __init__(self, num_views, lambda_ssim: float = 0.2):
-        super().__init__(num_views, lambda_ssim)
+    def __init__(self, num_views, lambda_ssim: float = 0.2, lambda_l2:float=0.0):
+        super().__init__(num_views, lambda_ssim, lambda_l2)
         
         STD = 1e-4
         
@@ -192,10 +194,11 @@ class VastGaussianAppearanceEmbedding(AppearanceEmbedding):
         mult[:, top:top+H, left:left+W] = 1.0
         
         Ll1 = self.l1_loss(transformed_image, gt_image) * mult
+        Ll2 = self.l2_loss(transformed_image, gt_image) * mult
         LSSIM = (1 - self.ssim_loss(image, gt_image))
         
         # TODO: might make sense to not crop the l1-loss but simply lets gradients backprop
-        return (1 - self.lambda_ssim) * Ll1 + self.lambda_ssim * LSSIM.mean()
+        return (1 - self.lambda_ssim) * Ll1 + self.lambda_ssim * LSSIM.mean() + self.lambda_l2 * Ll2
 
 
 # Decoupled luminance/structure SSIM (SinglePassFusedSSIM) + final mapping:
@@ -203,8 +206,8 @@ class VastGaussianAppearanceEmbedding(AppearanceEmbedding):
 # 2. using reflection padding instead of cropping
 # 3. adding a low-frequency grid embedding to the appearance embedding (for vignetting)
 class SSIMDecoupledAppearanceEmbedding(VastGaussianAppearanceEmbedding):
-    def __init__(self, num_views, lambda_ssim: float = 0.2):
-        super().__init__(num_views, lambda_ssim)
+    def __init__(self, num_views, lambda_ssim: float = 0.2, lambda_l2:float=0.0):
+        super().__init__(num_views, lambda_ssim, lambda_l2)
         self.register_buffer("window", create_window(11, 3))
         self.ssim_v2 = SinglePassFusedSSIM()
         self.appearance_network = AppearanceNetv2(3 + 64 + 3, 3).cuda()
@@ -262,9 +265,9 @@ class SSIMDecoupledAppearanceEmbedding(VastGaussianAppearanceEmbedding):
         transformed_image = self.appearance_mapping(image, view_idx)
         
         Ll1 = self.l1_loss(transformed_image, gt_image)
-
+        Ll2 = self.l2_loss(transformed_image, gt_image)
         l, cs = self.ssim_v2(gt_image, image, transformed_image)
         LSSIM = (1 - l * cs)
         
         # TODO: might make sense to not crop the l1-loss but simply lets gradients backprop
-        return (1 - self.lambda_ssim) * Ll1 + self.lambda_ssim * LSSIM
+        return (1 - self.lambda_ssim) * Ll1 + self.lambda_ssim * LSSIM + self.lambda_l2 * Ll2
