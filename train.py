@@ -98,9 +98,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     number_views_for_deform_model = np.max([c.uid for c in trainCameras]).item()+1
     
-    deform_cfg = deform_utils.make_deform_config(gaussians, scene, opt, number_views_for_deform_model)
-    deform_model = deform_utils.DeformModel(deform_cfg) 
-    deform_model.training_setting()
     
     if mesh.use_vastgaussian_appearance:
         appearance_embedding = VastGaussianAppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim, lambda_l2=opt.lambda_l2)
@@ -110,6 +107,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         warnings.warn("Unknown appearance embedding, using default (No Appearance Embedding)")
         appearance_embedding = AppearanceEmbedding(num_views=len(trainCameras), lambda_ssim=opt.lambda_dssim, lambda_l2=opt.lambda_l2)
     gaussians.training_setup(opt, mesh, appearance_embedding)
+    gaussians.clean_nans()
+    deform_cfg = deform_utils.make_deform_config(gaussians, scene, opt, number_views_for_deform_model)
+    deform_model = deform_utils.DeformModel(deform_cfg) 
+    deform_model.training_setting()
+    
+    
     if checkpoint:
         (model_params, first_iter, (_appearance_embedding), (_segmentation_network, _segmentation_network_optim), _deform_model) = torch.load(checkpoint, weights_only=False)
         appearance_embedding.restore(_appearance_embedding)
@@ -145,7 +148,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     splat_args.render_opacity = False
     
     structure_tensor_cache = densify_utils.precompute_structure_tensors(scene, opt.st_mode, opt.st_levels)
-    
     class BatchStats:
         # [NEW] Batch Training: accumulate gradients from multiple cameras
         def __init__(self, max_batch_size, device="cuda"):
@@ -168,7 +170,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     masks_selfgenerated = {}
     
     temp_lambdas = {
-        "occupation_variance_lambda": 0*1e-3,
         "occupation_lambda": 10,
         "variational_depth_normal_fusion_lambda": 5e-1,
         "depth_smoothness": 5e-2 * scene.cameras_extent
@@ -244,7 +245,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 network_gui.conn = None
                 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        if iteration % opt.self_generated_masks_interval == 0 and iteration > 0:
+        if iteration % opt.self_generated_masks_interval == 0 and iteration > 0 or (iteration == first_iter and first_iter >= opt.self_generated_masks_interval):
+            if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
             with torch.no_grad():
                 all_cameras = scene.getTrainCameras().copy()
                 import cv2
@@ -341,7 +343,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # Gradient w.r.t. confidence: rgb_loss_og - alpha/confidence
             # At confidence=1e-3: alpha/confidence = 0.2/1e-3 = 200 (reasonable)
             # At confidence=1e-6: alpha/confidence = 0.2/1e-6 = 200,000 (problematic)
-            rgb_loss = (pp_rgb_loss * confidence - alpha * torch.log(confidence))
+            rgb_loss = (pp_rgb_loss * confidence - alpha * torch.log(confidence) * mask)
 
             # Confidence-specific terms for TensorBoard diagnostics.
             confidence_pp_rgb_loss_mean = pp_rgb_loss.mean()
@@ -381,7 +383,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             
         occupation = rendering[13:14]
         occupation2 = rendering[14:15]
-        occupation_variance = (occupation2 - occupation**2)
         
         
             
@@ -448,8 +449,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         #freq_loss = densify_utils.frequency_loss_simple(image, structure_tensor_cache[viewpoint_cam.image_name])
         
-        occupation_variance_dp = central_diff(occupation_variance.permute(1,2,0))
-        occupation_var_loss = temp_lambdas["occupation_variance_lambda"] * ((occupation_variance_dp)**2).mean() #if iteration >= mesh.distortion_from_iter else 0
         occupation_loss = temp_lambdas["occupation_lambda"] * ((occupation * (1-mask))**2).mean() #if iteration >= mesh.distortion_from_iter else 0
         
         
@@ -458,24 +457,27 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         # Final loss
         #TODO: Try Variational Depth-Normal Fusion
-        loss =  rgb_loss_mean + \
-                depth_normal_loss    * lambda_depth_normal + \
-                distortion_loss      * lambda_distortion +  \
-                normal_loss          * lambda_normal + \
-                opa_loss             * lambda_opacity_field + \
-                extent_loss          * lambda_extent + \
-                variance_loss        * lambda_variance + \
-                normal_variance_loss * lambda_normal_variance + \
-                (mesh.opacity_reg * torch.abs(gaussians.get_opacity).mean() if mesh.opacity_reg > 0 else 0.0) + \
-                (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
-                (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
-                seg_loss_obj + \
-                seg_loss_obj_3d + \
-                occupation_var_loss + \
-                occupation_loss  + \
-                (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
-                lambda_depth_smoothness * depth_smoothness_loss
-                #freq_loss * opt.lambda_freq
+        
+        if iteration < opt.position_lr_max_steps:
+            loss =  rgb_loss_mean + \
+                    depth_normal_loss    * lambda_depth_normal + \
+                    distortion_loss      * lambda_distortion +  \
+                    normal_loss          * lambda_normal + \
+                    opa_loss             * lambda_opacity_field + \
+                    extent_loss          * lambda_extent + \
+                    variance_loss        * lambda_variance + \
+                    normal_variance_loss * lambda_normal_variance + \
+                    (mesh.opacity_reg * torch.abs(gaussians.get_opacity).mean() if mesh.opacity_reg > 0 else 0.0) + \
+                    (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
+                    (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
+                    seg_loss_obj + \
+                    seg_loss_obj_3d + \
+                    occupation_loss  + \
+                    (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
+                    lambda_depth_smoothness * depth_smoothness_loss
+                    #freq_loss * opt.lambda_freq
+        else:
+            loss = rgb_loss_mean
                 
         loss.backward(retain_graph=True)
         seg_network_loss.backward()
@@ -553,7 +555,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
 
                 # Optimizer step
                 if iteration < opt.iterations:
-                    gaussians.optimizer.step()
+                    if iteration < opt.position_lr_max_steps:
+                        gaussians.optimizer.step()
                     
                     if iteration >= opt.segmentation_network_first_step:
                         segmentation_network_optim.step()

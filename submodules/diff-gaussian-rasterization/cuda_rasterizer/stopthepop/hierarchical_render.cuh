@@ -504,6 +504,11 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 						V2G[9],
 						con_o.w
 					};
+					constexpr float ABC_MIN = 1e-8;
+					ABC.x = (fabsf(ABC.x) < ABC_MIN) ? copysignf(ABC_MIN, ABC.x) : ABC.x;
+					ABC.y = (fabsf(ABC.y) < ABC_MIN) ? copysignf(ABC_MIN, ABC.y) : ABC.y;
+					ABC.z = (fabsf(ABC.z) < ABC_MIN) ? copysignf(ABC_MIN, ABC.z) : ABC.z;
+
 					float depth = -ABC.y/(2.f * ABC.x);
 					float3 normal = {Ld.x, Ld.y, Ld.z};
 

@@ -218,7 +218,7 @@ class GaussianModel:
         self.use_SBs = use_SBs
         self.percent_dense = 0
         self.spatial_lr_scale = 0
-        self.filter_3D = torch.tensor([0.003,0.003,0.003]).cuda()
+        self.filter_3D = torch.empty(0)
         self.tmp_radii = None 
         
         
@@ -279,6 +279,13 @@ class GaussianModel:
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
         self.optimizer.load_state_dict(opt_dict)
+        self.clean_nans()
+        
+        
+        
+    def clean_nans(self):
+        isnan = torch.isnan(self._xyz).any(-1) | torch.isnan(self._scaling).any(-1) | torch.isnan(self._rotation).any(-1)
+        self.prune_points(isnan)
 
     # setter for scaling
     def set_scaling(self, new_scales):
@@ -534,6 +541,7 @@ class GaussianModel:
             lr_final=mesh_args.appearance_lr_final,
             lr_delay_mult=training_args.position_lr_delay_mult,
             max_steps=training_args.position_lr_max_steps)
+        
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''

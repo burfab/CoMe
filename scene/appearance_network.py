@@ -194,7 +194,7 @@ class VastGaussianAppearanceEmbedding(AppearanceEmbedding):
         mult[:, top:top+H, left:left+W] = 1.0
         
         Ll1 = self.l1_loss(transformed_image, gt_image) * mult
-        Ll2 = self.l2_loss(transformed_image, gt_image) * mult
+        Ll2 = 0.0 if self.lambda_l2 == 0 else self.l2_loss(transformed_image, gt_image) * mult
         LSSIM = (1 - self.ssim_loss(image, gt_image))
         
         # TODO: might make sense to not crop the l1-loss but simply lets gradients backprop
@@ -268,7 +268,7 @@ class SSIMDecoupledAppearanceEmbedding(VastGaussianAppearanceEmbedding):
         transformed_image = self.appearance_mapping(image, view_idx,mask)
         
         Ll1 = self.l1_loss(transformed_image, gt_image)
-        Ll2 = self.l2_loss(transformed_image, gt_image)
+        Ll2 = 0.0 if self.lambda_l2 == 0 else self.l2_loss(transformed_image, gt_image)
         l, cs = self.ssim_v2(gt_image, image, transformed_image)
         LSSIM = (1 - l * cs)
         

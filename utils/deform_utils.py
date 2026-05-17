@@ -22,7 +22,7 @@ def compute_bounds_for_deform(xyz):
     
 def make_deform_config(gaussians, scene, opt, num_cameras):
     deform_cfg = {
-        #"bound": compute_bounds_for_deform(gaussians.get_xyz),
+        "bound": compute_bounds_for_deform(gaussians.get_xyz),
         "hidden_dim": 64,
         "control_point_rate": 4,
         "num_degree": 3,
@@ -215,7 +215,7 @@ class DeformModel:
 
         )
         
-        simple_network_class = simple_network if False else simple_network_tcnn
+        simple_network_class = simple_network if True else simple_network_tcnn
 
         curve = (torch.randn(self.n_w, self.n_cp,6)*1e-5).contiguous().cuda()
         self.curve = torch.nn.Parameter(curve.requires_grad_(True))
@@ -331,7 +331,7 @@ class DeformModel:
         b_weights = weights.unsqueeze(0)
         cp_weights = self.knots[:, idx_cp]
         weight_ = (b_weights*cp_weights)
-        weight_ = weight_ / (weight_.sum(dim=-1,keepdim=True))
+        weight_ = weight_ / (weight_.sum(dim=-1,keepdim=True)+1e-6)
 
         deform_weight = torch.tanh(deform_weight)
 
@@ -353,7 +353,7 @@ class DeformModel:
 
         l = [
             {'params': self.deform_HASH.parameters(), 'lr': 0.01* self.spatial_lr_scale, "name": "deform_HASH", "weight_decay": self.cfg["weight_decay"]},
-            {'params': self.mlp_head.parameters(), 'lr': 0.001, "name": "mlp_head", "weight_decay": self.cfg["weight_decay"]},
+            {'params': self.mlp_head.parameters(), 'lr': 0.0001, "name": "mlp_head", "weight_decay": self.cfg["weight_decay"]},
 
 
             {'params': [self.curve], 'lr': self.cfg["curve_lr"], "name": "curve",},

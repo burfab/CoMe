@@ -264,4 +264,6 @@ def quaternion_multiply(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         The product of a and b, a tensor of quaternions of shape (..., 4).
     """
     ab = quaternion_raw_multiply(a, b)
-    return standardize_quaternion(ab)
+    eps = 1e-8
+    ab = ab / ab.norm(dim=-1, keepdim=True).clamp_min(eps) 
+    return ab
