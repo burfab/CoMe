@@ -43,7 +43,7 @@ def rasterize_gaussians(
     view2gaussian_precomp,
     filter_3d,
     raster_settings, 
-    gt_color
+    gt_color, extract_final_T
 ):
     return _RasterizeGaussians.apply(
         means3D,
@@ -59,7 +59,7 @@ def rasterize_gaussians(
         view2gaussian_precomp,
         filter_3d,
         raster_settings,
-        gt_color
+        gt_color, extract_final_T
     )
 
 class _RasterizeGaussians(torch.autograd.Function):
@@ -79,7 +79,7 @@ class _RasterizeGaussians(torch.autograd.Function):
         view2gaussian_precomp,
         filter_3d,
         raster_settings,
-        gt_color
+        gt_color, extract_final_T
     ):
         if gt_color is None:
             gt_color = torch.zeros((3, raster_settings.image_height, raster_settings.image_width)).cuda()
@@ -115,26 +115,32 @@ class _RasterizeGaussians(torch.autograd.Function):
         )
 
         # Invoke C++/CUDA rasterizer
+        accum_alpha = None
         if raster_settings.debug:
             cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
             try:
                 num_rendered, color, radii, cov2d, max_weights, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+                args_alpha = (imgBuffer, raster_settings.image_height, raster_settings.image_width, raster_settings.debug)
+                if extract_final_T: accum_alpha = _C.extract_accum_alpha(*args_alpha)
+                
             except Exception as ex:
                 torch.save(cpu_args, "snapshot_fw.dump")
                 print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
                 raise ex
         else:
             num_rendered, color, radii, cov2d,max_weights, geomBuffer, binningBuffer, imgBuffer = _C.rasterize_gaussians(*args)
+            args_alpha = (imgBuffer, raster_settings.image_height, raster_settings.image_width, raster_settings.debug)
+            if extract_final_T: accum_alpha = _C.extract_accum_alpha(*args_alpha)
 
         # Keep relevant tensors for backward
         ctx.raster_settings = raster_settings
         ctx.num_rendered = num_rendered
 
         ctx.save_for_backward(colors_precomp, means3D, opacities, scales, rotations, confidences, extra_features, cov3Ds_precomp, view2gaussian_precomp, filter_3d, radii, sh, color, geomBuffer, binningBuffer, imgBuffer, gt_color)
-        return color, radii, cov2d, max_weights
+        return color, radii, cov2d, max_weights, accum_alpha
 
     @staticmethod
-    def backward(ctx, grad_out_color, ignored_1, ignored_2, ignored_3):
+    def backward(ctx, grad_out_color, ignored_1, ignored_2, ignored_3, ignored_4):
 
         # Restore necessary values from context
         num_rendered = ctx.num_rendered
@@ -197,6 +203,7 @@ class _RasterizeGaussians(torch.autograd.Function):
             grad_extra_features,
             grad_cov3Ds_precomp,
             grad_view2gaussian_precomp,
+            None,
             None,
             None,
             None,
@@ -374,7 +381,7 @@ class GaussianRasterizer(nn.Module):
             
         return visible
 
-    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, confidences = None, cov3D_precomp = None, view2gaussian_precomp = None, filter_3d=None, gt_color=None, extra_features=None):
+    def forward(self, means3D, means2D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, confidences = None, cov3D_precomp = None, view2gaussian_precomp = None, filter_3d=None, gt_color=None, extra_features=None, extract_final_T=False):
         
         raster_settings : GaussianRasterizationSettings = self.raster_settings
 
@@ -416,7 +423,7 @@ class GaussianRasterizer(nn.Module):
             view2gaussian_precomp,
             filter_3d,
             raster_settings,
-            gt_color
+            gt_color, extract_final_T
         )
 
 

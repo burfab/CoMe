@@ -34,9 +34,10 @@ def make_deform_config(gaussians, scene, opt, num_cameras):
         "per_level_scale": 2,
         "num_layer": 4,
         "deform_lr_iter": opt.iterations,
+        "first_iter": opt.deform_first_step,
         "weight_decay": 1e-7,
         "weight_lr": 0.001,"rotation_lr": 0.001, "scaling_lr": 0.005, "curve_lr": 0.001 ,
-        "warmup": opt.deform_first_step,
+        "warmup": opt.deform_warmup,
         "lr_lambda": 0.99,
 
         "camera_extent": scene.cameras_extent.item(),
@@ -214,7 +215,7 @@ class DeformModel:
 
         )
         
-        simple_network_class = simple_network if True else simple_network_tcnn
+        simple_network_class = simple_network if False else simple_network_tcnn
 
         curve = (torch.randn(self.n_w, self.n_cp,6)*1e-5).contiguous().cuda()
         self.curve = torch.nn.Parameter(curve.requires_grad_(True))
@@ -223,6 +224,7 @@ class DeformModel:
         self.mlp_head = simple_network_class(self.deform_HASH.n_output_dims,self.hidden_dim, self.n_w , cfg["num_layer"]).cuda()
         
     def optimizer_step(self, iteration):
+        if iteration < self.cfg["first_iter"]: return
         self.optimizer.step()
         self.knots.data = torch.clamp(self.knots.data, min = 1e-6)
         if iteration < self.cfg["deform_lr_iter"]:

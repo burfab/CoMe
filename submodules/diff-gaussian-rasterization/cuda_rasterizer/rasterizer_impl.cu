@@ -383,6 +383,20 @@ CudaRasterizer::PointState CudaRasterizer::PointState::fromChunk(char*& chunk, s
 	obtain(chunk, geom.point_offsets, P, 128);
 	return geom;
 }
+
+	
+void CudaRasterizer::Rasterizer::extractAccumAlpha(const char *img_buffer, int width, int height, float *result, bool debug){
+	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X,
+					(height + BLOCK_Y - 1) / BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);
+
+	char* img_buffer_not_const = (char*)img_buffer;
+	ImageState imgState = ImageState::fromChunk(img_buffer_not_const, width * height);
+
+	CHECK_CUDA(cudaMemcpy(result, (const float*)imgState.accum_alpha, width * height * sizeof(float), cudaMemcpyDeviceToDevice), debug)
+}
+
+
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
 int CudaRasterizer::Rasterizer::forward(

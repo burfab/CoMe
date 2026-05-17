@@ -23,7 +23,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, SplattingSettings, OptimizationParams, SplattingSettings, MeshingParams
-from utils.depth_utils import depths_to_points, depth_to_normal, central_diff
+from utils.depth_utils import depths_to_points, depth_to_normal, central_diff, DepthNormalConsistencyLoss
 from utils.vis_utils import gui_visualize, export_image
 from utils import segmentation_utils
 from utils import deform_utils
@@ -167,7 +167,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     masks_selfgenerated = {}
     
-    
+    temp_lambdas = {
+        "occupation_variance_lambda": 0*1e-3,
+        "occupation_lambda": 10,
+        "variational_depth_normal_fusion_lambda": 5e-1,
+        "depth_smoothness": 5e-2 * scene.cameras_extent
+        }
     batch = None
     
     for iteration in checkpoint_iterations: assert (iteration % opt.batch_size) == 0, "Must be a multiple of batch size"
@@ -204,8 +209,10 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                                 gaussians_mask = (gaussians_classified == 1) | (gaussians_classified == 3)
                         
                         net_image = render(custom_cam, gaussians, pipe, background, message["scaling_modifier"], splat_args=splat_args, debugVis=debugVis, deformation=deformation, gaussians_mask = gaussians_mask)["render"]
-
                     if debugVis.type == 0 or debugVis.type == DebugVisualizationType.CONFIDENCE:
+                        rgb_image = net_image[:3]
+                        if message["render_appearance_embedding"] or message["custom_message"] == "appearance":
+                            rgb_image = appearance_embedding.appearance_mapping(rgb_image, message["camera_idx"])
                         image = gui_visualize(
                             render_cam=custom_cam,
                             alpha=net_image[7:8],
@@ -213,16 +220,15 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                             depth=net_image[6:7],
                             normal=net_image[3:6],
                             confidence=net_image[10:11],
-                            render=net_image[:3],
+                            render=rgb_image,
                             color_variance=net_image[11:12],
                             normal_variance=net_image[12:13],
                             other_args=message,
-                            segmentation=None if not render_segmentation else net_image[13:],
+                            occupation=net_image[13:14],
+                            occupation2=net_image[14:15],
+                            segmentation=None if not render_segmentation else net_image[-gaussians.segmentation_dimension:],
                             segmentation_network = segmentation_network
                         )
-                        if message["render_appearance_embedding"] or message["custom_message"] == "appearance":
-                            image = net_image[:3]
-                            image = appearance_embedding.appearance_mapping(image, message["camera_idx"])
                     else:
                         image = net_image[:3]
 
@@ -238,23 +244,28 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 network_gui.conn = None
                 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        if iteration == mesh.distortion_from_iter:
+        if iteration % opt.self_generated_masks_interval == 0 and iteration > 0:
             with torch.no_grad():
                 all_cameras = scene.getTrainCameras().copy()
                 import cv2
-                splat_args_exact_depth = splat_args.exact_depth
                 cv2.namedWindow("MASK", cv2.WINDOW_NORMAL)
                 for c in tqdm(all_cameras):
-                    splat_args.render_opacity = True
-                    splat_args.exact_depth = False
-                    render_pkg = render(c, gaussians, pipe, bg, splat_args=splat_args, gt_color=None, deformation=deform_utils.Deformation())
-                    mask = render_pkg["render"][7]
-                    masks_selfgenerated[c.uid] = torch.nn.functional.sigmoid((mask-0.1)*20).detach().cpu()
+                    render_pkg = render(c, gaussians, pipe, bg, splat_args=splat_args, gt_color=None, deformation=deform_utils.Deformation(), extract_final_T=True)
+                    mask = 1-render_pkg["final_T"].squeeze(0)
+                    masks_selfgenerated[c.uid] = mask.detach().cpu() #torch.nn.functional.sigmoid((mask.detach()- 0.9) * 20).cpu()  
+                    D = render_pkg["render"][6].detach().cpu()
+                    N = render_pkg["render"][3:6].detach().cpu()
+                    C = render_pkg["render"][:3].detach().cpu()
+                    C2 = c.original_image.detach().cpu()
+                    K = torch.tensor([[c.focal_x, 0, c.image_width/2],
+                                      [0, c.focal_y, c.image_height/2],
+                                      [0,0,1]
+                                      ]).cpu().float()
+                    torch.save((D,N,C, C2, c.world_view_transform.cpu().detach(),K),f"/tmp/test/{c.uid}.pth")
                     cv2.imshow("MASK",(masks_selfgenerated[c.uid].numpy()*255).astype(np.uint8))
                     cv2.waitKey(1)
                 cv2.destroyAllWindows()
-                splat_args.exact_depth = splat_args_exact_depth
-                gaussians.reset_confidence()
+        if iteration == opt.reset_confidence_iteration: gaussians.reset_confidence()
                 
 
         iter_start.record()
@@ -295,12 +306,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach(), deformation=deformation)
         rendering, viewspace_point_tensor, visibility_filter, radii, cov2D = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["cov2D"]
+        
 
         opacity = rendering[7]
         image = rendering[:3, :, :]
         gt_segmentation = viewpoint_cam.seg_mask.cuda().squeeze(0).long()
         
-        mask = (masks_selfgenerated[viewpoint_cam.uid] if iteration >= (mesh.distortion_from_iter+0) else (gt_segmentation > 0).float().detach()).cuda()
+        mask = (masks_selfgenerated[viewpoint_cam.uid] if viewpoint_cam.uid in masks_selfgenerated else (gt_segmentation > 0).float().detach()).cuda()
         mask = mask #* (mask > 0.5)
         
         # custom variance losses
@@ -322,7 +334,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # This prevents gradient explosion while maintaining the regularization effect
             confidence = torch.clamp(rendering[10, :, :], min=1e-3, max=5.0).unsqueeze(0)
 
-            pp_rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx)           
+            pp_rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx, mask)           
             alpha = mesh.color_confidence_max
 
             # Numerically stable: higher minimum clamp prevents extreme gradients
@@ -338,7 +350,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             confidence_neg_alpha_log_term_mean = (-alpha * torch.log(confidence)).mean()
             # TODO: confidence into a CUDA kernel for speed
         else:
-            rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx)
+            rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx, mask)
         
         seg_loss_obj = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
         seg_loss_obj_3d = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
@@ -367,6 +379,11 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
                 
             
+        occupation = rendering[13:14]
+        occupation2 = rendering[14:15]
+        occupation_variance = (occupation2 - occupation**2)
+        
+        
             
         # depth distortion regularization
         distortion_map = rendering[8, :, :]
@@ -402,9 +419,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         lambda_distortion = mesh.lambda_distortion if iteration >= mesh.distortion_from_iter else 0.0
         lambda_depth_normal = mesh.lambda_depth_normal if iteration >= mesh.depth_normal_from_iter else 0.0
+        
+        depth_smoothness_loss = central_diff(depth.unsqueeze(0).permute(1,2,0), ignore_inval=torch.zeros_like(depth[0,0].unsqueeze(0)))
+        depth_smoothness_loss = (depth_smoothness_loss*(mask * (depth>0))).mean()
+        lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff(render_normal_world.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal_world[:,0,0])) * torch.exp(-nabla_I)
+        normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0])) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 
@@ -427,7 +448,16 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         #freq_loss = densify_utils.frequency_loss_simple(image, structure_tensor_cache[viewpoint_cam.image_name])
         
+        occupation_variance_dp = central_diff(occupation_variance.permute(1,2,0))
+        occupation_var_loss = temp_lambdas["occupation_variance_lambda"] * ((occupation_variance_dp)**2).mean() #if iteration >= mesh.distortion_from_iter else 0
+        occupation_loss = temp_lambdas["occupation_lambda"] * ((occupation * (1-mask))**2).mean() #if iteration >= mesh.distortion_from_iter else 0
+        
+        
+        normal_consistency_loss = DepthNormalConsistencyLoss((viewpoint_cam.focal_x, viewpoint_cam.focal_y, viewpoint_cam.image_width/2, viewpoint_cam.image_height/2))
+        loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal, mask)
+        
         # Final loss
+        #TODO: Try Variational Depth-Normal Fusion
         loss =  rgb_loss_mean + \
                 depth_normal_loss    * lambda_depth_normal + \
                 distortion_loss      * lambda_distortion +  \
@@ -440,7 +470,11 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
                 (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
                 seg_loss_obj + \
-                seg_loss_obj_3d
+                seg_loss_obj_3d + \
+                occupation_var_loss + \
+                occupation_loss  + \
+                (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
+                lambda_depth_smoothness * depth_smoothness_loss
                 #freq_loss * opt.lambda_freq
                 
         loss.backward(retain_graph=True)

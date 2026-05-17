@@ -92,7 +92,9 @@ def gui_visualize(
     normal_variance,
     other_args,
     segmentation=None,
-    segmentation_network = None
+    segmentation_network = None,
+    occupation = None,
+    occupation2 = None
 ):
     indict = lambda key: key in other_args and str(other_args[key]).lower() == "true"
     
@@ -130,6 +132,24 @@ def gui_visualize(
             image = segmentation_utils.features_to_rgb_pca(segmentation)
         else:
             image = segmentation_utils.features_to_rgb_random_orth_proj(segmentation)
+        return image
+    elif other_args["custom_message"].lower() == "occupation":
+        image = occupation.squeeze()
+        image = image / image.max()
+        cmap = matplotlib.colormaps.get_cmap('magma')
+        image = torch.tensor(cmap(image.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
+        return image
+    elif other_args["custom_message"].lower() == "occupation2":
+        image = occupation2.squeeze()
+        image = image / image.max()
+        cmap = matplotlib.colormaps.get_cmap('magma')
+        image = torch.tensor(cmap(image.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
+        return image
+    elif other_args["custom_message"].lower() == "occupation_var":
+        image = occupation2.squeeze() - occupation.squeeze()**2
+        image = image / image.max()
+        cmap = matplotlib.colormaps.get_cmap('magma')
+        image = torch.tensor(cmap(image.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
         return image
     elif render_alpha:
         # magma colormap

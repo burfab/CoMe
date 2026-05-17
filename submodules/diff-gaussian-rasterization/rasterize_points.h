@@ -53,6 +53,10 @@ RasterizeGaussiansCUDA(
 	const bool debug, 
 	const torch::Tensor &gt_color);
 
+torch::Tensor ExtractAccumAlphaCUDA(const torch::Tensor &imageBuffer,
+                                    const int image_height,
+                                    const int image_width, const bool debug);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
  RasterizeGaussiansBackwardCUDA(
  	const torch::Tensor& background,

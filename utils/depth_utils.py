@@ -71,3 +71,84 @@ def central_diff(image, ignore_inval = None):
         )
     return output
 
+
+class DepthNormalConsistencyLoss(torch.nn.Module):
+    def __init__(self, intrinsics: tuple, grazing_threshold: float = 1e-3):
+        """
+        Args:
+            intrinsics: (fx, fy, cx, cy) camera intrinsics
+            grazing_threshold: Ignores gradients at sharp silhouettes or grazing angles
+        """
+        super().__init__()
+        self.fx, self.fy, self.cx, self.cy = intrinsics
+        self.grazing_threshold = grazing_threshold
+
+    def forward(self, rendered_depth: torch.Tensor, rendered_normals: torch.Tensor, mask: torch.Tensor = None):
+        """
+        Args:
+            rendered_depth: (1, H, W) or (H, W) tensor from 3DGS rasterizer
+            rendered_normals: (3, H, W) camera-space normals (OpenCV convention: +Z forward, +Y down)
+            mask: (1, H, W) or (H, W) optional foreground/valid opacity mask
+        """
+        if rendered_depth.ndim == 2:
+            rendered_depth = rendered_depth.unsqueeze(0)
+        if mask is not None and mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+            
+        _, H, W = rendered_depth.shape
+        device = rendered_depth.device
+        dtype = rendered_depth.dtype
+
+        # 1. Pixel Ray Vectors
+        y, x = torch.meshgrid(
+            torch.arange(H, device=device, dtype=dtype),
+            torch.arange(W, device=device, dtype=dtype),
+            indexing='ij'
+        )
+        u = ((x - self.cx) / self.fx).unsqueeze(0)
+        v = ((y - self.cy) / self.fy).unsqueeze(0)
+
+        # 2. Predicted Target Gradients from Rendered Normals
+        nx, ny, nz = -rendered_normals[0:1], -rendered_normals[1:2], -rendered_normals[2:3]
+        
+        N_dot_r = nx * u + ny * v + nz
+        # Clamp near zero to avoid explosion
+        N_dot_r = torch.where(
+            N_dot_r.abs() < 1e-6,
+            torch.where(N_dot_r >= 0, 1e-6, -1e-6),
+            N_dot_r
+        )
+
+        # Analytical log-depth target gradients
+        target_gx = -nx / (self.fx * N_dot_r)
+        target_gy = -ny / (self.fy * N_dot_r)
+
+        # 3. Actual Gradients from Rendered Log-Depth
+        L = torch.log(torch.clamp(rendered_depth, min=1e-5))
+        
+        actual_dx = torch.zeros_like(L)
+        actual_dy = torch.zeros_like(L)
+        actual_dx[..., :, :-1] = L[..., :, 1:] - L[..., :, :-1]
+        actual_dy[..., :-1, :] = L[..., 1:, :] - L[..., :-1, :]
+
+        # 4. Handle Masking and Edge Weighting
+        if mask is None:
+            mask = torch.ones_like(L)
+            
+        # Only compute loss across valid neighboring pixel edges
+        W_x = mask[..., :, 1:] * mask[..., :, :-1]
+        W_y = mask[..., 1:, :] * mask[..., :-1, :]
+
+        # Ignore grazing angles where normal is perpendicular to camera ray
+        valid_grad = (N_dot_r.abs() > self.grazing_threshold)
+        W_x = W_x * valid_grad[..., :, 1:] * valid_grad[..., :, :-1]
+        W_y = W_y * valid_grad[..., 1:, :] * valid_grad[..., :-1, :]
+
+        # 5. Compute Weighted L1 or L2 Mismatch Loss
+        loss_x = torch.abs(actual_dx[..., :, :-1] - target_gx[..., :, :-1]) * W_x
+        loss_y = torch.abs(actual_dy[..., :-1, :] - target_gy[..., :-1, :]) * W_y
+
+        # Normalize by the number of active edges to keep loss scaled properly
+        total_edges = W_x.sum() + W_y.sum() + 1e-6
+        
+        return (loss_x.sum() + loss_y.sum()) / total_edges

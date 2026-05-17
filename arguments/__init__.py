@@ -212,7 +212,11 @@ class OptimizationParams(ParamGroup):
         
         #deformation
         self.deform_first_step = 5_000
+        self.deform_warmup = 500
         
+        #masks
+        self.self_generated_masks_interval = 1000
+        self.reset_confidence_iteration = 2000
         #segmentation
         self.contrastive_interval = 5
         self.contrastive_lambda = 1e-1

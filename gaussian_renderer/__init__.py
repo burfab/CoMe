@@ -18,7 +18,7 @@ from utils.sh_utils import eval_sh
 from utils.sb_utils import eval_sb
 from utils.deform_utils import Deformation
 
-def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, splat_args: ExtendedSettings = None, debugVis : DebugVisualization = DebugVisualization(), gt_color = None, deformation: Deformation = Deformation(), gaussians_mask=None):
+def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, splat_args: ExtendedSettings = None, debugVis : DebugVisualization = DebugVisualization(), gt_color = None, deformation: Deformation = Deformation(), gaussians_mask=None, extract_final_T=True):
     """
     Render the scene. 
     
@@ -122,7 +122,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
         
         
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, max_weights, cov2D = rasterizer(
+    rendered_image, radii, max_weights, cov2D, accum_alpha = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -135,7 +135,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
         cov3D_precomp = cov3D_precomp,
         view2gaussian_precomp=view2gaussian_precomp,
         filter_3d = filter_3d,
-        gt_color = gt_color
+        gt_color = gt_color, extract_final_T=extract_final_T
         )
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
@@ -145,10 +145,12 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
             "visibility_filter" : radii > 0,
             "radii": radii,
             "cov2D": cov2D,
-            "max_weights": max_weights}
+            "max_weights": max_weights,
+            "final_T": accum_alpha,
+            }
 
 def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, 
-                  splat_args: ExtendedSettings = None, debug_data : DebugVisualization = None, deformation=Deformation()):
+                  splat_args: ExtendedSettings = None, debug_data : DebugVisualization = None, deformation=Deformation(), extract_final_T=False):
     """
     Render the scene. 
     
@@ -249,7 +251,7 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
     segmentation = torch.zeros((0,0)).float().to(confidences.device).requires_grad_(False) if splat_args.blend_extra_features == 0 else pc.get_segmentation
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, max_weights = rasterizer(
+    rendered_image, radii, max_weights, accum_alpha = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,
@@ -261,7 +263,7 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
         extra_features=segmentation,
         cov3D_precomp = cov3D_precomp,
         view2gaussian_precomp=view2gaussian_precomp,
-        filter_3d=filter_3d
+        filter_3d=filter_3d, extract_final_T=extract_final_T
         )
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
@@ -275,10 +277,10 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
         "depth": rendered_image[6:7],
         "distortion": rendered_image[8:9],
         "normal": rendered_image[3:6],
-        "confidence": rendered_image[10:11]
-        ,
+        "confidence": rendered_image[10:11],
         "color_variance": rendered_image[11:12],
-        "normal_variance": rendered_image[12:13]
+        "normal_variance": rendered_image[12:13],
+        "final_T": accum_alpha,
     }
 
 def integrate(points3D, alpha, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, override_color = None, subpixel_offset=None, splat_args=None):

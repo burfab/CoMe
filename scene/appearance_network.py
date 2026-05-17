@@ -213,7 +213,7 @@ class SSIMDecoupledAppearanceEmbedding(VastGaussianAppearanceEmbedding):
         self.appearance_network = AppearanceNetv2(3 + 64 + 3, 3).cuda()
     
     # this one detaches inbetween the mapping and the loss
-    def appearance_mapping(self, image, view_idx):
+    def appearance_mapping(self, image, view_idx, mask = None):
         appearance_embedding = self.get_apperance_embedding(idx=view_idx)
         # center crop the image
         origH, origW = image.shape[1:]
@@ -256,13 +256,16 @@ class SSIMDecoupledAppearanceEmbedding(VastGaussianAppearanceEmbedding):
             ],
             dim=0
         )[None]
-        mapping_image = self.appearance_network(image_down_w_embedding)
-        transformed_image = mapping_image * image_pad
+        mapping_image = self.appearance_network(image_down_w_embedding)[0, :, pad_top : pad_top + origH, pad_left : pad_left + origW]
+        if mask is None:
+            transformed_image = mapping_image * image
+        else:
+            transformed_image = mapping_image * image * mask + (1-mask) * image
 
-        return transformed_image[0, :, pad_top : pad_top + origH, pad_left : pad_left + origW]
+        return transformed_image
     
-    def forward(self, image, gt_image, view_idx):
-        transformed_image = self.appearance_mapping(image, view_idx)
+    def forward(self, image, gt_image, view_idx, mask):
+        transformed_image = self.appearance_mapping(image, view_idx,mask)
         
         Ll1 = self.l1_loss(transformed_image, gt_image)
         Ll2 = self.l2_loss(transformed_image, gt_image)
