@@ -534,7 +534,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
 					printf("%d - %d %d - %d %f alpha is %f\n", warp.thread_rank(), pixpos.x, pixpos.y, coll_id, depth, alpha);
 #endif
-					if (alpha < 1.0f / 255.0f)
+					if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
 						continue;
 
 					auto store = store_function(pixpos, coll_id, G, alpha, depth);
@@ -769,7 +769,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 					float power = max_contrib_power_rect_gaussian_float<3, 3>(in_conic_opacity, in_point_xy, tail_rect_min, tail_rect_max, max_pos);
 
 					float alpha = min(0.99f, in_conic_opacity.w * exp(-power));
-					if (alpha < 1.0f / 255.0f)
+					if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
 						halfs_culled_mask |= (0x1U << half);
 				}
 			}
@@ -1177,7 +1177,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 			// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
 
 			const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-			float C = (CC - 2 * logf(255 * ABC_.w));
+			float C = (CC - 2 * logf(ALPHA_THRESHOLD_INV * ABC_.w));
 			float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
 			float NDCspan = FN * (2 * AA * extent) / (BB * BB);
 
@@ -1967,7 +1967,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
 
 			const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-			float C = (CC - 2 * logf(255 * ABC_.w));
+			float C = (CC - 2 * logf(ALPHA_THRESHOLD_INV * ABC_.w));
 			float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
 
 			float dL_dNDC = blend_data.T * blend_data.dL_dextent_loss * FN;

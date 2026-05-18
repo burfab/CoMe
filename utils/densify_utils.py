@@ -453,7 +453,7 @@ def precompute_structure_tensors(scene, st_mode = "v1", st_levels=4):
                 
                 for j, cam in enumerate(batch_cams):
                     st_map = st_batch[j:j+1] # Keep (1, 3, H, W) shape
-                    structure_tensor_cache[cam.image_name] = st_map
+                    structure_tensor_cache[cam.image_name] = st_map.cpu()
                     
                     # Normalize for visualization (Sxx, Sxy, Syy can be large, so we normalize per image)
                     # st_vis = st_map.clone().detach()
@@ -689,7 +689,7 @@ def update_freq_stats_online(viewpoint_cam, gaussians, cov2D, visibility_filter,
     valid_indices_global = global_indices[is_active_vis] # [N_valid]
     
     if valid_indices_global.shape[0] > 0:
-        st_map = structure_tensor_cache[viewpoint_cam.image_name]
+        st_map = structure_tensor_cache[viewpoint_cam.image_name].cuda()
         h, w = viewpoint_cam.image_height, viewpoint_cam.image_width
 
         # [NEW] Extract Transmittance Weights for the valid subset

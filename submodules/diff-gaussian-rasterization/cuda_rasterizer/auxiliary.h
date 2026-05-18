@@ -32,6 +32,7 @@
 
 #define MAX_SURFACE_NORMALS
 
+
 // distortion loss
 #define NEAR_PLANE 0.2f
 #define OPT_CULL_POINTS
@@ -54,8 +55,10 @@
 //#define DEBUG_MIN_Z_BOUNDING
 #define POINT_TO_DEBUG (1226113)
 
-#define ALPHA_THRESHOLD (1.0f / 255.0f)
-#define ALPHA_THRESHOLD_PADDED (1.0f / 255.0f)
+//default is 255
+#define ALPHA_THRESHOLD_INV (1024.f)
+#define ALPHA_THRESHOLD (1.0f / ALPHA_THRESHOLD_INV)
+#define ALPHA_THRESHOLD_PADDED (1.0f / ALPHA_THRESHOLD_INV)
 #define T_THRESHOLD (0.0001f)
 
 constexpr uint32_t WARP_SIZE = 32U;

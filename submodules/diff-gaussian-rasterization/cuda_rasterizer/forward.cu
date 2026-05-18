@@ -572,7 +572,7 @@ renderCUDA(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
 				continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
@@ -813,7 +813,7 @@ renderCUDA_opacity(
 			// and its exponential falloff from mean.
 			// Avoid numerical instabilities (see paper appendix). 
 			float alpha = min(0.99f, con_o.w * exp(power));
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
 				continue;
 			float test_T = T * (1 - alpha);
 			if (test_T < 0.0001f)
@@ -1574,12 +1574,6 @@ integrateCUDA(
 				}
 #endif 
 
-				if (alpha_point < 1.0f / 255.0f) {
-					continue;
-				}
-
-				alpha += alpha_point * T;
-
 				if constexpr (RETURN_COLOR) {
 					// t is the depth of the gaussian
 					float t = -BB/(2*AA);
@@ -1598,6 +1592,13 @@ integrateCUDA(
 					}
 					T_blend = test_T;
 				}
+				
+				if (alpha_point < 1.0f / ALPHA_THRESHOLD_INV) {
+					continue;
+				}
+
+				alpha += alpha_point * T;
+
 
 				// hmm, isnt this already opa
 				T *= (1 - alpha_point);

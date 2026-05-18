@@ -857,7 +857,7 @@ renderCUDA(
 			const float G = exp(power);
 			const float alpha = min(0.99f, con_o.w * G);
 
-			if (alpha < 1.0f / 255.0f)
+			if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
 				continue;
 
 			// NDC mapping is taken from 2DGS paper, please check here https://arxiv.org/pdf/2403.17888.pdf

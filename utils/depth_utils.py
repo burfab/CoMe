@@ -39,7 +39,7 @@ def depth_to_normal(view, depth):
     return output, points
 
 threshold = 2
-def central_diff(image, ignore_inval = None):
+def central_diff(image, ignore_inval = None, op=torch.eq, return_squared_norm=False):
     """
         image
     """
@@ -49,26 +49,27 @@ def central_diff(image, ignore_inval = None):
     dy = torch.cat([image[1:-1, 2:] - image[1:-1, :-2]], dim=1)
     
     if ignore_inval is not None:
-        ignore_inval = ignore_inval.reshape(1,1,-1)
+        if ignore_inval is torch.Tensor and ignore_inval.ndim == 1: ignore_inval = ignore_inval.reshape(1,1,-1)
         valid_dx = (
-            ~(image[2:, 1:-1] == ignore_inval).all(-1) &
-            ~(image[:-2, 1:-1] == ignore_inval).all(-1)
+            ~(op(image[2:, 1:-1], ignore_inval)).all(-1) &
+            ~(op(image[:-2, 1:-1], ignore_inval)).all(-1)
         )
 
         valid_dy = (
-            ~(image[1:-1, 2:] == ignore_inval).all(-1) &
-            ~(image[1:-1, :-2] == ignore_inval).all(-1)
+            ~(op(image[1:-1, 2:], ignore_inval)).all(-1) &
+            ~(op(image[1:-1, :-2], ignore_inval)).all(-1)
         )
 
         output[1:-1, 1:-1] = (
-            torch.norm(dx, dim=-1) * valid_dx +
-            torch.norm(dy, dim=-1) * valid_dy
+            (dx*dx).sum(dim=-1) * valid_dx +
+            (dy*dy).sum(dim=-1) * valid_dy
         )
     else:
         output[1:-1, 1:-1] = (
-            torch.norm(dx, dim=-1) +
-            torch.norm(dy, dim=-1)
+            (dx*dx).sum(dim=-1) +
+            (dy*dy).sum(dim=-1)
         )
+    if not return_squared_norm: return output.sqrt()
     return output
 
 

@@ -172,7 +172,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     temp_lambdas = {
         "occupation_lambda": 10,
         "variational_depth_normal_fusion_lambda": 5e-1,
-        "depth_smoothness": 5e-2 * scene.cameras_extent
+        "depth_smoothness": 10 * (1/scene.cameras_extent)
         }
     batch = None
     
@@ -421,12 +421,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         lambda_distortion = mesh.lambda_distortion if iteration >= mesh.distortion_from_iter else 0.0
         lambda_depth_normal = mesh.lambda_depth_normal if iteration >= mesh.depth_normal_from_iter else 0.0
         
-        depth_smoothness_loss = central_diff(depth.unsqueeze(0).permute(1,2,0), ignore_inval=torch.zeros_like(depth[0,0].unsqueeze(0)))
-        depth_smoothness_loss = (depth_smoothness_loss*(mask * (depth>0))).mean()
+        MIN_DEPTH_FOR_SMOOTHNESS = 1e-2
+        depth_smoothness_loss = central_diff(1.0/(depth.unsqueeze(0).permute(1,2,0)+1e-8), ignore_inval=1.0/MIN_DEPTH_FOR_SMOOTHNESS, op=torch.ge,return_squared_norm=True)
+        depth_smoothness_loss = ((depth_smoothness_loss*mask)*(depth>MIN_DEPTH_FOR_SMOOTHNESS)).mean()
         lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0])) * torch.exp(-nabla_I)
+        normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]),return_squared_norm=True) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 
