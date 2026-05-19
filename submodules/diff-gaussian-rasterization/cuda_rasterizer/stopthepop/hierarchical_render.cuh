@@ -504,10 +504,6 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 						V2G[9],
 						con_o.w
 					};
-					constexpr float ABC_MIN = 1e-8;
-					ABC.x = (fabsf(ABC.x) < ABC_MIN) ? copysignf(ABC_MIN, ABC.x) : ABC.x;
-					ABC.y = (fabsf(ABC.y) < ABC_MIN) ? copysignf(ABC_MIN, ABC.y) : ABC.y;
-					ABC.z = (fabsf(ABC.z) < ABC_MIN) ? copysignf(ABC_MIN, ABC.z) : ABC.z;
 
 					float depth = -ABC.y/(2.f * ABC.x);
 					float3 normal = {Ld.x, Ld.y, Ld.z};
@@ -534,7 +530,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
 					printf("%d - %d %d - %d %f alpha is %f\n", warp.thread_rank(), pixpos.x, pixpos.y, coll_id, depth, alpha);
 #endif
-					if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
+					if (alpha < 1.0f / 255.0f)
 						continue;
 
 					auto store = store_function(pixpos, coll_id, G, alpha, depth);
@@ -769,7 +765,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 					float power = max_contrib_power_rect_gaussian_float<3, 3>(in_conic_opacity, in_point_xy, tail_rect_min, tail_rect_max, max_pos);
 
 					float alpha = min(0.99f, in_conic_opacity.w * exp(-power));
-					if (alpha < 1.0f / ALPHA_THRESHOLD_INV)
+					if (alpha < 1.0f / 255.0f)
 						halfs_culled_mask |= (0x1U << half);
 				}
 			}
@@ -1177,7 +1173,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 			// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
 
 			const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-			float C = (CC - 2 * logf(ALPHA_THRESHOLD_INV * ABC_.w));
+			float C = (CC - 2 * logf(255 * ABC_.w));
 			float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
 			float NDCspan = FN * (2 * AA * extent) / (BB * BB);
 
@@ -1869,8 +1865,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				// blend_data.depth_global_id = global_id;
 				// blend_data.dt_dA = BB / (2 * AA * AA);
 				// blend_data.dt_dB = -1.f / (2 * AA);
-#define CORRECT_EXACT_DEPTH_GRAD
 #ifdef CORRECT_EXACT_DEPTH_GRAD
+//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
+				if(test_T < 0.5){
+
 				// --- 1. Forward Re-evaluation (Re-calculate values for gradients) ---
 				float inv_A = 1.f / AA;
 				float mu = -BB * 0.5f * inv_A;
@@ -1897,6 +1895,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				// Simplified: = offset / (-2.0f * AA)
 				// We apply the negative sign from: t = mu - offset
 				dL_dA += dL_dt_total * (0.5f * offset * inv_A);
+				}
 
 				// Note on dL_dC: 
 				// In the variance formulation (mu/sigma), depth is usually 
@@ -1967,7 +1966,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
 
 			const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-			float C = (CC - 2 * logf(ALPHA_THRESHOLD_INV * ABC_.w));
+			float C = (CC - 2 * logf(255 * ABC_.w));
 			float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
 
 			float dL_dNDC = blend_data.T * blend_data.dL_dextent_loss * FN;
