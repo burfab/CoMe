@@ -23,7 +23,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, SplattingSettings, OptimizationParams, SplattingSettings, MeshingParams
-from utils.depth_utils import depths_to_points, depth_to_normal, central_diff, DepthNormalConsistencyLoss
+from utils.depth_utils import depths_to_points, depth_to_normal, central_diff, central_diff_normals, DepthNormalConsistencyLoss
 from utils.vis_utils import gui_visualize, export_image
 from utils import segmentation_utils
 from utils import deform_utils
@@ -172,7 +172,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     temp_lambdas = {
         "occupation_lambda": 10,
         "variational_depth_normal_fusion_lambda": 5e-1,
-        "depth_smoothness": 10 * (1/scene.cameras_extent)
+        "depth_smoothness": 0.001 * (1/scene.cameras_extent)
         }
     batch = None
     
@@ -201,7 +201,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                         deformation = deform_model.deformation(gaussians, deform_time) if deform_time >= 0 else deform_utils.Deformation()
                         
                         render_segmentation = message["custom_message"].startswith("segmentation")
-                        splat_args.blend_extra_features = gaussians.segmentation_dimension
+                        splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
                         
                         gaussians_mask = None
                         if message["custom_message"] == "no_bg_gaussians":
@@ -299,7 +299,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         gt_image = viewpoint_cam.original_image.cuda()
         # not sure we need detach here
         
-        render_segmentation = (iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0)
+        render_segmentation = (iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0) and False
         splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
         
         if iteration >= opt.deform_first_step:
@@ -415,19 +415,19 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         nabla_I = central_diff(gt_image.permute(1,2,0)).cuda()
         
-        normal_error = (1 - (render_normal_world * depth_normal).sum(dim=0))
+        normal_error = (1 - (render_normal_world.detach() * depth_normal).sum(dim=0))
         depth_normal_loss = (normal_error * (~mask_no_normal.squeeze(0) * mask)).mean()
         
         lambda_distortion = mesh.lambda_distortion if iteration >= mesh.distortion_from_iter else 0.0
         lambda_depth_normal = mesh.lambda_depth_normal if iteration >= mesh.depth_normal_from_iter else 0.0
         
         MIN_DEPTH_FOR_SMOOTHNESS = 1e-2
-        depth_smoothness_loss = central_diff(1.0/(depth.unsqueeze(0).permute(1,2,0)+1e-8), ignore_inval=1.0/MIN_DEPTH_FOR_SMOOTHNESS, op=torch.ge,return_squared_norm=True)
+        depth_smoothness_loss = central_diff(1.0/(depth.unsqueeze(0).permute(1,2,0)+1e-8), ignore_inval=1.0/MIN_DEPTH_FOR_SMOOTHNESS, op=torch.ge,return_squared_norm=True, scale_x=viewpoint_cam.focal_x, scale_y=viewpoint_cam.focal_y)
         depth_smoothness_loss = ((depth_smoothness_loss*mask)*(depth>MIN_DEPTH_FOR_SMOOTHNESS)).mean()
         lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]),return_squared_norm=True) * torch.exp(-nabla_I)
+        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0])) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 
@@ -454,7 +454,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         
         normal_consistency_loss = DepthNormalConsistencyLoss((viewpoint_cam.focal_x, viewpoint_cam.focal_y, viewpoint_cam.image_width/2, viewpoint_cam.image_height/2))
-        loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal, mask)
+        loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal.detach(), mask)
         
         # Final loss
         #TODO: Try Variational Depth-Normal Fusion

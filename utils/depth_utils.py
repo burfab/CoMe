@@ -38,26 +38,25 @@ def depth_to_normal(view, depth):
     output[1:-1, 1:-1, :] = normal_map
     return output, points
 
-threshold = 2
-def central_diff(image, ignore_inval = None, op=torch.eq, return_squared_norm=False):
+def central_diff(image, ignore_inval = None, op=torch.eq, return_squared_norm=False, scale_x=1, scale_y=1):
     """
         image
     """
     output = torch.zeros_like(image)[:,:,0]
     
-    dx = torch.cat([image[2:, 1:-1] - image[:-2, 1:-1]], dim=0)
-    dy = torch.cat([image[1:-1, 2:] - image[1:-1, :-2]], dim=1)
+    dx = torch.cat([image[1:-1, 2:] - image[1:-1, :-2]], dim=1) * scale_x
+    dy = torch.cat([image[2:, 1:-1] - image[:-2, 1:-1]], dim=0) * scale_y
     
     if ignore_inval is not None:
-        if ignore_inval is torch.Tensor and ignore_inval.ndim == 1: ignore_inval = ignore_inval.reshape(1,1,-1)
+        if isinstance(ignore_inval,torch.Tensor) and ignore_inval.ndim == 1: ignore_inval = ignore_inval.reshape(1,1,-1)
         valid_dx = (
-            ~(op(image[2:, 1:-1], ignore_inval)).all(-1) &
-            ~(op(image[:-2, 1:-1], ignore_inval)).all(-1)
+            ~(op(image[1:-1, 2:], ignore_inval)).all(-1) &
+            ~(op(image[1:-1, :-2], ignore_inval)).all(-1)
         )
 
         valid_dy = (
-            ~(op(image[1:-1, 2:], ignore_inval)).all(-1) &
-            ~(op(image[1:-1, :-2], ignore_inval)).all(-1)
+            ~(op(image[2:, 1:-1], ignore_inval)).all(-1) &
+            ~(op(image[:-2, 1:-1], ignore_inval)).all(-1)
         )
 
         output[1:-1, 1:-1] = (
@@ -71,6 +70,81 @@ def central_diff(image, ignore_inval = None, op=torch.eq, return_squared_norm=Fa
         )
     if not return_squared_norm: return output.sqrt()
     return output
+
+import torch
+
+def central_diff_normals(
+    image,
+    ignore_inval=None,
+    op=torch.eq,
+    scale_x=1.0,
+    scale_y=1.0,
+    epsilon=0.005,           # Threshold for angular variation
+    epsilon_type="hinge",  # Options: "hard", "hinge", "soft_gate"
+):
+    """
+    Central-difference angular variation for normal maps with epsilon insensitivity.
+
+    Args:
+        image: H x W x 3 tensor of unit normals
+        ignore_inval: optional invalid value marker
+        op: comparison op for invalid masking
+        scale_x, scale_y: Optional derivative scaling factors.
+        epsilon: Angular variation threshold (1 - cos(theta)). 
+                 Small values like 0.001 to 0.005 are good starting points.
+        epsilon_type: How to handle values below epsilon:
+            - "hard": Exactly 0 below epsilon; original value above it (gradient jump).
+            - "hinge": Exactly 0 below epsilon; shifts the loss down above it (smooth gradient).
+            - "soft_gate": Smoothly suppresses gradients for variations smaller than epsilon.
+    Returns:
+        H x W tensor
+    """
+    output = torch.zeros_like(image[..., 0])
+
+    # Neighbor pairs
+    nx1 = image[1:-1, 2:]
+    nx0 = image[1:-1, :-2]
+
+    ny1 = image[2:, 1:-1]
+    ny0 = image[:-2, 1:-1]
+
+    # Angular smoothness: 1 - dot(n1, n2)
+    dx = (1.0 - (nx1 * nx0).sum(dim=-1).clamp(-1.0, 1.0)) * scale_x
+    dy = (1.0 - (ny1 * ny0).sum(dim=-1).clamp(-1.0, 1.0)) * scale_y
+
+    # --- Apply Epsilon Thresholding ---
+    if epsilon > 0.0:
+        if epsilon_type == "hard":
+            # Direct 0-out. Note: Can cause slight optimization oscillations at the boundary.
+            dx = torch.where(dx < epsilon, torch.zeros_like(dx), dx)
+            dy = torch.where(dy < epsilon, torch.zeros_like(dy), dy)
+            
+        elif epsilon_type == "hinge":
+            # Standard L1-style dead-zone (SVR style). Smooth gradient everywhere except exactly at epsilon.
+            dx = torch.clamp(dx - epsilon, min=0.0)
+            dy = torch.clamp(dy - epsilon, min=0.0)
+            
+        elif epsilon_type == "soft_gate":
+            # Multiplies loss by a ramp (0 to 1) below epsilon.
+            # This turns the loss quadratic near 0, giving a perfectly smooth downweighting.
+            weight_x = torch.clamp(dx / epsilon, max=1.0)
+            weight_y = torch.clamp(dy / epsilon, max=1.0)
+            dx = dx * weight_x
+            dy = dy * weight_y
+
+    if ignore_inval is not None:
+        if isinstance(ignore_inval, torch.Tensor) and ignore_inval.ndim == 1:
+            ignore_inval = ignore_inval.reshape(1, 1, -1)
+
+        valid_dx = ~(op(nx1, ignore_inval)).all(-1) & ~(op(nx0, ignore_inval)).all(-1)
+        valid_dy = ~(op(ny1, ignore_inval)).all(-1) & ~(op(ny0, ignore_inval)).all(-1)
+
+        output[1:-1, 1:-1] = (dx * valid_dx + dy * valid_dy)
+    else:
+        output[1:-1, 1:-1] = dx + dy
+
+    return output
+
 
 
 class DepthNormalConsistencyLoss(torch.nn.Module):

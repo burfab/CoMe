@@ -423,6 +423,7 @@ def add_bbox_faces(pcl: BasicPointCloud, N = 16):
     
 
 def precompute_structure_tensors(scene, st_mode = "v1", st_levels=4):
+    torch.cuda.empty_cache()
     from time import time
     start = time()
     structure_tensor_cache = {}

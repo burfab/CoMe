@@ -17,6 +17,7 @@ from PIL import Image
 import cv2
 from tqdm import tqdm
 import torch
+import math
 import os
 WARNED = False
 
@@ -45,7 +46,7 @@ def loadCam(args, id, cam_info, resolution_scale):
                     print(f"[ INFO ] Encountered quite large input images (>{int(MAX_RES/1000)}K pixels), rescaling to {int(MAX_RES/1000)}K.\n "
                         "If this is not desired, please explicitly specify '--resolution/-r' as 1")
                     WARNED = True
-                global_down = orig_w*orig_h / MAX_RES
+                global_down = math.sqrt(orig_w*orig_h / MAX_RES)
             else:
                 global_down = 1
         else:
