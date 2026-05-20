@@ -171,8 +171,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     temp_lambdas = {
         "occupation_lambda": 10,
-        "variational_depth_normal_fusion_lambda": 5e-1,
-        "depth_smoothness": 0.001 * (1/scene.cameras_extent)
+        "variational_depth_normal_fusion_lambda": 5,
+        "depth_smoothness": 0* 0.001 * (1/scene.cameras_extent)
         }
     batch = None
     
@@ -415,8 +415,10 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         nabla_I = central_diff(gt_image.permute(1,2,0)).cuda()
         
-        normal_error = (1 - (render_normal_world.detach() * depth_normal).sum(dim=0))
-        depth_normal_loss = (normal_error * (~mask_no_normal.squeeze(0) * mask)).mean()
+        normal_error = (1 - (render_normal_world * depth_normal).sum(dim=0))
+        epsilon_depth_normal_error = 0.005  # Tune this (e.g., 0.001 to 0.005)
+        normal_error_hinge = torch.clamp(normal_error - epsilon_depth_normal_error, min=0.0)
+        depth_normal_loss = (normal_error_hinge * (~mask_no_normal.squeeze(0) * mask)).mean()
         
         lambda_distortion = mesh.lambda_distortion if iteration >= mesh.distortion_from_iter else 0.0
         lambda_depth_normal = mesh.lambda_depth_normal if iteration >= mesh.depth_normal_from_iter else 0.0
@@ -427,7 +429,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0])) * torch.exp(-nabla_I)
+        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), epsilon=0.002,alpha=0.05) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 

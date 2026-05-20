@@ -2054,9 +2054,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			// float AA = ray.x * normal[0] + ray.y * normal[1] + normal[2];
 			// float BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
 			// float CC = view2gaussian_j[9];
-
-			dL_dA += dL_dt * BB / (2 * AA * AA);
-			dL_dB += dL_dt * -1.f / (2 * AA);
+			
+			//dL_dA += dL_dt * BB / (2 * AA * AA);
+			//dL_dB += dL_dt * -1.f / (2 * AA);
 
 			dL_dnormal[0] += dL_dA * ray.x;
 			dL_dnormal[1] += dL_dA * ray.y;

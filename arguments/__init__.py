@@ -311,7 +311,7 @@ class MeshingParams(ParamGroup):
         # TODO: make this similar to what we have for appearance
         self.use_msv2_simplification = False
         # normal regularization bigger as we no longer take the sqrt
-        self.lambda_smoothness = 0.1
+        self.lambda_smoothness = 0.02
         # MCMC
         self.scale_reg = 0.0
         self.opacity_reg = 0.0

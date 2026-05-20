@@ -71,31 +71,37 @@ def central_diff(image, ignore_inval = None, op=torch.eq, return_squared_norm=Fa
     if not return_squared_norm: return output.sqrt()
     return output
 
-import torch
-
 def central_diff_normals(
     image,
     ignore_inval=None,
     op=torch.eq,
     scale_x=1.0,
     scale_y=1.0,
-    epsilon=0.005,           # Threshold for angular variation
-    epsilon_type="hinge",  # Options: "hard", "hinge", "soft_gate"
+    loss_type="charbonnier",  # Core math: "charbonnier", "l1", "l2"
+    alpha=0.05,              # Softening parameter (only for Charbonnier)
+    epsilon=0.002,              # Threshold value below which loss is suppressed
+    epsilon_type="soft_gate",      # Cutoff strategy: "none", "hinge", "soft_gate", "hard"
 ):
     """
-    Central-difference angular variation for normal maps with epsilon insensitivity.
+    Central-difference angular variation for normal maps with decoupled loss profiles
+    and epsilon cutoff strategies.
 
     Args:
         image: H x W x 3 tensor of unit normals
         ignore_inval: optional invalid value marker
         op: comparison op for invalid masking
         scale_x, scale_y: Optional derivative scaling factors.
-        epsilon: Angular variation threshold (1 - cos(theta)). 
-                 Small values like 0.001 to 0.005 are good starting points.
-        epsilon_type: How to handle values below epsilon:
-            - "hard": Exactly 0 below epsilon; original value above it (gradient jump).
-            - "hinge": Exactly 0 below epsilon; shifts the loss down above it (smooth gradient).
-            - "soft_gate": Smoothly suppresses gradients for variations smaller than epsilon.
+        loss_type: The core mathematical penalty profile:
+            - "charbonnier": L2 near zero, L1 for larger variations (uses `alpha`).
+            - "l1": Pure absolute variation.
+            - "l2": Pure squared variation.
+        alpha: Softening parameter for Charbonnier (sqrt(x^2 + alpha^2) - alpha).
+        epsilon: Threshold value for your zeroing/cutoff zone.
+        epsilon_type: How to handle values below your `epsilon` threshold:
+            - "none": Keep the raw continuous loss function values.
+            - "hinge": Standard dead-zone. Exactly 0 below epsilon, shifts loss down linearly.
+            - "soft_gate": Multiplies loss by a smooth ramp (0 to 1) below epsilon.
+            - "hard": Hard block. Exactly 0 below epsilon, unaltered above it.
     Returns:
         H x W tensor
     """
@@ -108,30 +114,42 @@ def central_diff_normals(
     ny1 = image[2:, 1:-1]
     ny0 = image[:-2, 1:-1]
 
-    # Angular smoothness: 1 - dot(n1, n2)
+    # 1. Calculate raw angular difference: 1 - dot(n1, n2)
     dx = (1.0 - (nx1 * nx0).sum(dim=-1).clamp(-1.0, 1.0)) * scale_x
     dy = (1.0 - (ny1 * ny0).sum(dim=-1).clamp(-1.0, 1.0)) * scale_y
 
-    # --- Apply Epsilon Thresholding ---
-    if epsilon > 0.0:
-        if epsilon_type == "hard":
-            # Direct 0-out. Note: Can cause slight optimization oscillations at the boundary.
-            dx = torch.where(dx < epsilon, torch.zeros_like(dx), dx)
-            dy = torch.where(dy < epsilon, torch.zeros_like(dy), dy)
-            
-        elif epsilon_type == "hinge":
-            # Standard L1-style dead-zone (SVR style). Smooth gradient everywhere except exactly at epsilon.
+    # 2. Apply Core Loss Profile
+    if loss_type == "charbonnier":
+        alpha_sq = alpha ** 2
+        dx = torch.sqrt(dx ** 2 + alpha_sq) - alpha
+        dy = torch.sqrt(dy ** 2 + alpha_sq) - alpha
+    elif loss_type == "l2":
+        dx = dx ** 2
+        dy = dy ** 2
+    elif loss_type == "l1":
+        pass
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}")
+
+    # 3. Apply Epsilon Cutoff / Threshold Strategy
+    if epsilon > 0.0 and epsilon_type != "none":
+        if epsilon_type == "hinge":
             dx = torch.clamp(dx - epsilon, min=0.0)
             dy = torch.clamp(dy - epsilon, min=0.0)
             
         elif epsilon_type == "soft_gate":
-            # Multiplies loss by a ramp (0 to 1) below epsilon.
-            # This turns the loss quadratic near 0, giving a perfectly smooth downweighting.
             weight_x = torch.clamp(dx / epsilon, max=1.0)
             weight_y = torch.clamp(dy / epsilon, max=1.0)
             dx = dx * weight_x
             dy = dy * weight_y
+            
+        elif epsilon_type == "hard":
+            dx = torch.where(dx < epsilon, torch.zeros_like(dx), dx)
+            dy = torch.where(dy < epsilon, torch.zeros_like(dy), dy)
+        else:
+            raise ValueError(f"Unknown epsilon_type: {epsilon_type}")
 
+    # 4. Invalid Value Masking
     if ignore_inval is not None:
         if isinstance(ignore_inval, torch.Tensor) and ignore_inval.ndim == 1:
             ignore_inval = ignore_inval.reshape(1, 1, -1)
@@ -144,8 +162,6 @@ def central_diff_normals(
         output[1:-1, 1:-1] = dx + dy
 
     return output
-
-
 
 class DepthNormalConsistencyLoss(torch.nn.Module):
     def __init__(self, intrinsics: tuple, grazing_threshold: float = 1e-3):
