@@ -1574,6 +1574,9 @@ integrateCUDA(
 				}
 #endif 
 
+				if (alpha_point < 1.0f / ALPHA_THRESHOLD_INV) {
+					continue;
+				}
 				if constexpr (RETURN_COLOR) {
 					// t is the depth of the gaussian
 					float t = -BB/(2*AA);
@@ -1593,9 +1596,6 @@ integrateCUDA(
 					T_blend = test_T;
 				}
 				
-				if (alpha_point < 1.0f / ALPHA_THRESHOLD_INV) {
-					continue;
-				}
 
 				alpha += alpha_point * T;
 

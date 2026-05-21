@@ -237,7 +237,6 @@ def get_multiscale_structure_tensor_v1(image_tensor, levels=3, base_sigma=1., oc
     final_Sxx = accum_Sxx / (accum_weight + 1e-6)
     final_Sxy = accum_Sxy / (accum_weight + 1e-6)
     final_Syy = accum_Syy / (accum_weight + 1e-6)
-    
     return torch.cat([final_Sxx, final_Sxy, final_Syy], dim=1)
 
 def get_multiscale_structure_tensor_v2(image_tensor, levels=3, base_sigma=1., octave_step=1.5, smoothing_factor=1.0, power_factor=3.0, aggregation_mode='average'): 

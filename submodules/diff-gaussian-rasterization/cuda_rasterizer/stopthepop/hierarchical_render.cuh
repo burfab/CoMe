@@ -11,7 +11,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-constexpr float SIGMA_MUL = 2.67f;
+constexpr float SIGMA_MUL = 3.00f;
 
 
 template<typename T, size_t S>
@@ -1122,26 +1122,34 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 
 			const float geom_intensity = expf(-0.5f * (CC - (BB * BB) / (4.0f * AA)));
 			blend_data.occupation+=geom_intensity;
-			blend_data.occupation2+=(geom_intensity * geom_intensity);
+			//blend_data.occupation2+=(geom_intensity*geom_intensity);
 			
 			// depth and alpha
             if (blend_data.T > 0.5f)
             {
 				if constexpr (EXACT_DEPTH) {
 					if (test_T < 0.5f) {
-						// Regularization strength
-						float lambda = 1;   // tune this
-						const float t0 = t;
-						float mu = -BB/(2.0*AA);
-						float inv_A = 1.f/AA;
-						float sigma = sqrtf(inv_A);
-						// Original coefficients (as in your setup)
-						float Fp = (-0.5f / (blend_data.T * conic_opacity[id].w)) + (1.0f / conic_opacity[id].w);
-						float log_fp = logf(Fp);
-						float offset = sqrtf(fmaxf(0.f,-2.f * log_fp * inv_A));
-						float clamped_offset = fminf(offset, SIGMA_MUL * sigma);
-						float t_star = mu - clamped_offset;
-						blend_data.depth = t_star;
+						//G_i(t_star) = exp(-1/2 * (A*t_star^2 + B*t_star + C))
+						//start by T_i * (1-o_i G_i(t_star)) = 0.5
+						//all to one side => (T_i-0.5)/(T_i*o_i) = G_i(t_star)
+						//replace t_star with t_peak + delta
+						//replace t_peak with -B/2A. Then replace delta with sigma * k
+						//Solve quadratic term in exp for left sides log
+						//depth should be <= t by the end so subtract
+						//we use SIGMA_MUL as 3.0, as the gaussian outside of its support otherwise could overfit to the depth, essentially underestimating it
+						//depth_T_crossing = t-fminf(k, SIGMA_MUL) * sigma
+
+						const float inv_A = 1.f/AA;
+						const float sigma = sqrtf(inv_A);
+						const float y = (blend_data.T - 0.5)/(blend_data.T * conic_opacity[id].w);
+						const float logy = logf(y);
+						const float inner = -2.f * logy - CC + (BB*BB)/(4*AA);
+						const float k = sqrtf(inner);
+						if (inner > 1e-6) {
+							blend_data.depth = t - fminf(k, SIGMA_MUL) * sigma;
+						} else {
+							blend_data.depth = t;
+						}
 					}
 					else {
 						blend_data.depth = t;
@@ -1165,6 +1173,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 	
 					alpha_point = min(0.99f, ABC_.w * exp(p));
 				}
+				blend_data.occupation2+=blend_data.T_opa*alpha_point*((rgb[0]*0.299+rgb[1]*0.587+rgb[2]*0.114));
 				blend_data.opacity += alpha_point * blend_data.T_opa;
 				blend_data.T_opa *= (1 - alpha_point);
 			}
@@ -1268,7 +1277,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 				out_color[VARIANCE_OFFSET * H * W + pix_id] = blend_data.variance;
 				out_color[NORMAL_VARIANCE_OFFSET * H * W + pix_id] = normal_variance;
 				out_color[OCCUPATION_OFFSET * H * W + pix_id] = blend_data.occupation/fmaxf((float)blend_data.blend_contributor, 1.f);
-				out_color[OCCUPATION2_OFFSET * H * W + pix_id] = blend_data.occupation2/fmaxf((float)blend_data.blend_contributor, 1.f);
+				out_color[OCCUPATION2_OFFSET * H * W + pix_id] = blend_data.occupation2;
 			}
 			else
 			{
@@ -1414,6 +1423,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 		float T;
 		float opacity;
 		float max_depth;
+		float gray;
 
 		float3 ray_dir;
 		uint32_t contributor{0};
@@ -1430,6 +1440,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			// needed for opacity evaluation
 			bd.T_opa = 1.0f;
 			bd.T = 1.f;
+			bd.gray = 0.f;
 
 			bd.opacity = 0.f;
 
@@ -1463,6 +1474,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 				}
 				alpha_point = min(0.99f, ABC_.w * exp(p));
 			}
+			float rgb[CHANNELS];
+			for (int ch = 0; ch < CHANNELS; ch++) 
+				rgb[ch] = features[id * CHANNELS + ch];
+			blend_data.gray +=blend_data.T_opa*alpha_point*((rgb[0]*0.299+rgb[1]*0.587+rgb[2]*0.144));
+
 
 			blend_data.opacity += alpha_point * blend_data.T_opa;
 			blend_data.T_opa *= (1 - alpha_point);
@@ -1477,10 +1493,12 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			// - final T_opa
 			float T_opa_rest = final_T[pix_id + 3 * H * W];
 			float opa_rest = out_color[ALPHA_OFFSET * H * W + pix_id];
+			float gray_rest = out_color[OCCUPATION2_OFFSET * H * W + pix_id];
 
 			// final opacity = blend_data.opacity + T_opa_k * opa_rest
 			float opacity = blend_data.opacity + blend_data.T_opa * opa_rest;
 			out_color[ALPHA_OFFSET * H * W + pix_id] = opacity;
+			out_color[OCCUPATION2_OFFSET * H * W + pix_id] = (gray_rest * blend_data.T_opa + blend_data.gray)/(1.f-(blend_data.T_opa * T_opa_rest) + 1e-8f);
 			
 			// final T_opa = T_opa_k * T_opa_rest
 			final_T[pix_id + 3 * H * W] = blend_data.T_opa * T_opa_rest;
@@ -1563,6 +1581,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		float dL_dt;
 		float dt_dA;
 		float dt_dB;
+		float dt_dC;
+		float dt_dw;
 
 		uint32_t blend_contributor;
 		uint32_t max_contributor;
@@ -1603,6 +1623,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			bd.dL_dt = 0.f;
 			bd.dt_dA = 0.f;
 			bd.dt_dB = 0.f;
+			bd.dt_dC = 0.f;
+			bd.dt_dw = 0.f;
 			bd.ray = {raydir.x, raydir.y};
 
 			bd.remaining_A = bd.final_A;
@@ -1676,9 +1698,13 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				bd.dL_doccupation =
 					dL_dpixels[OCCUPATION_OFFSET * H * W + pix_id] /
 					fmaxf((float)bd.blend_contributor, 1.f);
+					/*
 				bd.dL_doccupation2 =
 					dL_dpixels[OCCUPATION2_OFFSET * H * W + pix_id] /
 					fmaxf((float)bd.blend_contributor, 1.f);
+					*/
+				bd.dL_doccupation2 =
+					dL_dpixels[OCCUPATION2_OFFSET * H * W + pix_id] * (bd.T_opa_final+1e-8f);
 			}else {
 				bd.dL_doccupation = 0;
 				bd.dL_doccupation2 = 0;
@@ -1736,7 +1762,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			float geom_intensity = expf(peak_exponent);
 
 			// 2. dL / d(geom_intensity)
-			float dL_dgeom = blend_data.dL_doccupation + blend_data.dL_doccupation2 * 2.0f * geom_intensity;
+			//float dL_dgeom = blend_data.dL_doccupation + blend_data.dL_doccupation2 * 2.0f * geom_intensity;
+			float dL_dgeom = blend_data.dL_doccupation;
 
 			// 3. dL / d(peak_exponent) -> because d(exp(x))/dx = exp(x)
 			float dL_dexp = dL_dgeom * geom_intensity;
@@ -1757,21 +1784,26 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
 			// pair).
 			float dL_dalpha = 0.0f;
+
+			float dL_dcolors_gaussian[CHANNELS];
+			float rgb[3];
+
 			for (int ch = 0; ch < CHANNELS; ch++)
 			{
-				const float c = colors[global_id * CHANNELS + ch];
+				dL_dcolors_gaussian[ch] = 0.f;
+				rgb[ch] = colors[global_id * CHANNELS + ch];
 
 				// reconstruct color up to this point
-				blend_data.C[ch] += c * alpha * blend_data.T;
+				blend_data.C[ch] += rgb[ch] * alpha * blend_data.T;
 				// the contribution of all other gaussian coming after
 				float accum_rec_ch = (blend_data.final_color[ch] - blend_data.C[ch]) / test_T;
 
 				const float dL_dchannel = blend_data.dL_dpixel[ch];
-				dL_dalpha += (c - accum_rec_ch) * dL_dchannel;
+				dL_dalpha += (rgb[ch] - accum_rec_ch) * dL_dchannel;
 				// Update the gradients w.r.t. color of the Gaussian. 
 				// Atomic, since this pixel is just one of potentially
 				// many that were affected by this Gaussian.
-				atomicAdd(&(dL_dcolors[global_id * CHANNELS + ch]), dchannel_dcolor * dL_dchannel);
+				dL_dcolors_gaussian[ch]+=dchannel_dcolor*dL_dchannel;
 			}
 			// +++++++++Variance Loss ++++++++++
 			float sum_D_i = 0.f;
@@ -1779,8 +1811,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			//
 			for (int ch = 0; ch < CHANNELS; ch++)
 			{
-				const float c = colors[global_id * CHANNELS + ch];
-				atomicAdd(&(dL_dcolors[global_id * CHANNELS + ch]), 2.f * variance_strength * dchannel_dcolor * (c - blend_data.gt_color[ch] )) ;
+				const float c = rgb[ch];
+				dL_dcolors_gaussian[ch]+=2.f * variance_strength * dchannel_dcolor * (c - blend_data.gt_color[ch]);
 				float D_i = (c - blend_data.gt_color[ch]) * (c - blend_data.gt_color[ch]);
 				blend_data.remaining_variance -= dchannel_dcolor * D_i;
 				sum_D_i += D_i;
@@ -1797,7 +1829,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 
 			//++++++++++++GOF
 			// gradient for the distoration loss is taken from 2DGS paper, please check https://arxiv.org/pdf/2403.17888.pdf
-			float dL_dt = 0.0f;
 			float dL_dmax_t = 0.0f;
 			float dL_dweight = 0.0f;
 
@@ -1855,56 +1886,106 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				(-dL_dnormal_normalized[1] + dL_dlength * normal[1]) / length,
 				(-dL_dnormal_normalized[2] + dL_dlength * normal[2]) / length
 			};
-			
-			dL_dt = dL_dmax_t;
 
-			float dL_do = 0.0f;
+			float dL_do = 0;
+			float inv_A = 1.f / AA;
 			if (++blend_data.current_contributor == blend_data.max_contributor) {
-				dL_dt += blend_data.dL_dmax_depth;
-
-				// blend_data.depth_global_id = global_id;
-				// blend_data.dt_dA = BB / (2 * AA * AA);
-				// blend_data.dt_dB = -1.f / (2 * AA);
+				blend_data.depth_global_id = global_id;
 #ifdef CORRECT_EXACT_DEPTH_GRAD
-//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
-				if(test_T < 0.5){
+				//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
+				if (test_T < 0.5f) {
+					// recompute helpers
+					float sigma   = sqrtf(inv_A);
 
-				// --- 1. Forward Re-evaluation (Re-calculate values for gradients) ---
-				float inv_A = 1.f / AA;
-				float mu = -BB * 0.5f * inv_A;
-				
-				float Fp = (-0.5f / (blend_data.T * ABC_.w)) + (1.0f / ABC_.w);
-				float log_fp = logf(Fp);
-				// We use a small epsilon for the sqrt to keep the gradient from exploding
-				float inner = -2.f * log_fp * inv_A;
-				float offset = sqrtf(fmaxf(1e-8f, inner));
+					// y = (T - 0.5)/(T * o)
+					float y = (blend_data.T - 0.5f) / (blend_data.T * con_o.w);
+					y = fmaxf(y, 1e-6f);              // numerical safety
+					float logy = logf(y);
+					// inner = -2 logy - C + B^2/(4A)
+					float inner = -2.0f * logy - CC + (BB * BB) / (4.0f * AA);
+					// mask invalid region
+					if (inner <= 0.0f) {
+						// no valid solution -> gradients only through fallback path (if any)
+						inner = 0.0f;
+					}
+					float k = sqrtf(inner);
+					float k_clamped = fminf(k, SIGMA_MUL);
+					float delta = -sigma * k_clamped;
+					float t_star = t + delta;
+					//backward
+					float d_t = 1.f;
+					float d_delta = 1.f;
+					float d_sigma = -k_clamped * d_delta;
+					float d_k     = -sigma * d_delta;
+					if (k >= SIGMA_MUL) d_k = 0.f;
+					float d_inner = 0.0f;
+					if (inner > 0.0f) {
+						d_inner = d_k * 0.5f / k;
+					}
+					float d_C = -d_inner;
+					float d_B = d_inner * (BB / (2.0f * AA))+(-0.5f * inv_A);
+					float d_A = d_inner * (-(BB * BB) / (4.0f * AA * AA));
+					float d_logy = -2.0f * d_inner;
+					
+					float d_T = 0.0f;
+					float d_op = 0.0f;
 
-				// --- 2. STE Gradient Logic ---
-				// We treat t = mu - offset as differentiable everywhere, 
-				// ignoring the SIGMA_MUL clamp's derivative (STE).
-				
-				float dL_dt_total = blend_data.dL_dmax_depth;
+					float inv_To = 1.0f / (blend_data.T * con_o.w);
 
-				// d_mu/dA = B / (2 * A^2)
-				// d_mu/dB = -1 / (2 * A)
-				dL_dA += dL_dt_total * (BB * 0.5f * inv_A * inv_A);
-				dL_dB += dL_dt_total * (-0.5f * inv_A);
+					// dy/dT = (1/(T-0.5) - 1/T) * y
+					float d_y = d_logy / y;
 
-				// d_offset/dA = d/dA (sqrt(-2 * log_fp * A^-1))
-				//             = 0.5 * (inner)^-0.5 * (2 * log_fp * A^-2)
-				// Simplified: = offset / (-2.0f * AA)
-				// We apply the negative sign from: t = mu - offset
-				dL_dA += dL_dt_total * (0.5f * offset * inv_A);
+					// derivative split
+					/*
+					d_T += d_y * (1.0f / (blend_data.T - 0.5f) - 1.0f / blend_data.T);
+					d_T += d_y * (-(blend_data.T - 0.5f) / (blend_data.T * blend_data.T * con_o.w));
+					*/
+
+					d_op += d_y * (-(blend_data.T - 0.5f) / (blend_data.T * con_o.w * con_o.w));
+					d_A += d_sigma * (-0.5f) * inv_A * sqrtf(inv_A) + (0.5f * BB * inv_A * inv_A);
+					
+					dL_dA += d_A* (blend_data.dL_dmax_depth);
+					dL_dB += d_B* (blend_data.dL_dmax_depth);
+					dL_dC += d_C* (blend_data.dL_dmax_depth);
+
+					//grad_dT = dT
+					dL_do += d_op* (blend_data.dL_dmax_depth);
+
+					blend_data.dt_dA = d_A;
+					blend_data.dt_dB = d_B;
+					blend_data.dt_dC = d_C;
+					blend_data.dt_dw = d_op;
+				} else {
+					// plain depth (test_T >= 0.5)
+					dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
+					dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
+					dL_dC += 0* (blend_data.dL_dmax_depth);
+					dL_do += 0* (blend_data.dL_dmax_depth);
+
+					blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
+					blend_data.dt_dB = -0.5f * inv_A;
+					blend_data.dt_dC = 0.f;
+					blend_data.dt_dw = 0.f;
 				}
-
-				// Note on dL_dC: 
-				// In the variance formulation (mu/sigma), depth is usually 
-				// decoupled from the 2D normalization constant C. 
-				// If your forward t_star doesn't use CC, dL_dC is 0.
+#else
+				dL_dA += 0.5f * BB * inv_A * inv_A * blend_data.dL_dmax_depth;
+				dL_dB += -0.5f * inv_A * blend_data.dL_dmax_depth;
+				dL_dC += 0;
+				dL_do += 0;
 #endif
 			}
+			
+			dL_dA += 0.5f * BB * inv_A * inv_A * (dL_dmax_t);
+			dL_dB += -0.5f * inv_A* (dL_dmax_t);
+			dL_dC += 0* (dL_dmax_t);
+			dL_do += 0* (dL_dmax_t);
+			
 
 			dL_dalpha *= blend_data.T;
+
+
+
+
 			
 			// here, the depth of the Gaussian is larger than the depth of the pixel
 			float alpha_point = 0.f;
@@ -1919,11 +2000,13 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				}
 				float expp = exp(p);
 				alpha_point = min(0.99f, ABC_.w * expp);
-				float dL_dalpha_point = (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity)) * blend_data.dL_dopacity;
+				float dalpha_point = (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity));
+				float dL_dalpha_point = dalpha_point * blend_data.dL_dopacity;
+				
+				dL_dalpha_point += blend_data.T_opa * (0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2])
+								* blend_data.dL_doccupation2;
+				dL_do += dL_dalpha_point * expp; 
 
-				// derive gradients w.r.t. opacity
-				// alpha_point = min(0.99f, ABC_.w * exp(p));
-				dL_do += dL_dalpha_point * expp;
 
 				// derive gradients w.r.t. AA,BB,CC
 				// alpha_point = min(0.99f, ABC_.w * exp(p));
@@ -1947,7 +2030,12 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				alpha_point = alpha;
 				// just add the gradient to alpha, the computation will take care of the rest
 				dL_dalpha += (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity)) * blend_data.dL_dopacity;
+				dL_dalpha += blend_data.T_opa * (0.299f * rgb[0] + 0.587f * rgb[1] + 0.114 * rgb[2]) * blend_data.dL_doccupation2;
 			}
+
+			dL_dcolors_gaussian[0] += blend_data.T_opa * alpha_point * 0.299f * blend_data.dL_doccupation2;
+			dL_dcolors_gaussian[1] += blend_data.T_opa * alpha_point * 0.587f * blend_data.dL_doccupation2;
+			dL_dcolors_gaussian[2] += blend_data.T_opa * alpha_point * 0.114f * blend_data.dL_doccupation2;
 
 			// first, accumulate the opacity
 			blend_data.opacity += alpha_point * blend_data.T_opa;
@@ -2043,9 +2131,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			dL_dB += dL_dmin_value * -BB / (2 *AA);
 			dL_dC += dL_dmin_value * 1.0f;
 
-			dL_dA += dL_dt * BB / (2 * AA * AA);
-			dL_dB += dL_dt * -1.f / (2 * AA);
-
 			// const float normal[3] = { view2gaussian_j[0] * ray.x + view2gaussian_j[1] * ray.y + view2gaussian_j[2], 
 			// 						view2gaussian_j[1] * ray.x + view2gaussian_j[3] * ray.y + view2gaussian_j[4],
 			// 						view2gaussian_j[2] * ray.x + view2gaussian_j[4] * ray.y + view2gaussian_j[5]};
@@ -2055,8 +2140,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			// float BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
 			// float CC = view2gaussian_j[9];
 			
-			//dL_dA += dL_dt * BB / (2 * AA * AA);
-			//dL_dB += dL_dt * -1.f / (2 * AA);
 
 			dL_dnormal[0] += dL_dA * ray.x;
 			dL_dnormal[1] += dL_dA * ray.y;
@@ -2074,6 +2157,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 7]), dL_dB * 2 * ray.y);
 			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 8]), dL_dB * 2);
 			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 9]), dL_dC);
+
+
+			for(int ch =0; ch < CHANNELS;ch++) atomicAdd(&(dL_dcolors[global_id * CHANNELS + ch]), dL_dcolors_gaussian[ch]);
 
 			//++++++++++++GOF
 
@@ -2116,32 +2202,56 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			if (abs(diff2) > 1e-5)
 				printf("%u, %u:\t T %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff2, blend_data.T_opa_final, blend_data.T_opa);
 #endif
-			// if (blend_data.depth_global_id != -1) {
-			// 	// we need to compute the gradients for the dO/dA, dO/dB
-			// 	float dL_dt = blend_data.dL_dt;
+		if (blend_data.depth_global_id != (uint32_t)-1 &&
+			blend_data.dL_dt != 0.f) {
+			float dL_dA = blend_data.dt_dA * blend_data.dL_dt;
+			float dL_dB = blend_data.dt_dB * blend_data.dL_dt;
+			float dL_dC = 
+				blend_data.dt_dC * blend_data.dL_dt; // NEW
 
-			// 	// gradient with respect to A,B,C
-			// 	float dL_dA = blend_data.dt_dA * dL_dt;
-			// 	float dL_dB = blend_data.dt_dB * dL_dt;
+			float dL_dnormal[3] = {dL_dA * blend_data.ray.x,
+									dL_dA * blend_data.ray.y,
+									dL_dA};
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 0],
+					dL_dnormal[0] * blend_data.ray.x);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 1],
+					dL_dnormal[0] * blend_data.ray.y +
+						dL_dnormal[1] * blend_data.ray.x);
+			atomicAdd(
+				&dL_dview2gaussian[blend_data.depth_global_id *
+										10 +
+									2],
+				dL_dnormal[0] + dL_dnormal[2] * blend_data.ray.x);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 3],
+					dL_dnormal[1] * blend_data.ray.y);
+			atomicAdd(
+				&dL_dview2gaussian[blend_data.depth_global_id *
+										10 +
+									4],
+				dL_dnormal[1] + dL_dnormal[2] * blend_data.ray.y);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 5],
+					dL_dnormal[2]);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 6],
+					dL_dB * 2.f * blend_data.ray.x);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 7],
+					dL_dB * 2.f * blend_data.ray.y);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 8],
+					dL_dB * 2.f);
+			atomicAdd(&dL_dview2gaussian
+						[blend_data.depth_global_id * 10 + 9],
+					dL_dC); // NEW
+			atomicAdd(&dL_dopacity[blend_data.depth_global_id],
+					blend_data.dt_dw * blend_data.dL_dt);
+		}
 
-			// 	float dL_dnormal[3] = {
-			// 		dL_dA * blend_data.ray.x,
-			// 		dL_dA * blend_data.ray.y,
-			// 		dL_dA
-			// 	};
-
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 0]), dL_dnormal[0] * blend_data.ray.x);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 1]), dL_dnormal[0] * blend_data.ray.y + dL_dnormal[1] * blend_data.ray.x);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 2]), dL_dnormal[0] + dL_dnormal[2] * blend_data.ray.x);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 3]), dL_dnormal[1] * blend_data.ray.y);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 4]), dL_dnormal[1] + dL_dnormal[2] * blend_data.ray.y);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 5]), dL_dnormal[2]);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 6]), dL_dB * 2 * blend_data.ray.x);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 7]), dL_dB * 2 * blend_data.ray.y);
-			// 	atomicAdd(&(dL_dview2gaussian[blend_data.depth_global_id * 10 + 8]), dL_dB * 2);
-			// }
-			
-			return;
+                        return;
 		};
 
 	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(

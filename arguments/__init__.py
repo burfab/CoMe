@@ -243,7 +243,7 @@ class OptimizationParams(ParamGroup):
         self.importance_error_threshold = 0.06
         self.add_bbox_faces = False
         self.warmup_densification = False
-        self.camera_sampling = "fps"
+        self.camera_sampling = "random"
         
         # expansion parameters
         self.tau_expand = 1.0

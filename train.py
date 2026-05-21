@@ -171,8 +171,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     temp_lambdas = {
         "occupation_lambda": 10,
-        "variational_depth_normal_fusion_lambda": 5,
-        "depth_smoothness": 0* 0.001 * (1/scene.cameras_extent)
+        "variational_depth_normal_fusion_lambda": 1.000,
+        "depth_smoothness": 0* 0.001 * (1/scene.cameras_extent),
+        "surface_L_lambda" :1e-3
         }
     batch = None
     
@@ -245,8 +246,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 network_gui.conn = None
                 
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+        if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
         if iteration % opt.self_generated_masks_interval == 0 and iteration > 0 or (iteration == first_iter and first_iter >= opt.self_generated_masks_interval):
-            if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
             with torch.no_grad():
                 all_cameras = scene.getTrainCameras().copy()
                 import cv2
@@ -416,7 +417,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         nabla_I = central_diff(gt_image.permute(1,2,0)).cuda()
         
         normal_error = (1 - (render_normal_world * depth_normal).sum(dim=0))
-        epsilon_depth_normal_error = 0.005  # Tune this (e.g., 0.001 to 0.005)
+        epsilon_depth_normal_error = 0.000  # Tune this (e.g., 0.001 to 0.005)
         normal_error_hinge = torch.clamp(normal_error - epsilon_depth_normal_error, min=0.0)
         depth_normal_loss = (normal_error_hinge * (~mask_no_normal.squeeze(0) * mask)).mean()
         
@@ -429,7 +430,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), epsilon=0.002,alpha=0.05) * torch.exp(-nabla_I)
+        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), epsilon=0.001,alpha=0.05) #* torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
 
@@ -461,6 +462,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         # Final loss
         #TODO: Try Variational Depth-Normal Fusion
         
+        rgb_to_gray = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32, device=gt_image.device)[:,None,None]
+        surface_L = ((occupation2 - (gt_image * rgb_to_gray).sum(0,keepdim=True))**2)*2 + ((occupation2 - (image * rgb_to_gray).sum(0,keepdim=True))**2)
+        
         if iteration < opt.position_lr_max_steps:
             loss =  rgb_loss_mean + \
                     depth_normal_loss    * lambda_depth_normal + \
@@ -470,13 +474,14 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     extent_loss          * lambda_extent + \
                     variance_loss        * lambda_variance + \
                     normal_variance_loss * lambda_normal_variance + \
-                    (mesh.opacity_reg * torch.abs(gaussians.get_opacity).mean() if mesh.opacity_reg > 0 else 0.0) + \
+                    (mesh.opacity_reg * (gaussians.get_opacity.abs()).mean() if mesh.opacity_reg > 0 else 0.0) + \
                     (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
                     (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
                     seg_loss_obj + \
                     seg_loss_obj_3d + \
                     occupation_loss  + \
                     (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
+                    (temp_lambdas["surface_L_lambda"] if iteration >= mesh.distortion_from_iter else 0) * (surface_L*mask).mean() + \
                     lambda_depth_smoothness * depth_smoothness_loss
                     #freq_loss * opt.lambda_freq
         else:
