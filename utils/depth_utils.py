@@ -3,8 +3,7 @@ import math
 import torch
 import numpy as np
 
-def depths_to_points(view, depthmap):
-    c2w = (view.world_view_transform.T).inverse()
+def intrinsics_from_view(view):
     W, H = view.image_width, view.image_height
     fx = W / (2 * math.tan(view.FoVx / 2.))
     fy = H / (2 * math.tan(view.FoVy / 2.))
@@ -12,21 +11,31 @@ def depths_to_points(view, depthmap):
         [[fx, 0., W/2.],
         [0., fy, H/2.],
         [0., 0., 1.0]]
-    ).float().cuda()
-    grid_x, grid_y = torch.meshgrid(torch.arange(W, device='cuda').float() + 0.5, torch.arange(H, device='cuda').float() + 0.5, indexing='xy')
+    ).float()
+    return intrins
+
+def depths_to_points(view, depthmap, cam_space=False):
+    c2w = (view.world_view_transform.T).inverse()
+    intrins = intrinsics_from_view(view).cuda()
+    grid_x, grid_y = torch.meshgrid(torch.arange(view.image_width, device='cuda').float() + 0.5, torch.arange(view.image_height, device='cuda').float() + 0.5, indexing='xy')
     points = torch.stack([grid_x, grid_y, torch.ones_like(grid_x)], dim=-1).reshape(-1, 3)
-    rays_d = points @ intrins.inverse().T @ c2w[:3,:3].T
-    rays_o = c2w[:3,3]
-    points = depthmap.reshape(-1, 1) * rays_d + rays_o
+    if not cam_space:
+        rays_d = points @ intrins.inverse().T @ c2w[:3,:3].T
+        rays_o = c2w[:3,3]
+        points = depthmap.reshape(-1, 1) * rays_d + rays_o
+    else:
+        rays_d = points @ intrins.inverse().T 
+        points = depthmap.reshape(-1, 1) * rays_d
     return points
 
+
 threshold = 2
-def depth_to_normal(view, depth):
+def depth_to_normal(view, depth, cam_space=False):
     """
         view: view camera
         depth: depthmap 
     """
-    points = depths_to_points(view, depth).reshape(*depth.shape[1:], 3)
+    points = depths_to_points(view, depth, cam_space).reshape(*depth.shape[1:], 3)
     output = torch.zeros_like(points)
     dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
     dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)

@@ -13,6 +13,111 @@ namespace cg = cooperative_groups;
 
 constexpr float SIGMA_MUL = 3.00f;
 
+template <bool NormalizeCoeffs = false>
+struct StableQuadraticSolver {
+    float A, B, C;
+    float q, S, M; 
+    float eps;
+    bool valid_delta;
+    bool is_linear; // Flag to skip quadratic calculations in forward/backward
+
+    __device__ StableQuadraticSolver(float epsilon = 1e-7f) 
+        : eps(epsilon), M(1.0f), is_linear(false), valid_delta(false) {}
+
+    // ---------------------------------------------------------
+    // FORWARD PASS
+    // ---------------------------------------------------------
+    __device__ void forward(float in_A, float in_B, float in_C, float& x_target) {
+        if (NormalizeCoeffs) {
+            M = fmaxf(fmaxf(fabsf(in_A), fabsf(in_B)), fabsf(in_C));
+            M = fmaxf(M, eps); 
+            A = in_A / M;
+            B = in_B / M;
+            C = in_C / M;
+        } else {
+            A = in_A;
+            B = in_B;
+            C = in_C;
+            M = 1.0f;
+        }
+
+        // Check for near-linearity. 1e-5f is a robust threshold for FP32.
+        is_linear = (fabsf(A) < 1e-5f);
+
+        if (is_linear) {
+            // Linear equation has a single unique root: Bx + C = 0 -> x = -C / B
+            float B_safe = fabsf(B) < eps ? copysignf(eps, B) : B;
+            x_target = -C / B_safe;
+            
+            // Zero out unused registers to keep compiler clean
+            q = 0.0f; S = 0.0f; valid_delta = false;
+        } else {
+            // Full Stable Quadratic Solver
+            float delta = B * B - 4.0f * A * C;
+            valid_delta = delta > 0.0f; 
+            
+            S = sqrtf(fmaxf(delta, 0.0f) + eps);
+            float b_sign = copysignf(1.0f, B);
+            q = -0.5f * (B + b_sign * S);
+            
+            float A_safe = fabsf(A) < eps ? copysignf(eps, A) : A;
+            float q_safe = fabsf(q) < eps ? copysignf(eps, q) : q;
+            
+            float x1 = q / A_safe;
+            float x2 = C / q_safe;
+
+            // Target the root IN FRONT of the peak (x < peak)
+            bool same_sign = (A >= 0.0f) == (B >= 0.0f);
+            x_target = same_sign ? x1 : x2;
+        }
+    }
+
+    // ---------------------------------------------------------
+    // BACKWARD PASS
+    // ---------------------------------------------------------
+    __device__ void backward(float grad_x_target, float& grad_A, float& grad_B, float& grad_C) {
+        if (is_linear) {
+            // x = -C / B. 
+            // dx/dC = -1/B, dx/dB = C / B^2, dx/dA = 0
+            float B_safe = fabsf(B) < eps ? copysignf(eps, B) : B;
+            
+            float grad_A_norm = 0.0f;
+            float grad_B_norm = grad_x_target * (C / (B_safe * B_safe));
+            float grad_C_norm = grad_x_target * (-1.0f / B_safe);
+
+            grad_A = grad_A_norm / M;
+            grad_B = grad_B_norm / M;
+            grad_C = grad_C_norm / M;
+        } else {
+            // Quadratic gradient branch
+            float A_safe = fabsf(A) < eps ? copysignf(eps, A) : A;
+            float q_safe = fabsf(q) < eps ? copysignf(eps, q) : q;
+            bool same_sign = (A >= 0.0f) == (B >= 0.0f);
+
+            // Upstream split matched to our front-of-peak forward selection
+            float grad_x1 = same_sign ? grad_x_target : 0.0f;
+            float grad_x2 = same_sign ? 0.0f : grad_x_target;
+
+            float grad_q = (grad_x1 / A_safe) - (grad_x2 * C / (q_safe * q_safe));
+            float b_sign = copysignf(1.0f, B);
+            float grad_S_term = valid_delta ? (0.5f / S) : 0.0f;
+
+            float dq_dA = b_sign * C * grad_S_term * 2.0f; 
+            float dq_dB = -0.5f * (1.0f + b_sign * B * grad_S_term * 2.0f);
+            float dq_dC = b_sign * A * grad_S_term * 2.0f;
+
+            float grad_A_norm = grad_x1 * (-q / (A_safe * A_safe)) + grad_q * dq_dA;
+            float grad_B_norm = grad_q * dq_dB;
+            float grad_C_norm = (grad_x2 / q_safe) + grad_q * dq_dC;
+
+            grad_A = grad_A_norm / M;
+            grad_B = grad_B_norm / M;
+            grad_C = grad_C_norm / M;
+        }
+    }
+};
+
+
 
 template<typename T, size_t S>
 __device__ void initArray(T(&arr)[S], T v = 0)
@@ -1123,6 +1228,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 			const float geom_intensity = expf(-0.5f * (CC - (BB * BB) / (4.0f * AA)));
 			blend_data.occupation+=geom_intensity;
 			//blend_data.occupation2+=(geom_intensity*geom_intensity);
+
+			const float g_opacity = conic_opacity[id].w;
 			
 			// depth and alpha
             if (blend_data.T > 0.5f)
@@ -1139,17 +1246,20 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 						//we use SIGMA_MUL as 3.0, as the gaussian outside of its support otherwise could overfit to the depth, essentially underestimating it
 						//depth_T_crossing = t-fminf(k, SIGMA_MUL) * sigma
 
-						const float inv_A = 1.f/AA;
-						const float sigma = sqrtf(inv_A);
-						const float y = (blend_data.T - 0.5)/(blend_data.T * conic_opacity[id].w);
-						const float logy = logf(y);
-						const float inner = -2.f * logy - CC + (BB*BB)/(4*AA);
-						const float k = sqrtf(inner);
-						if (inner > 1e-6) {
-							blend_data.depth = t - fminf(k, SIGMA_MUL) * sigma;
-						} else {
-							blend_data.depth = t;
-						}
+
+						// 1. Compute stable logy
+						float log_num = logf(fmaxf(2.0f * blend_data.T - 1.0f, 1e-7f)); // NaN protection
+						float log_den = logf(2.0f * blend_data.T) + logf(g_opacity);
+						float logy = fmaxf(log_num - log_den, -13.8155105579f);
+
+						// 2. Setup quadratic constant
+						float D = CC + 2.f * logy;
+						float x;
+
+						// 3. Solve for the root cleanly
+						StableQuadraticSolver<true>(1e-6f).forward(AA, BB, D, x);
+						float t_star = t + x;
+						blend_data.depth = t_star;
 					}
 					else {
 						blend_data.depth = t;
@@ -1894,67 +2004,41 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 #ifdef CORRECT_EXACT_DEPTH_GRAD
 				//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
 				if (test_T < 0.5f) {
-					// recompute helpers
-					float sigma   = sqrtf(inv_A);
 
-					// y = (T - 0.5)/(T * o)
-					float y = (blend_data.T - 0.5f) / (blend_data.T * con_o.w);
-					y = fmaxf(y, 1e-6f);              // numerical safety
-					float logy = logf(y);
-					// inner = -2 logy - C + B^2/(4A)
-					float inner = -2.0f * logy - CC + (BB * BB) / (4.0f * AA);
-					// mask invalid region
-					if (inner <= 0.0f) {
-						// no valid solution -> gradients only through fallback path (if any)
-						inner = 0.0f;
-					}
-					float k = sqrtf(inner);
-					float k_clamped = fminf(k, SIGMA_MUL);
-					float delta = -sigma * k_clamped;
-					float t_star = t + delta;
-					//backward
-					float d_t = 1.f;
-					float d_delta = 1.f;
-					float d_sigma = -k_clamped * d_delta;
-					float d_k     = -sigma * d_delta;
-					if (k >= SIGMA_MUL) d_k = 0.f;
-					float d_inner = 0.0f;
-					if (inner > 0.0f) {
-						d_inner = d_k * 0.5f / k;
-					}
-					float d_C = -d_inner;
-					float d_B = d_inner * (BB / (2.0f * AA))+(-0.5f * inv_A);
-					float d_A = d_inner * (-(BB * BB) / (4.0f * AA * AA));
-					float d_logy = -2.0f * d_inner;
-					
-					float d_T = 0.0f;
-					float d_op = 0.0f;
+					// 1. Compute stable logy
+					float log_num = logf(fmaxf(2.0f * blend_data.T - 1.0f, 1e-7f)); // NaN protection
+					float log_den = logf(2.0f * blend_data.T) + logf(con_o.w);
+					float logy = fmaxf(log_num - log_den, -13.8155105579f);
 
-					float inv_To = 1.0f / (blend_data.T * con_o.w);
+					// 2. Setup quadratic constant
+					float D = CC + 2.f * logy;
+					float x;
+					// 3. Solve for the root cleanly
+					float grad_A = 0.f; float grad_B = 0.f; float grad_C = 0.f;
+					StableQuadraticSolver<true> solver(1e-6f);solver.forward(AA, BB, D, x); solver.backward(1.f, grad_A, grad_B, grad_C);
+					float grad_o = logy <= -13.8155105579f ? 0 : -2.f * grad_C/con_o.w;
+					float t_star = t + x;
 
-					// dy/dT = (1/(T-0.5) - 1/T) * y
-					float d_y = d_logy / y;
+					// =====================================================
+					// accumulate
+					// =====================================================
+					//add derivaite wrt t = -B/(2A)
+					grad_A += (0.5f * BB * inv_A * inv_A);
+					grad_B += (-0.5f * inv_A);
 
-					// derivative split
-					/*
-					d_T += d_y * (1.0f / (blend_data.T - 0.5f) - 1.0f / blend_data.T);
-					d_T += d_y * (-(blend_data.T - 0.5f) / (blend_data.T * blend_data.T * con_o.w));
-					*/
+					dL_dA += grad_A * blend_data.dL_dmax_depth;
+					dL_dB += grad_B * blend_data.dL_dmax_depth;
+					dL_dC += grad_C * blend_data.dL_dmax_depth;
+					dL_do += grad_o * blend_data.dL_dmax_depth;
 
-					d_op += d_y * (-(blend_data.T - 0.5f) / (blend_data.T * con_o.w * con_o.w));
-					d_A += d_sigma * (-0.5f) * inv_A * sqrtf(inv_A) + (0.5f * BB * inv_A * inv_A);
-					
-					dL_dA += d_A* (blend_data.dL_dmax_depth);
-					dL_dB += d_B* (blend_data.dL_dmax_depth);
-					dL_dC += d_C* (blend_data.dL_dmax_depth);
+					// optional
+					// dL_dT += d_T;
 
-					//grad_dT = dT
-					dL_do += d_op* (blend_data.dL_dmax_depth);
-
-					blend_data.dt_dA = d_A;
-					blend_data.dt_dB = d_B;
-					blend_data.dt_dC = d_C;
-					blend_data.dt_dw = d_op;
+					// deferred storage
+					blend_data.dt_dA = grad_A;
+					blend_data.dt_dB = grad_B;
+					blend_data.dt_dC = grad_C;
+					blend_data.dt_dw = grad_o;
 				} else {
 					// plain depth (test_T >= 0.5)
 					dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);

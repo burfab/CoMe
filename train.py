@@ -23,7 +23,7 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, SplattingSettings, OptimizationParams, SplattingSettings, MeshingParams
-from utils.depth_utils import depths_to_points, depth_to_normal, central_diff, central_diff_normals, DepthNormalConsistencyLoss
+from utils.depth_utils import depths_to_points, depth_to_normal, central_diff, central_diff_normals, DepthNormalConsistencyLoss, intrinsics_from_view
 from utils.vis_utils import gui_visualize, export_image
 from utils import segmentation_utils
 from utils import deform_utils
@@ -260,10 +260,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     N = render_pkg["render"][3:6].detach().cpu()
                     C = render_pkg["render"][:3].detach().cpu()
                     C2 = c.original_image.detach().cpu()
-                    K = torch.tensor([[c.focal_x, 0, c.image_width/2],
-                                      [0, c.focal_y, c.image_height/2],
-                                      [0,0,1]
-                                      ]).cpu().float()
+                    K = intrinsics_from_view(c).cpu()
                     torch.save((D,N,C, C2, c.world_view_transform.cpu().detach(),K),f"/tmp/test/{c.uid}.pth")
                     cv2.imshow("MASK",(masks_selfgenerated[c.uid].numpy()*255).astype(np.uint8))
                     cv2.waitKey(1)
@@ -398,7 +395,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             depth[depth.isnan()] = 0.0
         
         
-        depth_normal, _ = depth_to_normal(viewpoint_cam, depth[None, ...])
+        depth_normal, _ = depth_to_normal(viewpoint_cam, depth[None, ...], cam_space=False)
         depth_normal = depth_normal.permute(2, 0, 1)
 
         render_normal = rendering[3:6, :, :]
@@ -408,8 +405,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         mask_no_normal2 = (render_normal == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
         mask_no_normal = mask_no_normal1 | mask_no_normal2
         
-        # c2w = (viewpoint_cam.world_view_transform.T).inverse()
-        # if we only need the rotation, why bother with the inverse
         c2w = (viewpoint_cam.world_view_transform)
         normal2 = c2w[:3, :3] @ render_normal.reshape(3, -1)
         render_normal_world = normal2.reshape(3, *render_normal.shape[1:])
@@ -430,9 +425,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), epsilon=0.001,alpha=0.05) #* torch.exp(-nabla_I)
+        normal_loss = central_diff_normals(render_normal_world.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal_world[:,0,0]), epsilon=0.000,alpha=0.05) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
+        
+        normal_loss2 = central_diff_normals(depth_normal.permute(1,2,0), ignore_inval = torch.zeros_like(depth_normal[:,0,0]), epsilon=0.000,alpha=0.05) * torch.exp(-nabla_I)
+        normal_loss2 = (normal_loss2*(mask * ~mask_no_normal)).mean()
+        normal_loss = normal_loss + normal_loss2*0.5
 
         lambda_opacity_field = mesh.lambda_opacity_field if iteration >= mesh.distortion_from_iter else 0.0
         opa_loss = ((opacity - 0.5)*mask)**2
