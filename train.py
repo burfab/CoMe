@@ -428,10 +428,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         normal_loss = central_diff_normals(render_normal_world.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal_world[:,0,0]), epsilon=0.000,alpha=0.05) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
-        
-        normal_loss2 = central_diff_normals(depth_normal.permute(1,2,0), ignore_inval = torch.zeros_like(depth_normal[:,0,0]), epsilon=0.000,alpha=0.05) * torch.exp(-nabla_I)
-        normal_loss2 = (normal_loss2*(mask * ~mask_no_normal)).mean()
-        normal_loss = normal_loss + normal_loss2*0.5
 
         lambda_opacity_field = mesh.lambda_opacity_field if iteration >= mesh.distortion_from_iter else 0.0
         opa_loss = ((opacity - 0.5)*mask)**2

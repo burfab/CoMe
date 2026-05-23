@@ -15,79 +15,78 @@ constexpr float SIGMA_THRESHOLD = 3.00f;
 				
 
 struct TransmittanceVacancy {
-	static constexpr float MIN_ONE_MINUS_GAUSSIAN_DIV = 1e-6f;
-    // G(t)  = ABC.w * exp(-0.5*(ABC.x*t^2 + ABC.y*t + ABC.z))
-    // T(t)  = sqrt(1-G)                         for t <= t_peak
-    //       = (1-G_peak) / sqrt(1-G)            for t >  t_peak
+    static constexpr float MIN_OMG = 1e-6f;
+    static constexpr float MIN_VG  = 1e-3f;
 
-    static __device__ inline float v (float G) { return sqrtf (fmaxf(1.f-G, 0.f)); }
-    static __device__ inline float v2(float G) { return 1.f-G; }
+    // G(t) = G_peak * exp(-0.5 * AA * (t - t_peak)^2)
+    //      = G_peak * exp(-0.5 * ((t - t_peak) / sigma)^2),  sigma = 1/sqrt(AA)
+    // T(t) = sqrt(1-G)                  for t <= t_peak
+    //      = (1-G_peak) / sqrt(1-G)     for t >  t_peak
 
-    float4 ABC;        // (AA, BB, CC, opacity)
-    float  G_peak;
-    float  t_peak;
-    float  v2_Gpeak;   // precomputed: max(1 - G_peak, 0)
+    float AA;        // = 1/sigma^2
+    float G_peak;
+    float t_peak;
+    float v2_Gpeak;  // precomputed: 1 - G_peak
 
-    __device__ TransmittanceVacancy(float4 ABC, float G_peak, float t_peak)
-        : ABC(ABC), G_peak(G_peak), t_peak(t_peak)
+    __device__ TransmittanceVacancy(float AA, float G_peak, float t_peak)
+        : AA(AA), G_peak(G_peak), t_peak(t_peak)
         , v2_Gpeak(fmaxf(1.f - G_peak, 0.f))
     {}
 
     __device__ float T(float t) const {
-        const float q           = ABC.x*t*t + ABC.y*t + ABC.z;
-        const float G           = ABC.w * __expf(-0.5f * q);
-        const float one_minus_G = fmaxf(1.f - G, MIN_ONE_MINUS_GAUSSIAN_DIV);
-        return (t > t_peak)
-            ? v2_Gpeak * rsqrtf(one_minus_G)   // (1-G_peak)/sqrt(1-G)
-            : sqrtf(one_minus_G);
+        const float dt      = t - t_peak;
+        const float G       = G_peak * __expf(-0.5f * AA * dt * dt);  // one expf
+        const float clamped = fmaxf(1.f - G, MIN_OMG);
+        return (t > t_peak) ? v2_Gpeak * rsqrtf(clamped) : sqrtf(clamped);
     }
 
-    // Returns T(t); writes dT/d(AA,BB,CC,op) into dABC, dT/dG_peak into dG_peak_out
-    __device__ float dT_dGaussian(float t, float4 &dABC, float &dG_peak_out) const {
-        const float q           = ABC.x*t*t + ABC.y*t + ABC.z;
-        const float exp_of_q    = __expf(-0.5f * q);
-        const float G           = ABC.w * exp_of_q;
-        const float one_minus_G = 1.f - G;
-        const float vG          = sqrtf(one_minus_G);
+ // Returns T(t); writes dT/d(AA, G_peak, t_peak) and dT/dt
+    // dG/dt_peak = -dG/dt, so both come free from one computation
+    __device__ float dT_dGaussian(float t,
+                                  float &dAA, float &dG_peak_out,
+                                  float &dt_peak_out) const {
+        const float dt          = t - t_peak;
+        const float exp_term    = __expf(-0.5f * AA * dt * dt);
+        const float G           = G_peak * exp_term;
+        const float clamped     = fmaxf(1.f - G, MIN_OMG);
+        const float vG          = sqrtf(clamped);
 
         float Ti, dT_dG;
         if (t > t_peak) {
-            Ti          = v2_Gpeak * rsqrtf(fmaxf(one_minus_G, MIN_ONE_MINUS_GAUSSIAN_DIV));  // = v2_Gpeak / vG
-            dT_dG       = Ti / (2.f * fmaxf(one_minus_G, MIN_ONE_MINUS_GAUSSIAN_DIV));        // v2_Gpeak / (2*vG^3)
-            dG_peak_out = -rsqrtf(fmaxf(one_minus_G,MIN_ONE_MINUS_GAUSSIAN_DIV));            // -1/vG
+            Ti    = v2_Gpeak * rsqrtf(clamped);
+            dT_dG = Ti / (2.f * clamped);
+            // G_peak appears in numerator (1-G_peak) AND in G — two terms
+            dG_peak_out = -rsqrtf(clamped) + dT_dG * exp_term;
         } else {
-            Ti          = vG;
-            dT_dG       = -0.5f / fmaxf(vG, sqrtf(MIN_ONE_MINUS_GAUSSIAN_DIV));                      // -1/(2*vG)
-            dG_peak_out = 0.f;
+            Ti    = vG;
+            dT_dG = -0.5f / fmaxf(vG, MIN_VG);
+            dG_peak_out = dT_dG * exp_term;
         }
 
-        // dG/dAA=G*(-0.5t*t), dG/dBB=G*(-0.5t), dG/dCC=G*(-0.5), dG/dop=exp_of_q
-        const float k = dT_dG * G;   // dT/dG * dG/d(·) for AA/BB/CC share G factor
-        dABC.x = k * (-0.5f * t * t);
-        dABC.y = k * (-0.5f * t);
-        dABC.z = k * (-0.5f);
-        dABC.w = dT_dG * exp_of_q;   // dT/dop: dG/dop = exp_of_q (no G factor)
+        // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
+        const float dG_dt = G * (-AA * dt);
+        dAA         = dT_dG * G * (-0.5f * dt * dt);
+        float dt_out = (t > t_peak) ? Ti * dG_dt / (2.f * clamped)
+                                   : -dG_dt / (2.f * fmaxf(vG, MIN_VG));
+        dt_peak_out = -dt_out; 
+
         return Ti;
     }
 
-    // Returns T(t); writes dT/dt into dt
-    __device__ float dT_dt(float t, float &dt) const {
-        const float q           = ABC.x*t*t + ABC.y*t + ABC.z;
-        const float exp_of_q    = __expf(-0.5f * q);
-        const float G           = ABC.w * exp_of_q;
-        const float one_minus_G = 1.f - G;
-        const float vG          = sqrtf(one_minus_G);
-
-        // dq/dt = 2*AA*t + BB,  dG/dt = G * (-0.5) * dq/dt
-        const float dG_dt = G * (-0.5f) * (2.f*ABC.x*t + ABC.y);
-
+    // Convenience: T + dT/dt only (e.g. for ray marching step adjustment)
+    __device__ float dT_dt(float t, float &dt_out) const {
+        const float dt      = t - t_peak;
+        const float G       = G_peak * __expf(-0.5f * AA * dt * dt);
+        const float clamped = fmaxf(1.f - G, MIN_OMG);
+        const float vG      = sqrtf(clamped);
+        const float dG_dt   = G * (-AA * dt);
         float Ti;
         if (t > t_peak) {
-            Ti = v2_Gpeak * rsqrtf(fmaxf(one_minus_G,MIN_ONE_MINUS_GAUSSIAN_DIV));
-            dt = Ti * dG_dt / (2.f * fmaxf(one_minus_G,MIN_ONE_MINUS_GAUSSIAN_DIV));  // v2_Gpeak*dG_dt / (2*vG^3)
+            Ti     = v2_Gpeak * rsqrtf(clamped);
+            dt_out = Ti * dG_dt / (2.f * clamped);
         } else {
-            Ti = vG;
-            dt = -dG_dt / (2.f * fmaxf(vG, sqrtf(MIN_ONE_MINUS_GAUSSIAN_DIV)));               // -dG_dt / (2*sqrt(1-G))
+            Ti     = vG;
+            dt_out = -dG_dt / (2.f * fmaxf(vG, MIN_VG));
         }
         return Ti;
     }
@@ -499,7 +498,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
           auto blend_one = [&]() {
             fill_counters -= FillHeadOne;
 
-            if (!active)
+            if (!active || head_ids[0] == -1)
               return;
             // float* view2gaussian_j = ;
             if (!blend_function(
@@ -1151,7 +1150,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                 }
               }
               // drain front
-              while (active && fill_counters != 0) {
+              while (active && (fill_counters & FillHeadMask) != 0) {
                 blend_one();
               }
             }
@@ -1637,7 +1636,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 
 
 
-				TransmittanceVacancy transmittance_helper(ABC_, G_peak, t_peak);
+				TransmittanceVacancy transmittance_helper(ABC_.x, G_peak, t_peak);
 
 				const float vacancy2_peak = (1.f-G_peak);
 				for(int i = START_ID; i < END_ID;i++){
@@ -2143,7 +2142,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 					}			
 					//eq 16 from paper https://arxiv.org/html/2601.17835v1#S4.SS1
 					//now t_peak is t
-					TransmittanceVacancy transmittance_helper(ABC_, alpha, t);
+					TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
 					float dT_dtmed;
 					const float T_tmed = transmittance_helper.dT_dt(blend_data.max_depth, dT_dtmed);
 					blend_data.dT_dtmedian += 0.5f/(T_tmed) * dT_dtmed;
@@ -2371,14 +2370,14 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 #endif
 				}
 			}else{
-				TransmittanceVacancy transmittance_helper(ABC_, alpha, t);
-				float4 dT_dABC; float dT_dalpha;
-				const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dABC, dT_dalpha);
+				blend_data.depth_global_id = (uint32_t)-1;
+				TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
+				float dT_dA; float dT_dalpha; float dT_dtpeak;
+				const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dA, dT_dalpha, dT_dtpeak);
 				float dL_dT_dtmed = (0.5/T_tmed) * blend_data.dL_dmt_dT_dtm;
-				dL_dA += dL_dT_dtmed * dT_dABC.x;
-				dL_dB += dL_dT_dtmed * dT_dABC.y;
-				dL_dC += dL_dT_dtmed * dT_dABC.z;
-				dL_do += dL_dT_dtmed * dT_dABC.w;
+				dL_dA += dL_dT_dtmed * (dT_dA + dT_dtpeak * (0.5f * BB*inv_A*inv_A));
+				dL_dB += dL_dT_dtmed * (-0.5f * inv_A) * dT_dtpeak;
+
 				//divide by blend_data.T as its later multiplied by it
 				dL_dalpha += (dL_dT_dtmed * dT_dalpha)/blend_data.T;
 			}
@@ -2628,39 +2627,39 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 									dL_dA * blend_data.ray.y,
 									dL_dA};
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 0],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 0],
 					dL_dnormal[0] * blend_data.ray.x);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 1],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 1],
 					dL_dnormal[0] * blend_data.ray.y +
 						dL_dnormal[1] * blend_data.ray.x);
 			atomicAdd(
 				&dL_dview2gaussian[blend_data.depth_global_id *
-										10 +
+										VIEW2GAUSSIAN_OFFSET +
 									2],
 				dL_dnormal[0] + dL_dnormal[2] * blend_data.ray.x);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 3],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 3],
 					dL_dnormal[1] * blend_data.ray.y);
 			atomicAdd(
 				&dL_dview2gaussian[blend_data.depth_global_id *
-										10 +
+										VIEW2GAUSSIAN_OFFSET +
 									4],
 				dL_dnormal[1] + dL_dnormal[2] * blend_data.ray.y);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 5],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 5],
 					dL_dnormal[2]);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 6],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 6],
 					dL_dB * 2.f * blend_data.ray.x);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 7],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 7],
 					dL_dB * 2.f * blend_data.ray.y);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 8],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 8],
 					dL_dB * 2.f);
 			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * 10 + 9],
+						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 9],
 					dL_dC); // NEW
 			atomicAdd(&dL_dopacity[blend_data.depth_global_id],
 					blend_data.dt_dw * blend_data.dL_dt);
