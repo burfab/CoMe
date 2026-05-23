@@ -171,9 +171,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     temp_lambdas = {
         "occupation_lambda": 10,
-        "variational_depth_normal_fusion_lambda": 1.000,
+        "variational_depth_normal_fusion_lambda": 0.000,
         "depth_smoothness": 0* 0.001 * (1/scene.cameras_extent),
-        "surface_L_lambda" :1e-3
+        "surface_L_lambda": 0
         }
     batch = None
     
@@ -456,13 +456,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         
         normal_consistency_loss = DepthNormalConsistencyLoss((viewpoint_cam.focal_x, viewpoint_cam.focal_y, viewpoint_cam.image_width/2, viewpoint_cam.image_height/2))
-        loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal.detach(), mask)
+        loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal, mask)
         
         # Final loss
         #TODO: Try Variational Depth-Normal Fusion
         
         rgb_to_gray = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32, device=gt_image.device)[:,None,None]
-        surface_L = ((occupation2 - (gt_image * rgb_to_gray).sum(0,keepdim=True))**2)*2 + ((occupation2 - (image * rgb_to_gray).sum(0,keepdim=True))**2)
+        surface_L = (((occupation2 - (gt_image * rgb_to_gray).sum(0,keepdim=True))**2)*2 + ((occupation2 - (image * rgb_to_gray).sum(0,keepdim=True))**2))
         
         if iteration < opt.position_lr_max_steps:
             loss =  rgb_loss_mean + \

@@ -1596,7 +1596,6 @@ integrateCUDA(
 					T_blend = test_T;
 				}
 				
-
 				alpha += alpha_point * T;
 
 
@@ -1622,7 +1621,9 @@ integrateCUDA(
 #endif
 			if constexpr (RETURN_COLOR) {
 				for (int ch = 0; ch < CHANNELS; ch++)
-					out_color_integrated[point_id * CHANNELS + ch] = C[ch] + T * bg_color[ch];
+				//replaced T with T_blend
+				//further, trying to normalize color by T_blend
+					out_color_integrated[point_id * CHANNELS + ch] = C[ch]+ T_blend * bg_color[ch];
 			}
 		}
 	}

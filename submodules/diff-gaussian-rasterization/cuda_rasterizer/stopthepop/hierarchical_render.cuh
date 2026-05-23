@@ -11,113 +11,7 @@
 #include <cooperative_groups.h>
 namespace cg = cooperative_groups;
 
-constexpr float SIGMA_MUL = 3.00f;
-
-template <bool NormalizeCoeffs = false>
-struct StableQuadraticSolver {
-    float A, B, C;
-    float q, S, M; 
-    float eps;
-    bool valid_delta;
-    bool is_linear; // Flag to skip quadratic calculations in forward/backward
-
-    __device__ StableQuadraticSolver(float epsilon = 1e-7f) 
-        : eps(epsilon), M(1.0f), is_linear(false), valid_delta(false) {}
-
-    // ---------------------------------------------------------
-    // FORWARD PASS
-    // ---------------------------------------------------------
-    __device__ void forward(float in_A, float in_B, float in_C, float& x_target) {
-        if (NormalizeCoeffs) {
-            M = fmaxf(fmaxf(fabsf(in_A), fabsf(in_B)), fabsf(in_C));
-            M = fmaxf(M, eps); 
-            A = in_A / M;
-            B = in_B / M;
-            C = in_C / M;
-        } else {
-            A = in_A;
-            B = in_B;
-            C = in_C;
-            M = 1.0f;
-        }
-
-        // Check for near-linearity. 1e-5f is a robust threshold for FP32.
-        is_linear = (fabsf(A) < 1e-5f);
-
-        if (is_linear) {
-            // Linear equation has a single unique root: Bx + C = 0 -> x = -C / B
-            float B_safe = fabsf(B) < eps ? copysignf(eps, B) : B;
-            x_target = -C / B_safe;
-            
-            // Zero out unused registers to keep compiler clean
-            q = 0.0f; S = 0.0f; valid_delta = false;
-        } else {
-            // Full Stable Quadratic Solver
-            float delta = B * B - 4.0f * A * C;
-            valid_delta = delta > 0.0f; 
-            
-            S = sqrtf(fmaxf(delta, 0.0f) + eps);
-            float b_sign = copysignf(1.0f, B);
-            q = -0.5f * (B + b_sign * S);
-            
-            float A_safe = fabsf(A) < eps ? copysignf(eps, A) : A;
-            float q_safe = fabsf(q) < eps ? copysignf(eps, q) : q;
-            
-            float x1 = q / A_safe;
-            float x2 = C / q_safe;
-
-            // Target the root IN FRONT of the peak (x < peak)
-            bool same_sign = (A >= 0.0f) == (B >= 0.0f);
-            x_target = same_sign ? x1 : x2;
-        }
-    }
-
-    // ---------------------------------------------------------
-    // BACKWARD PASS
-    // ---------------------------------------------------------
-    __device__ void backward(float grad_x_target, float& grad_A, float& grad_B, float& grad_C) {
-        if (is_linear) {
-            // x = -C / B. 
-            // dx/dC = -1/B, dx/dB = C / B^2, dx/dA = 0
-            float B_safe = fabsf(B) < eps ? copysignf(eps, B) : B;
-            
-            float grad_A_norm = 0.0f;
-            float grad_B_norm = grad_x_target * (C / (B_safe * B_safe));
-            float grad_C_norm = grad_x_target * (-1.0f / B_safe);
-
-            grad_A = grad_A_norm / M;
-            grad_B = grad_B_norm / M;
-            grad_C = grad_C_norm / M;
-        } else {
-            // Quadratic gradient branch
-            float A_safe = fabsf(A) < eps ? copysignf(eps, A) : A;
-            float q_safe = fabsf(q) < eps ? copysignf(eps, q) : q;
-            bool same_sign = (A >= 0.0f) == (B >= 0.0f);
-
-            // Upstream split matched to our front-of-peak forward selection
-            float grad_x1 = same_sign ? grad_x_target : 0.0f;
-            float grad_x2 = same_sign ? 0.0f : grad_x_target;
-
-            float grad_q = (grad_x1 / A_safe) - (grad_x2 * C / (q_safe * q_safe));
-            float b_sign = copysignf(1.0f, B);
-            float grad_S_term = valid_delta ? (0.5f / S) : 0.0f;
-
-            float dq_dA = b_sign * C * grad_S_term * 2.0f; 
-            float dq_dB = -0.5f * (1.0f + b_sign * B * grad_S_term * 2.0f);
-            float dq_dC = b_sign * A * grad_S_term * 2.0f;
-
-            float grad_A_norm = grad_x1 * (-q / (A_safe * A_safe)) + grad_q * dq_dA;
-            float grad_B_norm = grad_q * dq_dB;
-            float grad_C_norm = (grad_x2 / q_safe) + grad_q * dq_dC;
-
-            grad_A = grad_A_norm / M;
-            grad_B = grad_B_norm / M;
-            grad_C = grad_C_norm / M;
-        }
-    }
-};
-
-
+constexpr float SIGMA_THRESHOLD = 3.00f;
 
 template<typename T, size_t S>
 __device__ void initArray(T(&arr)[S], T v = 0)
@@ -1229,37 +1123,25 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 			blend_data.occupation+=geom_intensity;
 			//blend_data.occupation2+=(geom_intensity*geom_intensity);
 
-			const float g_opacity = conic_opacity[id].w;
+			const float g_opacity = ABC_.w;
 			
 			// depth and alpha
             if (blend_data.T > 0.5f)
             {
 				if constexpr (EXACT_DEPTH) {
 					if (test_T < 0.5f) {
-						//G_i(t_star) = exp(-1/2 * (A*t_star^2 + B*t_star + C))
-						//start by T_i * (1-o_i G_i(t_star)) = 0.5
-						//all to one side => (T_i-0.5)/(T_i*o_i) = G_i(t_star)
-						//replace t_star with t_peak + delta
-						//replace t_peak with -B/2A. Then replace delta with sigma * k
-						//Solve quadratic term in exp for left sides log
-						//depth should be <= t by the end so subtract
-						//we use SIGMA_MUL as 3.0, as the gaussian outside of its support otherwise could overfit to the depth, essentially underestimating it
-						//depth_T_crossing = t-fminf(k, SIGMA_MUL) * sigma
+						float Fp = (-0.5/(blend_data.T*ABC_.w)) + (1.0f/ABC_.w);
+						float con = CC + 2 * logf(Fp);
+						// why does this need to be abs?
+						// TODO: new formulation with variance along the Gaussian
+						float disc = abs(BB*BB - 4* AA*(con));
+						float median_t = sqrtf(disc + 1e-9);
 
-
-						// 1. Compute stable logy
-						float log_num = logf(fmaxf(2.0f * blend_data.T - 1.0f, 1e-7f)); // NaN protection
-						float log_den = logf(2.0f * blend_data.T) + logf(g_opacity);
-						float logy = fmaxf(log_num - log_den, -13.8155105579f);
-
-						// 2. Setup quadratic constant
-						float D = CC + 2.f * logy;
-						float x;
-
-						// 3. Solve for the root cleanly
-						StableQuadraticSolver<true>(1e-6f).forward(AA, BB, D, x);
-						float t_star = t + x;
-						blend_data.depth = t_star;
+						// TODO: can we somehow scrap fminf
+						// -BB, 1/2A are always positive (experiments)
+						// median_t is always positive, due to being the sqrt of a positive nmber - only this one makes sense
+						median_t = (-BB - median_t)/2.0f/AA;
+						blend_data.depth = median_t;
 					}
 					else {
 						blend_data.depth = t;
@@ -1587,7 +1469,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			float rgb[CHANNELS];
 			for (int ch = 0; ch < CHANNELS; ch++) 
 				rgb[ch] = features[id * CHANNELS + ch];
-			blend_data.gray +=blend_data.T_opa*alpha_point*((rgb[0]*0.299+rgb[1]*0.587+rgb[2]*0.144));
+			blend_data.gray +=blend_data.T_opa*alpha_point*((rgb[0]*0.299+rgb[1]*0.587+rgb[2]*0.114));
 
 
 			blend_data.opacity += alpha_point * blend_data.T_opa;
@@ -2003,42 +1885,24 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				blend_data.depth_global_id = global_id;
 #ifdef CORRECT_EXACT_DEPTH_GRAD
 				//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
-				if (test_T < 0.5f) {
+				if (test_T < 0.5f && EXACT_DEPTH) {
+					float Fp = (-0.5/(blend_data.T*ABC_.w)) + (1.0f/ABC_.w);
+					float con = CC + 2 * logf(Fp);
+					float disc = abs(BB*BB - 4 * AA * (con));
+					float median_t = sqrtf(disc + 1e-9);
 
-					// 1. Compute stable logy
-					float log_num = logf(fmaxf(2.0f * blend_data.T - 1.0f, 1e-7f)); // NaN protection
-					float log_den = logf(2.0f * blend_data.T) + logf(con_o.w);
-					float logy = fmaxf(log_num - log_den, -13.8155105579f);
+					float grad_A = (BB * BB - 2 * AA * (con)) / (median_t * 2 * AA * AA);
+					float grad_B = t / median_t;
+					float grad_C = 1.f / median_t;
+					// 3. Accumulate projected gradients
+					dL_dA += blend_data.dL_dmax_depth * grad_A;
+					dL_dB += blend_data.dL_dmax_depth * grad_B;
+					dL_dC += blend_data.dL_dmax_depth * grad_C;
 
-					// 2. Setup quadratic constant
-					float D = CC + 2.f * logy;
-					float x;
-					// 3. Solve for the root cleanly
-					float grad_A = 0.f; float grad_B = 0.f; float grad_C = 0.f;
-					StableQuadraticSolver<true> solver(1e-6f);solver.forward(AA, BB, D, x); solver.backward(1.f, grad_A, grad_B, grad_C);
-					float grad_o = logy <= -13.8155105579f ? 0 : -2.f * grad_C/con_o.w;
-					float t_star = t + x;
-
-					// =====================================================
-					// accumulate
-					// =====================================================
-					//add derivaite wrt t = -B/(2A)
-					grad_A += (0.5f * BB * inv_A * inv_A);
-					grad_B += (-0.5f * inv_A);
-
-					dL_dA += grad_A * blend_data.dL_dmax_depth;
-					dL_dB += grad_B * blend_data.dL_dmax_depth;
-					dL_dC += grad_C * blend_data.dL_dmax_depth;
-					dL_do += grad_o * blend_data.dL_dmax_depth;
-
-					// optional
-					// dL_dT += d_T;
-
-					// deferred storage
 					blend_data.dt_dA = grad_A;
 					blend_data.dt_dB = grad_B;
 					blend_data.dt_dC = grad_C;
-					blend_data.dt_dw = grad_o;
+					blend_data.dt_dw = 0.f;
 				} else {
 					// plain depth (test_T >= 0.5)
 					dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
@@ -2052,10 +1916,15 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 					blend_data.dt_dw = 0.f;
 				}
 #else
-				dL_dA += 0.5f * BB * inv_A * inv_A * blend_data.dL_dmax_depth;
-				dL_dB += -0.5f * inv_A * blend_data.dL_dmax_depth;
-				dL_dC += 0;
-				dL_do += 0;
+					dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
+					dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
+					dL_dC += 0* (blend_data.dL_dmax_depth);
+					dL_do += 0* (blend_data.dL_dmax_depth);
+
+					blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
+					blend_data.dt_dB = -0.5f * inv_A;
+					blend_data.dt_dC = 0.f;
+					blend_data.dt_dw = 0.f;
 #endif
 			}
 			
@@ -2087,8 +1956,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				float dalpha_point = (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity));
 				float dL_dalpha_point = dalpha_point * blend_data.dL_dopacity;
 				
-				dL_dalpha_point += blend_data.T_opa * (0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2])
-								* blend_data.dL_doccupation2;
+				//might cause instability as simple would be to make central gaussian represent gray color and then setting to opaque
+				dL_dalpha_point += blend_data.T_opa * (0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2]) * blend_data.dL_doccupation2;
 				dL_do += dL_dalpha_point * expp; 
 
 
