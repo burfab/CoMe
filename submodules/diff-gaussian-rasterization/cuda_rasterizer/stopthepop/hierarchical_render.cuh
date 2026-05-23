@@ -207,7 +207,7 @@ __device__ void batcherSort(CG& cg, KT* keys, VT* vals)
 #define DEBUG_HIERARCHICAL 0x0
 
 // MID_WINDOW needs to be pow2+4, minimum 8
-template <int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename SF, typename BF, typename FF>
+template <int ITERATIONS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename SF, typename BF, typename FF>
 __device__ void sortGaussiansRayHierarchicaEvaluation(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
@@ -225,6 +225,8 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	BF && blend_function,
 	FF && fin_function)
 {
+	
+
 #if (DEBUG_HIERARCHICAL & 0x100) != 0
 	//if (blockIdx.x != 7 || blockIdx.y != 7)
 	//	return;
@@ -274,7 +276,6 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 
 	// head sorting setup
 	float head_depths[PerThreadSortWindow];
-
 	// GOF: stuff
 	float3 head_normals[PerThreadSortWindow];
 	float4 head_ABCs[PerThreadSortWindow];
@@ -308,12 +309,6 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	auto halfwarp = cg::tiled_partition<WARP_SIZE / 2>(block);
 	auto head_group = cg::tiled_partition<4>(halfwarp);
 
-
-	// initialize head structure
-	initArray(head_depths, FLT_MAX);
-	initArray(head_stores);
-	initArray(head_ids, -1);
-
 	uint32_t fill_counters = 0; // HEAD 8 bit, MID 8 bit, TAIL 16 bit, 
 	[[maybe_unused]] constexpr uint32_t FillHeadMask = 0xFF000000;
 	constexpr uint32_t FillHeadOne = 0x1000000;
@@ -321,6 +316,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	constexpr uint32_t FillMidOne = 0x10000;
 	constexpr uint32_t FillTailMask = 0xFFFF;
 	constexpr uint32_t FillTailOne = 0x1;
+
 
 	// initialize ray directions
 	const uint2 tile_min = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
@@ -351,6 +347,8 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 #endif
 	}
 
+
+
 	const int midid = halfwarp.thread_rank() / 4;
 	const int midrank = halfwarp.thread_rank() % 4;
 	const int midy = midid / 2;
@@ -360,613 +358,1101 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	const int headx = midrank % 2;
 
 	const uint2 pixpos = { tail_corner.x + midx * 2 + headx, tail_corner.y + midy * 2 + heady };
-	bool active = pixpos.x < W && pixpos.y < H;
 
-	// do it exactly as GOF (+0.5f)
-	const float2 pixf = { pixpos.x + 0.5f, pixpos.y + 0.5f };
-	float2 ray = { 
-		(pixf.x - W/2.) / focal_x, 
-		(pixf.y - H/2.) / focal_y 
-	};
-	const float3 viewdir = computeViewRay(inverse_vp, campos, pixf, W, H);
-#if (DEBUG_HIERARCHICAL & 0x2F) != 0 && (DEBUG_HIERARCHICAL & 0x100) != 0
-	printf("own dir %d - %d %d %d  - pix %d %d dir %f %f %f\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x,
-		pixpos.x, pixpos.y, viewdir.x, viewdir.y, viewdir.z);
-#endif
 	// setup helpers
 	const int32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
-
 	if (warp.thread_rank() == 0)
 	{
 		range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
 	}
 	
-
-	if constexpr (MidSortWindow != 8)
-	{
-		for (int i = 0; i < MidSortWindow; i += 4)
-		{
-			mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][i + warp.thread_rank() % 4] = FLT_MAX;
-			mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][i + warp.thread_rank() % 4] = -1;
-		}
-	}
-
 	// ensure all helpers are visible
+	//not needed here right? 
 	warp.sync();
 
-	float3 r{ray.x, ray.y, 1.0f};
-	// thread state variables
-	auto blend_data = prep_function(active, pixpos, r);
-	
-	// lambdas controlling the behavior
-	auto blend_one = [&]()
-		{
-			fill_counters -= FillHeadOne;
+	// do it exactly as GOF (+0.5f)
+	const float2 pixf = { pixpos.x + 0.5f, pixpos.y + 0.5f };
+	const float2 ray = { 
+		(pixf.x - W/2.) / focal_x, 
+		(pixf.y - H/2.) / focal_y 
+	};
+	const float3 viewdir = computeViewRay(inverse_vp, campos, pixf, W, H);
+	const float3 r{ray.x, ray.y, 1.0f};
 
-			if (!active)
-				return;
-			//float* view2gaussian_j = ;
-			if (!blend_function(pixpos, blend_data, head_ids[0], head_stores[0], head_depths[0], &view2gaussian[head_ids[0] * VIEW2GAUSSIAN_OFFSET], ray, debugType, head_normals[0], head_ABCs[0]))
-			{
-				active = false;
-				return;
-			}
+
+	#if (DEBUG_HIERARCHICAL & 0x2F) != 0 && (DEBUG_HIERARCHICAL & 0x100) != 0
+		printf("own dir %d - %d %d %d  - pix %d %d dir %f %f %f\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x,
+			pixpos.x, pixpos.y, viewdir.x, viewdir.y, viewdir.z);
+	#endif
+	
+
+	const bool active_outter_iteration = pixpos.x < W && pixpos.y < H;
+
+	// thread state variables
+	auto blend_data = prep_function(active_outter_iteration, pixpos, r);
+        for (int iter = 0; iter < ITERATIONS; iter++) {
+          // initialize head structure
+          initArray(head_depths, FLT_MAX);
+          initArray(head_stores);
+          initArray(head_ids, -1);
+		  blend_data.contributor = 0;
+          fill_counters = 0;
+          mid_front = 0;
+          bool active = active_outter_iteration;
+
+          if constexpr (MidSortWindow != 8) {
+            for (int i = 0; i < MidSortWindow; i += 4) {
+              mid_depths[block.thread_index().y][block.thread_index().z]
+                        [block.thread_index().x / 4]
+                        [i + warp.thread_rank() % 4] = FLT_MAX;
+              mid_ids[block.thread_index().y][block.thread_index().z]
+                     [block.thread_index().x / 4][i + warp.thread_rank() % 4] =
+                         -1;
+            }
+          }
+
+          // ensure all helpers are visible
+          warp.sync();
+
+
+          // lambdas controlling the behavior
+          auto blend_one = [&]() {
+            fill_counters -= FillHeadOne;
+
+            if (!active)
+              return;
+            // float* view2gaussian_j = ;
+            if (!blend_function(
+                    pixpos, blend_data, head_ids[0], head_stores[0],
+                    head_depths[0],
+                    &view2gaussian[head_ids[0] * VIEW2GAUSSIAN_OFFSET], ray,
+                    debugType, head_normals[0], head_ABCs[0])) {
+              active = false;
+              return;
+            }
 
 #if (DEBUG_HIERARCHICAL & 0x8) != 0
 #if (DEBUG_HIERARCHICAL & 0x100)
-			if (pixpos.x == target.x && pixpos.y == target.y)
+            if (pixpos.x == target.x && pixpos.y == target.y)
 #endif
-				printf("%d - %d %d - blending: %f %d %f (%d %d %d)\n", warp.thread_rank(), pixpos.x, pixpos.y,
-					head_depths[0], head_ids[0], head_stores[0],
-					(fill_counters & FillHeadMask) / FillHeadOne,
-					(fill_counters & FillMidMask) / FillMidOne,
-					(fill_counters & FillTailMask) / FillTailOne);
+              printf("%d - %d %d - blending: %f %d %f (%d %d %d)\n",
+                     warp.thread_rank(), pixpos.x, pixpos.y, head_depths[0],
+                     head_ids[0], head_stores[0],
+                     (fill_counters & FillHeadMask) / FillHeadOne,
+                     (fill_counters & FillMidMask) / FillMidOne,
+                     (fill_counters & FillTailMask) / FillTailOne);
 #endif
 
-			for (int i = 1; i < PerThreadSortWindow; ++i)
-			{
-				head_depths[i - 1] = head_depths[i];
-				head_stores[i - 1] = head_stores[i];
-				head_ids[i - 1] = head_ids[i];
-				head_normals[i - 1] = head_normals[i];
-				head_ABCs[i - 1] = head_ABCs[i];
-			}
-			head_depths[PerThreadSortWindow - 1] = FLT_MAX;
-		};
+            for (int i = 1; i < PerThreadSortWindow; ++i) {
+              head_depths[i - 1] = head_depths[i];
+              head_stores[i - 1] = head_stores[i];
+              head_ids[i - 1] = head_ids[i];
+              head_normals[i - 1] = head_normals[i];
+              head_ABCs[i - 1] = head_ABCs[i];
+            }
+            head_depths[PerThreadSortWindow - 1] = FLT_MAX;
+          };
 
+          auto front4OneFromMid = [&](bool checkvalid) {
+            if (head_group.any(active)) {
+              // prepare depth and data for shfl
+              float3 mid_depth_info[3];
+              float4 mid_conic_opacity;
+              float2 mid_point_xy;
 
-
-	auto front4OneFromMid = [&](bool checkvalid)
-		{
-			if (head_group.any(active))
-			{
-				// prepare depth and data for shfl
-				float3 mid_depth_info[3];
-				float4 mid_conic_opacity;
-				float2 mid_point_xy;
-
-				int load_id;
-				if constexpr (MidSortWindow == 8)
-				{
-					load_id = mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4];
-				}
-				else
-				{
-					load_id = mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][mid_access(warp.thread_rank() % 4)];
-				}
-				if (!checkvalid || load_id != -1)
-				{
-					mid_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
-					mid_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
-					mid_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
-					mid_conic_opacity = conic_opacity[load_id];
-					mid_point_xy = points_xy_image[load_id];
-				}
+              int load_id;
+              if constexpr (MidSortWindow == 8) {
+                load_id =
+                    mid_ids[block.thread_index().y][block.thread_index().z]
+                           [block.thread_index().x / 4][warp.thread_rank() % 4];
+              } else {
+                load_id =
+                    mid_ids[block.thread_index().y][block.thread_index().z]
+                           [block.thread_index().x / 4]
+                           [mid_access(warp.thread_rank() % 4)];
+              }
+              if (!checkvalid || load_id != -1) {
+                mid_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
+                mid_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
+                mid_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
+                mid_conic_opacity = conic_opacity[load_id];
+                mid_point_xy = points_xy_image[load_id];
+              }
 
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
-				printf("%d - %d %d - head loading %d\n", warp.thread_rank(), pixpos.x, pixpos.y, load_id);
+              printf("%d - %d %d - head loading %d\n", warp.thread_rank(),
+                     pixpos.x, pixpos.y, load_id);
 #endif
-				// inner always takes out up to four elements from mid
-				for (int inner = 0; inner < 4; ++inner)
-				{
-					// the head is left most, so this checks for a full sort window
-					if (fill_counters >= FillHeadOne * PerThreadSortWindow)
-					{
-						blend_one();
-					}
+              // inner always takes out up to four elements from mid
+              for (int inner = 0; inner < 4; ++inner) {
+                // the head is left most, so this checks for a full sort window
+                if (fill_counters >= FillHeadOne * PerThreadSortWindow) {
+                  blend_one();
+                }
 
-					// take one from mid
-					int coll_id;
-					if constexpr (MidSortWindow == 8)
-					{
-						coll_id = mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][inner];
-					}
-					else
-					{
-						coll_id = mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][mid_access(inner)];
-					}
+                // take one from mid
+                int coll_id;
+                if constexpr (MidSortWindow == 8) {
+                  coll_id =
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4][inner];
+                } else {
+                  coll_id =
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4][mid_access(inner)];
+                }
 
-					// every thread has the same id so this is safe
-					if (checkvalid && coll_id == -1)
-						continue;
+                // every thread has the same id so this is safe
+                if (checkvalid && coll_id == -1)
+                  continue;
 
-					const float* V2G = view2gaussian + (coll_id * VIEW2GAUSSIAN_OFFSET);
-					float3 Ld = {
-						V2G[0] * ray.x + V2G[1] * ray.y + V2G[2], 
-						V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
-						V2G[2] * ray.x + V2G[4] * ray.y + V2G[5]
-					};
-					float4 con_o = head_group.shfl(mid_conic_opacity, inner);
-					float4 ABC = {
-						ray.x * Ld.x + ray.y * Ld.y + Ld.z,
-						2 * (V2G[6] * ray.x + V2G[7] * ray.y + V2G[8]),
-						V2G[9],
-						con_o.w
-					};
+                const float *V2G =
+                    view2gaussian + (coll_id * VIEW2GAUSSIAN_OFFSET);
+                float3 Ld = {V2G[0] * ray.x + V2G[1] * ray.y + V2G[2],
+                             V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
+                             V2G[2] * ray.x + V2G[4] * ray.y + V2G[5]};
+                float4 con_o = head_group.shfl(mid_conic_opacity, inner);
+                float4 ABC = {ray.x * Ld.x + ray.y * Ld.y + Ld.z,
+                              2 * (V2G[6] * ray.x + V2G[7] * ray.y + V2G[8]),
+                              V2G[9], con_o.w};
 
-					float depth = -ABC.y/(2.f * ABC.x);
-					float3 normal = {Ld.x, Ld.y, Ld.z};
+                float depth = -ABC.y / (2.f * ABC.x);
+                float3 normal = {Ld.x, Ld.y, Ld.z};
 
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
-					printf("%d - %d %d - %d new depth %f\n", warp.thread_rank(), pixpos.x, pixpos.y, coll_id, depth);
+                printf("%d - %d %d - %d new depth %f\n", warp.thread_rank(),
+                       pixpos.x, pixpos.y, coll_id, depth);
 #endif
-					if (!active || depth < NEAR_PLANE)
-						continue;
+                if (!active || depth < NEAR_PLANE)
+                  continue;
 
-					blend_data.contributor++;
+                blend_data.contributor++;
 
-					float min_value = -(ABC.y/ABC.x) * (ABC.y/4.f) + ABC.z;
+                float min_value = -(ABC.y / ABC.x) * (ABC.y / 4.f) + ABC.z;
 
-					float power = -0.5f * min_value;
-					if (power > 0.0f){
-						power = 0.0f;
-					}
+                float power = -0.5f * min_value;
+                if (power > 0.0f) {
+                  power = 0.0f;
+                }
 
-					float G = exp(power);
-					float alpha = min(0.99f, con_o.w * G);
-					
+                float G = exp(power);
+                float alpha = min(0.99f, con_o.w * G);
 
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
-					printf("%d - %d %d - %d %f alpha is %f\n", warp.thread_rank(), pixpos.x, pixpos.y, coll_id, depth, alpha);
+                printf("%d - %d %d - %d %f alpha is %f\n", warp.thread_rank(),
+                       pixpos.x, pixpos.y, coll_id, depth, alpha);
 #endif
-					if (alpha < 1.0f / 255.0f)
-						continue;
+                if (alpha < 1.0f / 255.0f)
+                  continue;
 
-					auto store = store_function(pixpos, coll_id, G, alpha, depth);
+                auto store = store_function(pixpos, coll_id, G, alpha, depth);
 
-					// push alpha and depth into per thread sorted array
+                // push alpha and depth into per thread sorted array
 #pragma unroll
-					for (int s = 0; s < PerThreadSortWindow; ++s)
-					{
-						if (depth < head_depths[s])
-						{
-							swap(depth, head_depths[s]);
-							swap(coll_id, head_ids[s]);
-							swap(store, head_stores[s]);
-							swap(normal, head_normals[s]);
-							swap(ABC, head_ABCs[s]);
-						}
-					}
-					fill_counters += FillHeadOne;
+                for (int s = 0; s < PerThreadSortWindow; ++s) {
+                  if (depth < head_depths[s]) {
+                    swap(depth, head_depths[s]);
+                    swap(coll_id, head_ids[s]);
+                    swap(store, head_stores[s]);
+                    swap(normal, head_normals[s]);
+                    swap(ABC, head_ABCs[s]);
+                  }
+                }
+                fill_counters += FillHeadOne;
 
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
-					printf("%d - %d %d - count: %d - sorted: %f %d - %f %d - %f %d - %f %d\n", warp.thread_rank(), pixpos.x, pixpos.y,
-						fill_counters, head_depths[0], head_ids[0], head_depths[1], head_ids[1], head_depths[2], head_ids[2], head_depths[3], head_ids[3]);
+                printf("%d - %d %d - count: %d - sorted: %f %d - %f %d - %f %d "
+                       "- %f %d\n",
+                       warp.thread_rank(), pixpos.x, pixpos.y, fill_counters,
+                       head_depths[0], head_ids[0], head_depths[1], head_ids[1],
+                       head_depths[2], head_ids[2], head_depths[3],
+                       head_ids[3]);
 #endif
-				}
-			}
-			if constexpr (MidSortWindow != 8)
-			{
-				mid_front += 4;
-			}
-			fill_counters -= 4 * FillMidOne;
-			halfwarp.sync();
-		};
+              }
+            }
+            if constexpr (MidSortWindow != 8) {
+              mid_front += 4;
+            }
+            fill_counters -= 4 * FillMidOne;
+            halfwarp.sync();
+          };
 
-	auto pushPullThroughMid = [&](bool checkvalid)
-		{
-			// prepare depth for shfl
-			float3 tail_depth_info[3];
-			int load_id = tail_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x];
-			if (!checkvalid || load_id != -1)
-			{
-				tail_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
-				tail_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
-				tail_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
-			}
-			else
-			{
-				tail_depth_info[0] = tail_depth_info[1] = tail_depth_info[2] = { 0,0,0 };
-			}
+          auto pushPullThroughMid = [&](bool checkvalid) {
+            // prepare depth for shfl
+            float3 tail_depth_info[3];
+            int load_id =
+                tail_ids[block.thread_index().y][block.thread_index().z]
+                        [block.thread_index().x];
+            if (!checkvalid || load_id != -1) {
+              tail_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
+              tail_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
+              tail_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
+            } else {
+              tail_depth_info[0] = tail_depth_info[1] =
+                  tail_depth_info[2] = {0, 0, 0};
+            }
 #if (DEBUG_HIERARCHICAL & 0x2) != 0
-			printf("%d - %d %d - mid loading %d\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, load_id);
+            printf("%d - %d %d - mid loading %d\n", warp.thread_rank(),
+                   block.thread_index().y, block.thread_index().z, load_id);
 #endif
 
-			// take out 4 x 4 elements from tail and move into mid
-			for (int mid = 0; mid < 4; ++mid)
-			{
-				// the tail is the same for everyone in the half warp
-				if (checkvalid && (fill_counters & FillTailMask) == 0)
-					break;
+            // take out 4 x 4 elements from tail and move into mid
+            for (int mid = 0; mid < 4; ++mid) {
+              // the tail is the same for everyone in the half warp
+              if (checkvalid && (fill_counters & FillTailMask) == 0)
+                break;
 
-				// take 4 from tail to mid
-				int tid = 4 * mid + (warp.thread_rank() % 4);
-				int coll_id = tail_ids[block.thread_index().y][block.thread_index().z][tid];
+              // take 4 from tail to mid
+              int tid = 4 * mid + (warp.thread_rank() % 4);
+              int coll_id =
+                  tail_ids[block.thread_index().y][block.thread_index().z][tid];
 
-				float depth = depthAlongRay(halfwarp.shfl(tail_depth_info[0], tid),
-					halfwarp.shfl(tail_depth_info[1], tid),
-					halfwarp.shfl(tail_depth_info[2], tid),
-					tail_and_mid_viewdir[block.thread_index().y][block.thread_index().z][1 + block.thread_index().x / 4]);
+              float depth = depthAlongRay(
+                  halfwarp.shfl(tail_depth_info[0], tid),
+                  halfwarp.shfl(tail_depth_info[1], tid),
+                  halfwarp.shfl(tail_depth_info[2], tid),
+                  tail_and_mid_viewdir[block.thread_index().y]
+                                      [block.thread_index().z]
+                                      [1 + block.thread_index().x / 4]);
 
-				// note: we can only get invalid during draining here
-				if (checkvalid && coll_id == -1)
-				{
-					depth = FLT_MAX;
-				}
-
-#if (DEBUG_HIERARCHICAL & 0x2) != 0
-				printf("%d - %d %d %d - mid new depth %d %f (%f)\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, tid, coll_id, depth,
-					tail_depths[block.thread_index().y][block.thread_index().z][tid]);
-#endif
-				if constexpr (MidSortWindow == 8)
-				{
-					// local sort first into front 4 slots (which are empty for sure)
-					shflSortLocal2Shared<4>(head_group, warp.thread_rank() % 4, depth, coll_id,
-						mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4],
-						mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4]);
-					head_group.sync();
-
-					coll_id = mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4];
-					depth = mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4];
+              // note: we can only get invalid during draining here
+              if (checkvalid && coll_id == -1) {
+                depth = FLT_MAX;
+              }
 
 #if (DEBUG_HIERARCHICAL & 0x2) != 0
-					printf("%d - %d %d %d - mid local %d sort %d %f \n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x / 4, warp.thread_rank() % 4, coll_id, depth);
+              printf("%d - %d %d %d - mid new depth %d %f (%f)\n",
+                     warp.thread_rank(), block.thread_index().y,
+                     block.thread_index().z, tid, coll_id, depth,
+                     tail_depths[block.thread_index().y][block.thread_index().z]
+                                [tid]);
 #endif
+              if constexpr (MidSortWindow == 8) {
+                // local sort first into front 4 slots (which are empty for
+                // sure)
+                shflSortLocal2Shared<4>(
+                    head_group, warp.thread_rank() % 4, depth, coll_id,
+                    mid_depths[block.thread_index().y][block.thread_index().z]
+                              [block.thread_index().x / 4],
+                    mid_ids[block.thread_index().y][block.thread_index().z]
+                           [block.thread_index().x / 4]);
+                head_group.sync();
 
-
-					// we do not need the exact count as we only got invalid during draining
-					fill_counters += 4 * FillMidOne;
-
-					// we are not culling here, so we always have data after the first
-					// if ( (fill_counters & FillMidMask) > 4 * FillMidOne)
-					if (mid != 0 || ((fill_counters & FillMidMask) > 4 * FillMidOne))
-					{
-						// sort mid					
-						mergeSortRegToSmem<4>(head_group,
-							mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4] + 4,
-							mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4] + 4,
-							mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4],
-							mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4],
-							depth, coll_id);
-						head_group.sync();
-#if (DEBUG_HIERARCHICAL & 0x2) != 0
-						printf("%d - %d %d %d - sorted into mid %d:  %d %f \n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x / 4, warp.thread_rank() % 4,
-							mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4],
-							mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4]);
-						printf("%d - %d %d %d - sorted into mid %d:  %d %f \n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x / 4, 4 + warp.thread_rank() % 4,
-							mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][4 + warp.thread_rank() % 4],
-							mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][4 + warp.thread_rank() % 4]);
-#endif
-						front4OneFromMid(false);
-					}
-					else
-					{
-						// move mid
-						mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][4 + warp.thread_rank() % 4] = coll_id;
-						mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][4 + warp.thread_rank() % 4] = depth;
-						// no need to sync here  as shfl of the next iteration will take care of it
-					}
-				}
-				else
-				{
-					// local sort first using shfl
-					int offset = shflRankingLocal<4>(head_group, warp.thread_rank() % 4, depth);
-					uint32_t sort_mid_offset = mid_access(MidSortWindow - 4 + offset);
-					uint32_t my_mid_offset = mid_access(MidSortWindow - 4 + warp.thread_rank() % 4);
-					mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][sort_mid_offset] = coll_id;
-					mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][sort_mid_offset] = depth;
-
-					head_group.sync();
-
-					coll_id = mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][my_mid_offset];
-					depth = mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][my_mid_offset];
+                coll_id =
+                    mid_ids[block.thread_index().y][block.thread_index().z]
+                           [block.thread_index().x / 4][warp.thread_rank() % 4];
+                depth =
+                    mid_depths[block.thread_index().y][block.thread_index().z]
+                              [block.thread_index().x / 4]
+                              [warp.thread_rank() % 4];
 
 #if (DEBUG_HIERARCHICAL & 0x2) != 0
-					printf("%d - %d %d %d - mid local %d sort %d %f \n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x / 4, warp.thread_rank() % 4, coll_id, depth);
+                printf("%d - %d %d %d - mid local %d sort %d %f \n",
+                       warp.thread_rank(), block.thread_index().y,
+                       block.thread_index().z, block.thread_index().x / 4,
+                       warp.thread_rank() % 4, coll_id, depth);
 #endif
-					// we do not need the exact count as we only got invalid during draining
-					fill_counters += 4 * FillMidOne;
 
-					// merge sort with existing
-					mergeSortInto<4, MidSortWindow - 4>(head_group, warp.thread_rank() % 4, depth, coll_id,
-						mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4],
-						mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4],
-						mid_access);
+                // we do not need the exact count as we only got invalid during
+                // draining
+                fill_counters += 4 * FillMidOne;
+
+                // we are not culling here, so we always have data after the
+                // first if ( (fill_counters & FillMidMask) > 4 * FillMidOne)
+                if (mid != 0 ||
+                    ((fill_counters & FillMidMask) > 4 * FillMidOne)) {
+                  // sort mid
+                  mergeSortRegToSmem<4>(
+                      head_group,
+                      mid_depths[block.thread_index().y][block.thread_index().z]
+                                [block.thread_index().x / 4] +
+                          4,
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4] +
+                          4,
+                      mid_depths[block.thread_index().y][block.thread_index().z]
+                                [block.thread_index().x / 4],
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4],
+                      depth, coll_id);
+                  head_group.sync();
+#if (DEBUG_HIERARCHICAL & 0x2) != 0
+                  printf(
+                      "%d - %d %d %d - sorted into mid %d:  %d %f \n",
+                      warp.thread_rank(), block.thread_index().y,
+                      block.thread_index().z, block.thread_index().x / 4,
+                      warp.thread_rank() % 4,
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4]
+                             [warp.thread_rank() % 4],
+                      mid_depths[block.thread_index().y][block.thread_index().z]
+                                [block.thread_index().x / 4]
+                                [warp.thread_rank() % 4]);
+                  printf(
+                      "%d - %d %d %d - sorted into mid %d:  %d %f \n",
+                      warp.thread_rank(), block.thread_index().y,
+                      block.thread_index().z, block.thread_index().x / 4,
+                      4 + warp.thread_rank() % 4,
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4]
+                             [4 + warp.thread_rank() % 4],
+                      mid_depths[block.thread_index().y][block.thread_index().z]
+                                [block.thread_index().x / 4]
+                                [4 + warp.thread_rank() % 4]);
+#endif
+                  front4OneFromMid(false);
+                } else {
+                  // move mid
+                  mid_ids[block.thread_index().y][block.thread_index().z]
+                         [block.thread_index().x / 4]
+                         [4 + warp.thread_rank() % 4] = coll_id;
+                  mid_depths[block.thread_index().y][block.thread_index().z]
+                            [block.thread_index().x / 4]
+                            [4 + warp.thread_rank() % 4] = depth;
+                  // no need to sync here  as shfl of the next iteration will
+                  // take care of it
+                }
+              } else {
+                // local sort first using shfl
+                int offset = shflRankingLocal<4>(head_group,
+                                                 warp.thread_rank() % 4, depth);
+                uint32_t sort_mid_offset =
+                    mid_access(MidSortWindow - 4 + offset);
+                uint32_t my_mid_offset =
+                    mid_access(MidSortWindow - 4 + warp.thread_rank() % 4);
+                mid_ids[block.thread_index().y][block.thread_index().z]
+                       [block.thread_index().x / 4][sort_mid_offset] = coll_id;
+                mid_depths[block.thread_index().y][block.thread_index().z]
+                          [block.thread_index().x / 4][sort_mid_offset] = depth;
+
+                head_group.sync();
+
+                coll_id =
+                    mid_ids[block.thread_index().y][block.thread_index().z]
+                           [block.thread_index().x / 4][my_mid_offset];
+                depth =
+                    mid_depths[block.thread_index().y][block.thread_index().z]
+                              [block.thread_index().x / 4][my_mid_offset];
 
 #if (DEBUG_HIERARCHICAL & 0x2) != 0
-					for (int j = 0; j < MidSortWindow; j += 4)
-					{
-						int access = mid_access(j + warp.thread_rank() % 4);
-						printf("%d - %d %d %d - sorted into mid %d (%d from %d):  %d %f \n", 
-							warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x / 4, 
-							j + warp.thread_rank() % 4, access, mid_front,
-							mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][access],
-							mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][access]);
-					}
+                printf("%d - %d %d %d - mid local %d sort %d %f \n",
+                       warp.thread_rank(), block.thread_index().y,
+                       block.thread_index().z, block.thread_index().x / 4,
+                       warp.thread_rank() % 4, coll_id, depth);
+#endif
+                // we do not need the exact count as we only got invalid during
+                // draining
+                fill_counters += 4 * FillMidOne;
+
+                // merge sort with existing
+                mergeSortInto<4, MidSortWindow - 4>(
+                    head_group, warp.thread_rank() % 4, depth, coll_id,
+                    mid_depths[block.thread_index().y][block.thread_index().z]
+                              [block.thread_index().x / 4],
+                    mid_ids[block.thread_index().y][block.thread_index().z]
+                           [block.thread_index().x / 4],
+                    mid_access);
+
+#if (DEBUG_HIERARCHICAL & 0x2) != 0
+                for (int j = 0; j < MidSortWindow; j += 4) {
+                  int access = mid_access(j + warp.thread_rank() % 4);
+                  printf(
+                      "%d - %d %d %d - sorted into mid %d (%d from %d):  %d %f "
+                      "\n",
+                      warp.thread_rank(), block.thread_index().y,
+                      block.thread_index().z, block.thread_index().x / 4,
+                      j + warp.thread_rank() % 4, access, mid_front,
+                      mid_ids[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x / 4][access],
+                      mid_depths[block.thread_index().y][block.thread_index().z]
+                                [block.thread_index().x / 4][access]);
+                }
 #endif
 
-					// run front if we are full
-					if ((fill_counters & FillMidMask) > (MidSortWindow - 4) * FillMidOne)
-					{
-						front4OneFromMid(false);
-					}
-				}
+                // run front if we are full
+                if ((fill_counters & FillMidMask) >
+                    (MidSortWindow - 4) * FillMidOne) {
+                  front4OneFromMid(false);
+                }
+              }
 
-				if (checkvalid)
-				{
-					fill_counters -= min(4 * FillTailOne, FillTailMask & fill_counters);
-				}
-			}
-			if (!checkvalid)
-			{
-				fill_counters -= 16 * FillTailOne;
-			}
+              if (checkvalid) {
+                fill_counters -=
+                    min(4 * FillTailOne, FillTailMask & fill_counters);
+              }
+            }
+            if (!checkvalid) {
+              fill_counters -= 16 * FillTailOne;
+            }
+          };
 
-		};
-
-	// run through elements and continue to push in and blend out
-	for (int progress = range.x; progress < range.y; progress += WARP_SIZE)
-	{
-		if (!warp.any(active))
-			break;
+          for (int progress = range.x; progress < range.y;
+               progress += WARP_SIZE) {
+            if (!warp.any(active))
+              break;
 
 #if DEBUG_HIERARCHICAL != 0
-		//if (progress - range.x > 64)
-		//	return;
+            // if (progress - range.x > 64)
+            //	return;
 #endif
 
-		// fill new data into tail (last 32 elements) for both tail lists
-		// and determine actual elements added and adjust count
-		float4 in_conic_opacity;
-		float2 in_point_xy;
+            // fill new data into tail (last 32 elements) for both tail lists
+            // and determine actual elements added and adjust count
+            float4 in_conic_opacity;
+            float2 in_point_xy;
 
-		int load_id = -1;
-		const int tid = progress + warp.thread_rank();
-		if (tid < range.y)
-		{
-			load_id = point_list[tid];
-		}
+            int load_id = -1;
+            const int tid = progress + warp.thread_rank();
+            if (tid < range.y) {
+              load_id = point_list[tid];
+            }
 
-		if (load_id != -1 && CULL_ALPHA)
-		{
-			in_conic_opacity = conic_opacity[load_id];
-			in_point_xy = points_xy_image[load_id];
-		}
+            if (load_id != -1 && CULL_ALPHA) {
+              in_conic_opacity = conic_opacity[load_id];
+              in_point_xy = points_xy_image[load_id];
+            }
 
 #if (DEBUG_HIERARCHICAL & 0x1) != 0
-		printf("%d - %d %d - loading %d\n", warp.thread_rank(), pixpos.x, pixpos.y, load_id);
+            printf("%d - %d %d - loading %d\n", warp.thread_rank(), pixpos.x,
+                   pixpos.y, load_id);
 #endif
 
-		uint32_t halfs_culled_mask = 0U;
-		for (int half = 0; half < 2; ++half)
-		{
-			int xid = half == 0 ? (block.thread_index().y & (~0x1)) : (block.thread_index().y | 0x1);
-			if (load_id != -1)
-			{
-				// cull against tail tile
-				if (CULL_ALPHA)
-				{
-					// tile boundaries
-					const glm::vec2 tail_rect_min = { static_cast<float>(block.group_index().x * BLOCK_X + 4 * xid), static_cast<float>(block.group_index().y * BLOCK_Y + 4 * block.thread_index().z) };
-					const glm::vec2 tail_rect_max = { tail_rect_min.x + 3.0f, tail_rect_min.y + 3.0f };
+            uint32_t halfs_culled_mask = 0U;
+            for (int half = 0; half < 2; ++half) {
+              int xid = half == 0 ? (block.thread_index().y & (~0x1))
+                                  : (block.thread_index().y | 0x1);
+              if (load_id != -1) {
+                // cull against tail tile
+                if (CULL_ALPHA) {
+                  // tile boundaries
+                  const glm::vec2 tail_rect_min = {
+                      static_cast<float>(block.group_index().x * BLOCK_X +
+                                         4 * xid),
+                      static_cast<float>(block.group_index().y * BLOCK_Y +
+                                         4 * block.thread_index().z)};
+                  const glm::vec2 tail_rect_max = {tail_rect_min.x + 3.0f,
+                                                   tail_rect_min.y + 3.0f};
 
-					glm::vec2 max_pos;
-					float power = max_contrib_power_rect_gaussian_float<3, 3>(in_conic_opacity, in_point_xy, tail_rect_min, tail_rect_max, max_pos);
+                  glm::vec2 max_pos;
+                  float power = max_contrib_power_rect_gaussian_float<3, 3>(
+                      in_conic_opacity, in_point_xy, tail_rect_min,
+                      tail_rect_max, max_pos);
 
-					float alpha = min(0.99f, in_conic_opacity.w * exp(-power));
-					if (alpha < 1.0f / 255.0f)
-						halfs_culled_mask |= (0x1U << half);
-				}
-			}
-		}
+                  float alpha = min(0.99f, in_conic_opacity.w * exp(-power));
+                  if (alpha < 1.0f / 255.0f)
+                    halfs_culled_mask |= (0x1U << half);
+                }
+              }
+            }
 
-		float3 in_depth_info[3];
-		if (load_id != -1 && (!CULL_ALPHA || !(halfs_culled_mask == 0x3))) // if culling and not both halfs culled
-		{
-			in_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
-			in_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
-			in_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
-		}	
+            float3 in_depth_info[3];
+            if (load_id != -1 &&
+                (!CULL_ALPHA || !(halfs_culled_mask ==
+                                  0x3))) // if culling and not both halfs culled
+            {
+              in_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
+              in_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
+              in_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
+            }
 
-		for (int half = 0; half < 2; ++half)
-		{
-			int xid = half == 0 ? (block.thread_index().y & (~0x1)) : (block.thread_index().y | 0x1);
-			float depth = FLT_MAX;
+            for (int half = 0; half < 2; ++half) {
+              int xid = half == 0 ? (block.thread_index().y & (~0x1))
+                                  : (block.thread_index().y | 0x1);
+              float depth = FLT_MAX;
 
-			if (load_id != -1)
-			{
-				// if not culled, compute depth
-				if (!CULL_ALPHA || !(halfs_culled_mask & (0x1U << half)))
-				{
-					depth = depthAlongRay(in_depth_info[0], in_depth_info[1], in_depth_info[2], tail_and_mid_viewdir[xid][block.thread_index().z][0]);
-				}
-			}
-			
-			tail_depths[xid][block.thread_index().z][32 + warp.thread_rank()] = depth;
-			tail_ids[xid][block.thread_index().z][32 + warp.thread_rank()] = depth == FLT_MAX ? -1 : load_id;
+              if (load_id != -1) {
+                // if not culled, compute depth
+                if (!CULL_ALPHA || !(halfs_culled_mask & (0x1U << half))) {
+                  depth = depthAlongRay(
+                      in_depth_info[0], in_depth_info[1], in_depth_info[2],
+                      tail_and_mid_viewdir[xid][block.thread_index().z][0]);
+                }
+              }
+
+              tail_depths[xid][block.thread_index().z]
+                         [32 + warp.thread_rank()] = depth;
+              tail_ids[xid][block.thread_index().z][32 + warp.thread_rank()] =
+                  depth == FLT_MAX ? -1 : load_id;
 #if (DEBUG_HIERARCHICAL & 0x1) != 0
-			printf("(%d) %d - %d %d %d - %d : %f\n", half, warp.thread_rank(), xid, block.thread_index().z, 0, load_id, depth);
+              printf("(%d) %d - %d %d %d - %d : %f\n", half, warp.thread_rank(),
+                     xid, block.thread_index().z, 0, load_id, depth);
 #endif
-		}
-		// local sort the 32 elements with half warp from shared memory
-		batcherSort<32>(halfwarp, tail_depths[block.thread_index().y][block.thread_index().z] + 32, tail_ids[block.thread_index().y][block.thread_index().z] + 32);
-		// sync comes through shfl below
-
-#if (DEBUG_HIERARCHICAL & 0x1) != 0
-		printf("batcher sort %d/%d: %f %d\n", block.thread_index().y, halfwarp.thread_rank(), tail_depths[block.thread_index().y][block.thread_index().z][32 + halfwarp.thread_rank()], tail_ids[block.thread_index().y][block.thread_index().z][32 + halfwarp.thread_rank()]);
-		printf("batcher sort %d/%d: %f %d\n", block.thread_index().y, 16 + halfwarp.thread_rank(), tail_depths[block.thread_index().y][block.thread_index().z][32 + 16 + halfwarp.thread_rank()], tail_ids[block.thread_index().y][block.thread_index().z][32 + 16 + halfwarp.thread_rank()]);
-#endif
-
-		for (int half = 0; half < 2; ++half)
-		{
-			// merge sort if we have old data
-			if ((warp.shfl(fill_counters, half * 16) & FillTailMask) != 0)
-			{
-				int xid = half == 0 ? (block.thread_index().y & (~0x1)) : (block.thread_index().y | 0x1);
-
-				float* d = tail_depths[xid][block.thread_index().z];
-				int* id = tail_ids[xid][block.thread_index().z];
-
-				float k = d[32 + warp.thread_rank()];
-				int v = id[32 + warp.thread_rank()];
-				// determine number of valid
-				uint32_t count_valid = __popc(warp.ballot(v != -1));
-				if (half == warp.thread_rank() / 16)
-					fill_counters += count_valid * FillTailOne;
-				mergeSortRegToSmem<32>(warp, d, id, d, id, k, v);
+            }
+            // local sort the 32 elements with half warp from shared memory
+            batcherSort<32>(
+                halfwarp,
+                tail_depths[block.thread_index().y][block.thread_index().z] +
+                    32,
+                tail_ids[block.thread_index().y][block.thread_index().z] + 32);
+            // sync comes through shfl below
 
 #if (DEBUG_HIERARCHICAL & 0x1) != 0
-				warp.sync();
-				printf("merge of %d (%d) sort %d: %f %d\n", xid, (fill_counters & FillTailMask) / FillTailOne, warp.thread_rank(), d[warp.thread_rank()], id[warp.thread_rank()]);
-				printf("merge of %d (%d) sort %d: %f %d\n", xid, (fill_counters & FillTailMask) / FillTailOne, 32 + warp.thread_rank(), d[32 + warp.thread_rank()], id[32 + warp.thread_rank()]);
+            printf("batcher sort %d/%d: %f %d\n", block.thread_index().y,
+                   halfwarp.thread_rank(),
+                   tail_depths[block.thread_index().y][block.thread_index().z]
+                              [32 + halfwarp.thread_rank()],
+                   tail_ids[block.thread_index().y][block.thread_index().z]
+                           [32 + halfwarp.thread_rank()]);
+            printf("batcher sort %d/%d: %f %d\n", block.thread_index().y,
+                   16 + halfwarp.thread_rank(),
+                   tail_depths[block.thread_index().y][block.thread_index().z]
+                              [32 + 16 + halfwarp.thread_rank()],
+                   tail_ids[block.thread_index().y][block.thread_index().z]
+                           [32 + 16 + halfwarp.thread_rank()]);
 #endif
-			}
-			else
-			{
-				// copy data to the front
-				int xid = half == 0 ? (block.thread_index().y & (~0x1)) : (block.thread_index().y | 0x1);
-				float* d = tail_depths[xid][block.thread_index().z];
-				int* id = tail_ids[xid][block.thread_index().z];
-				d[warp.thread_rank()] = d[32 + warp.thread_rank()];
-				int v = id[32 + warp.thread_rank()];
-				id[warp.thread_rank()] = v;
-				// determine number of valid
-				uint32_t count_valid = __popc(warp.ballot(v != -1));
-				if (half == warp.thread_rank() / 16)
-					fill_counters += count_valid * FillTailOne;
+
+            for (int half = 0; half < 2; ++half) {
+              // merge sort if we have old data
+              if ((warp.shfl(fill_counters, half * 16) & FillTailMask) != 0) {
+                int xid = half == 0 ? (block.thread_index().y & (~0x1))
+                                    : (block.thread_index().y | 0x1);
+
+                float *d = tail_depths[xid][block.thread_index().z];
+                int *id = tail_ids[xid][block.thread_index().z];
+
+                float k = d[32 + warp.thread_rank()];
+                int v = id[32 + warp.thread_rank()];
+                // determine number of valid
+                uint32_t count_valid = __popc(warp.ballot(v != -1));
+                if (half == warp.thread_rank() / 16)
+                  fill_counters += count_valid * FillTailOne;
+                mergeSortRegToSmem<32>(warp, d, id, d, id, k, v);
 
 #if (DEBUG_HIERARCHICAL & 0x1) != 0
-				warp.sync();
-				printf("copied of %d (%d) data %d: %f %d\n", xid, (fill_counters & FillTailMask) / FillTailOne, warp.thread_rank(), d[warp.thread_rank()], id[warp.thread_rank()]);
+                warp.sync();
+                printf("merge of %d (%d) sort %d: %f %d\n", xid,
+                       (fill_counters & FillTailMask) / FillTailOne,
+                       warp.thread_rank(), d[warp.thread_rank()],
+                       id[warp.thread_rank()]);
+                printf("merge of %d (%d) sort %d: %f %d\n", xid,
+                       (fill_counters & FillTailMask) / FillTailOne,
+                       32 + warp.thread_rank(), d[32 + warp.thread_rank()],
+                       id[32 + warp.thread_rank()]);
 #endif
-			}
-		}
+              } else {
+                // copy data to the front
+                int xid = half == 0 ? (block.thread_index().y & (~0x1))
+                                    : (block.thread_index().y | 0x1);
+                float *d = tail_depths[xid][block.thread_index().z];
+                int *id = tail_ids[xid][block.thread_index().z];
+                d[warp.thread_rank()] = d[32 + warp.thread_rank()];
+                int v = id[32 + warp.thread_rank()];
+                id[warp.thread_rank()] = v;
+                // determine number of valid
+                uint32_t count_valid = __popc(warp.ballot(v != -1));
+                if (half == warp.thread_rank() / 16)
+                  fill_counters += count_valid * FillTailOne;
 
-		for (int half = 0; half < 2; ++half)
-		{
-			if ((fill_counters & FillTailMask) > 32 * FillTailOne)
-			{
-				// take 16 elements out from mid
-				pushPullThroughMid(false);
-				halfwarp.sync();
+#if (DEBUG_HIERARCHICAL & 0x1) != 0
+                warp.sync();
+                printf("copied of %d (%d) data %d: %f %d\n", xid,
+                       (fill_counters & FillTailMask) / FillTailOne,
+                       warp.thread_rank(), d[warp.thread_rank()],
+                       id[warp.thread_rank()]);
+#endif
+              }
+            }
 
-				// move current data in tail (max 48)
-				for (int i = 0; i < 3 - half; ++i)
-				{
-					tail_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x + i * 16] =
-						tail_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x + (i + 1) * 16];
-					tail_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x + i * 16] =
-						tail_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x + (i + 1) * 16];
-				}
-				halfwarp.sync();
-			}
+            for (int half = 0; half < 2; ++half) {
+              if ((fill_counters & FillTailMask) > 32 * FillTailOne) {
+                // take 16 elements out from mid
+                pushPullThroughMid(false);
+                halfwarp.sync();
 
-		}
-	}
+                // move current data in tail (max 48)
+                for (int i = 0; i < 3 - half; ++i) {
+                  tail_ids[block.thread_index().y][block.thread_index().z]
+                          [block.thread_index().x + i * 16] =
+                              tail_ids[block.thread_index().y]
+                                      [block.thread_index().z]
+                                      [block.thread_index().x + (i + 1) * 16];
+                  tail_depths[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x + i * 16] =
+                                 tail_depths[block.thread_index().y]
+                                            [block.thread_index().z]
+                                            [block.thread_index().x +
+                                             (i + 1) * 16];
+                }
+                halfwarp.sync();
+              }
+            }
+          }
 
-	// debug
+          // run through elements and continue to push in and blend out
+
+          // debug
 #if (DEBUG_HIERARCHICAL & 0x10) != 0
-	printf("%d - %d %d %d - draining tail with %d %d %d\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x,
-		(fill_counters & FillHeadMask) / FillHeadOne, (fill_counters & FillMidMask) / FillMidOne, (fill_counters & FillTailMask) / FillTailOne);
+          printf("%d - %d %d %d - draining tail with %d %d %d\n",
+                 warp.thread_rank(), block.thread_index().y,
+                 block.thread_index().z, block.thread_index().x,
+                 (fill_counters & FillHeadMask) / FillHeadOne,
+                 (fill_counters & FillMidMask) / FillMidOne,
+                 (fill_counters & FillTailMask) / FillTailOne);
 #endif
 
-	if (warp.any(active))
-	{
-		if ((fill_counters & FillTailMask) != 0)
-		{
-			for (int half = 0; half < 2; ++half)
-			{
-				pushPullThroughMid(true);
+          if (warp.any(active)) {
+            if ((fill_counters & FillTailMask) != 0) {
+              for (int half = 0; half < 2; ++half) {
+                pushPullThroughMid(true);
 #if (DEBUG_HIERARCHICAL & 0x10) != 0
-				printf("%d - %d %d %d - pulled from mid %d  with %d %d %d\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x,
-					half, (fill_counters & FillHeadMask) / FillHeadOne, (fill_counters & FillMidMask) / FillMidOne, (fill_counters & FillTailMask) / FillTailOne);
+                printf("%d - %d %d %d - pulled from mid %d  with %d %d %d\n",
+                       warp.thread_rank(), block.thread_index().y,
+                       block.thread_index().z, block.thread_index().x, half,
+                       (fill_counters & FillHeadMask) / FillHeadOne,
+                       (fill_counters & FillMidMask) / FillMidOne,
+                       (fill_counters & FillTailMask) / FillTailOne);
 #endif
-				if ((half == 0) && (fill_counters & FillTailMask) == 0)
-					break;
+                if ((half == 0) && (fill_counters & FillTailMask) == 0)
+                  break;
 
+                // move current data in tail (max 16)
+                if (half == 0) {
+                  tail_ids[block.thread_index().y][block.thread_index().z]
+                          [block.thread_index().x] =
+                              tail_ids[block.thread_index().y]
+                                      [block.thread_index().z]
+                                      [block.thread_index().x + 16];
+                  tail_depths[block.thread_index().y][block.thread_index().z]
+                             [block.thread_index().x] =
+                                 tail_depths[block.thread_index().y]
+                                            [block.thread_index().z]
+                                            [block.thread_index().x + 16];
+                }
+              }
+            }
 
-				// move current data in tail (max 16)
-				if (half == 0)
-				{
-					tail_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x] =
-						tail_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x + 16];
-					tail_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x] =
-						tail_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x + 16];
-				}
-			}
-		}
+            // drain the remainder from mid
+            if (warp.any(active)) {
+              if constexpr (MidSortWindow == 8) {
+                if ((fill_counters & FillMidMask) != 0) {
+                  // mid still has data, but it is not at the right location, so
+                  // move it
+                  mid_ids[block.thread_index().y][block.thread_index().z]
+                         [block.thread_index().x / 4][warp.thread_rank() % 4] =
+                             mid_ids[block.thread_index().y]
+                                    [block.thread_index().z]
+                                    [block.thread_index().x / 4]
+                                    [4 + warp.thread_rank() % 4];
+                  mid_depths[block.thread_index().y][block.thread_index().z]
+                            [block.thread_index().x / 4]
+                            [warp.thread_rank() % 4] =
+                                mid_depths[block.thread_index().y]
+                                          [block.thread_index().z]
+                                          [block.thread_index().x / 4]
+                                          [4 + warp.thread_rank() % 4];
 
-		// drain the remainder from mid
-		if (warp.any(active))
-		{
-			if constexpr (MidSortWindow == 8)
-			{
-				if ((fill_counters & FillMidMask) != 0)
-				{
-					// mid still has data, but it is not at the right location, so move it
-					mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4] =
-						mid_ids[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][4 + warp.thread_rank() % 4];
-					mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][warp.thread_rank() % 4] =
-						mid_depths[block.thread_index().y][block.thread_index().z][block.thread_index().x / 4][4 + warp.thread_rank() % 4];
-
-
-					front4OneFromMid(true);
+                  front4OneFromMid(true);
 
 #if (DEBUG_HIERARCHICAL & 0x10) != 0
-					printf("%d - %d %d %d - pulled took 4 from mid %d %d %d\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x,
-						(fill_counters & FillHeadMask) / FillHeadOne, (fill_counters & FillMidMask) / FillMidOne, (fill_counters & FillTailMask) / FillTailOne);
+                  printf("%d - %d %d %d - pulled took 4 from mid %d %d %d\n",
+                         warp.thread_rank(), block.thread_index().y,
+                         block.thread_index().z, block.thread_index().x,
+                         (fill_counters & FillHeadMask) / FillHeadOne,
+                         (fill_counters & FillMidMask) / FillMidOne,
+                         (fill_counters & FillTailMask) / FillTailOne);
 #endif
+                }
+              } else {
+#if (DEBUG_HIERARCHICAL & 0x10) != 0
+                int deb_counter = 0;
+#endif
+                while ((fill_counters & FillMidMask) != 0) {
+                  front4OneFromMid(true);
+#if (DEBUG_HIERARCHICAL & 0x10) != 0
+                  printf(
+                      "%d - %d %d %d - pulled (%d) took 4 from mid %d %d %d\n",
+                      warp.thread_rank(), block.thread_index().y,
+                      block.thread_index().z, block.thread_index().x,
+                      deb_counter, (fill_counters & FillHeadMask) / FillHeadOne,
+                      (fill_counters & FillMidMask) / FillMidOne,
+                      (fill_counters & FillTailMask) / FillTailOne);
+                  ++deb_counter;
+#endif
+                }
+              }
+              // drain front
+              while (active && fill_counters != 0) {
+                blend_one();
+              }
+            }
+          }
 
-				}
-			}
-			else
-			{
-#if (DEBUG_HIERARCHICAL & 0x10) != 0
-				int deb_counter = 0;
-#endif
-				while ((fill_counters & FillMidMask) != 0)
-				{
-					front4OneFromMid(true);
-#if (DEBUG_HIERARCHICAL & 0x10) != 0
-					printf("%d - %d %d %d - pulled (%d) took 4 from mid %d %d %d\n", warp.thread_rank(), block.thread_index().y, block.thread_index().z, block.thread_index().x,
-						deb_counter, (fill_counters& FillHeadMask) / FillHeadOne, (fill_counters& FillMidMask) / FillMidOne, (fill_counters& FillTailMask) / FillTailOne);
-					++deb_counter;
-#endif
-				}
-			}
-			// drain front
-			while (active && fill_counters != 0)
-			{
-				blend_one();
-			}
-	}
+          // All threads that treat valid pixel write out their final
+          // rendering data to the frame and auxiliary buffers.
+
+          if (pixpos.x < W && pixpos.y < H) {
+            float3 o = {cam_pos->x, cam_pos->y, cam_pos->z};
+            fin_function(pixpos, blend_data, debugType, range.y - range.x, o);
+          }
+        }
 }
-
-
-	// All threads that treat valid pixel write out their final
-	// rendering data to the frame and auxiliary buffers.
-
-	if (pixpos.x < W && pixpos.y < H)
-	{
-		float3 o = {cam_pos->x, cam_pos->y, cam_pos->z};
-		fin_function(pixpos, blend_data, debugType, range.y - range.x, o);
-
-	}
-}
-
 
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false, bool CONSIDER_MAX_WEIGHT = false>
-__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forward(
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_renderForward(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	float focal_x, float focal_y, 
+	const float far_plane,
+	const bool include_alpha,
+	const float* view2gaussian,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ cov3Ds_inv,
+	const float* __restrict__ projmatrix_inv,
+	const float3* __restrict__ cam_pos,
+	const float* __restrict__ features,
+	const float* __restrict__ confidences,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	float* __restrict__ max_weights,
+	float* __restrict__ cov2Ds,
+	CudaRasterizer::DebugVisualization debugType,
+	float* __restrict__ out_color,
+	float* __restrict__ gt_color){
+	constexpr uint2 debug_target_pixel = {500, 500};
+	// int num_blends = 0;
+
+          struct BlendData {
+            float T;
+            float T_opa;
+            float C[CHANNELS * 2];
+            uint32_t contributor = 0;
+            float opacity;
+            float depth;
+            float variance;
+            float distortion;
+            float dist1;
+            float dist2;
+            float extent_loss;
+            float confidence{0};
+            float occupation;
+            float occupation2;
+            uint32_t max_contributor{0};
+            uint32_t blend_contributor{0};
+            float3 ray_dir;
+            float gt_color[CHANNELS];
+
+            float weighted_normal_sum[CHANNELS];
+          };
+
+          auto prep_function = [&](bool inside, const uint2 &pixpos,
+                                   const float3 ray_dir) {
+            BlendData bd;
+            bd.ray_dir = ray_dir;
+            bd.T = 1.0f;
+            bd.T_opa = 1.0f;
+            for (int ch = 0; ch < CHANNELS * 2; ++ch) {
+              bd.C[ch] = 0.0f;
+            }
+            bd.distortion = 0.f;
+            bd.depth = 0.f;
+            bd.opacity = 0.f;
+            bd.dist1 = 0.f;
+            bd.dist2 = 0.f;
+            bd.extent_loss = 0.f;
+            bd.variance = 0.f;
+            bd.occupation = 0.f;
+            bd.occupation2 = 0.f;
+
+            uint32_t pix_id = pixpos.y * W + pixpos.x;
+            for (int ch = 0; ch < CHANNELS; ch++) {
+              if (inside) {
+                bd.gt_color[ch] = gt_color[ch * H * W + pix_id];
+              }
+            }
+
+#if (DEBUG_HIERARCHICAL & 0x200) != 0
+            if (pixpos.x == debug_target_pixel.x &&
+                pixpos.y == debug_target_pixel.y) {
+              printf("+++++++++++++++++++++++++++++++++++++++++++\n");
+            }
+#endif
+            return bd;
+          };
+          auto store_function = [](const uint2 &, int coll_id, float G,
+                                   float alpha, float depth) { return alpha; };
+          auto blend_function =
+              [&](const uint2 &pixpos, BlendData &blend_data, int id,
+                  float alpha, float t, const float *view2gaussian_j,
+                  float2 ray, CudaRasterizer::DebugVisualization debugType,
+                  float3 normal_, float4 ABC_) {
+                // alpha = 0.999f;
+                const float normal[3] = {normal_.x, normal_.y, normal_.z};
+                [[maybe_unused]] const float AA = ABC_.x;
+                [[maybe_unused]] const float BB = ABC_.y;
+                [[maybe_unused]] const float CC = ABC_.z;
+
+                float test_T = blend_data.T * (1.0f - alpha);
+                // Keep track of max transmittance for this Gaussian
+                if (cov2Ds) {
+                  atomicMax((int *)&cov2Ds[id * 7 + 6],
+                            __float_as_int(blend_data.T));
+                }
+
+                blend_data.blend_contributor++;
+                const float weight = alpha * blend_data.T;
+
+                // only do this when enabled to reduce memory pressure
+                if constexpr (CONSIDER_MAX_WEIGHT) {
+                  aMaxFloat(&max_weights[id], weight);
+                }
+
+                // TODO: consider using vectors and better loads?
+                float rgb[CHANNELS];
+                for (int ch = 0; ch < CHANNELS; ch++) {
+                  rgb[ch] = features[id * CHANNELS + ch];
+                  blend_data.C[ch] += rgb[ch] * weight;
+                  // +++++++++Variance Loss ++++++++++
+                  blend_data.variance += weight *
+                                         (blend_data.gt_color[ch] - rgb[ch]) *
+                                         (blend_data.gt_color[ch] - rgb[ch]);
+                  // +++++++++Variance Loss ++++++++++
+                }
+
+                // confidence
+                blend_data.confidence += confidences[id] * weight;
+
+                // NDC mapping is taken from 2DGS paper, please check here
+                // https://arxiv.org/pdf/2403.17888.pdf
+                const float max_t = t;
+                const float mapped_max_t =
+                    (far_plane * max_t - far_plane * NEAR_PLANE) /
+                    ((far_plane - NEAR_PLANE) * max_t);
+
+                // normalize normal
+                float length =
+                    sqrt(normal[0] * normal[0] + normal[1] * normal[1] +
+                         normal[2] * normal[2] + 1e-7);
+                const float normal_normalized[3] = {-normal[0] / length,
+                                                    -normal[1] / length,
+                                                    -normal[2] / length};
+
+                // distortion loss is taken from 2DGS paper, please check
+                // https://arxiv.org/pdf/2403.17888.pdf
+                float A = 1 - blend_data.T;
+                float error = mapped_max_t * mapped_max_t * A +
+                              blend_data.dist2 -
+                              2 * mapped_max_t * blend_data.dist1;
+                blend_data.distortion += error * weight;
+
+                blend_data.dist1 += mapped_max_t * weight;
+                blend_data.dist2 += mapped_max_t * mapped_max_t * weight;
+
+                // normal
+                for (int ch = 0; ch < CHANNELS; ch++)
+                  blend_data.C[CHANNELS + ch] += normal_normalized[ch] * weight;
+
+                const float geom_intensity =
+                    expf(-0.5f * (CC - (BB * BB) / (4.0f * AA)));
+                blend_data.occupation += geom_intensity;
+                // blend_data.occupation2+=(geom_intensity*geom_intensity);
+
+                const float g_opacity = ABC_.w;
+
+                // depth and alpha
+                if (blend_data.T > 0.5f) {
+                  if constexpr (EXACT_DEPTH) {
+                    if (test_T < 0.5f) {
+                      float Fp =
+                          (-0.5 / (blend_data.T * ABC_.w)) + (1.0f / ABC_.w);
+                      float con = CC + 2 * logf(Fp);
+                      // why does this need to be abs?
+                      // TODO: new formulation with variance along the Gaussian
+                      float disc = abs(BB * BB - 4 * AA * (con));
+                      float median_t = sqrtf(disc + 1e-9);
+
+                      // TODO: can we somehow scrap fminf
+                      // -BB, 1/2A are always positive (experiments)
+                      // median_t is always positive, due to being the sqrt of a
+                      // positive nmber - only this one makes sense
+                      median_t = (-BB - median_t) / 2.0f / AA;
+                      blend_data.depth = median_t;
+                    } else {
+                      blend_data.depth = t;
+                    }
+                  } else {
+                    blend_data.depth = t;
+                  }
+                  blend_data.max_contributor++;
+                } else {
+                  // TODO: test if t* < t
+                  // if so, we have an issue
+                  float alpha_point = alpha;
+                  if (t > blend_data.depth) {
+                    float min_value =
+                        (AA * blend_data.depth * blend_data.depth +
+                         BB * blend_data.depth + CC);
+                    float p = -0.5f * min_value;
+                    if (p > 0.0f) {
+                      p = 0.0f;
+                    }
+
+                    alpha_point = min(0.99f, ABC_.w * exp(p));
+                  }
+                  blend_data.occupation2 +=
+                      blend_data.T_opa * alpha_point *
+                      ((rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114));
+                  blend_data.opacity += alpha_point * blend_data.T_opa;
+                  blend_data.T_opa *= (1 - alpha_point);
+                }
+
+                // const float C = (far_plane * NEAR_PLANE * sqrtf(2 * logf(255
+                // * ABC_.w))) / (far_plane - NEAR_PLANE); float NDCspan = C * 4
+                // * AA * sqrtf(AA) / (BB * BB);
+
+                const float FN =
+                    (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
+                float C = (CC - 2 * logf(255 * ABC_.w));
+                float extent = sqrtf(abs(BB * BB - 4 * AA * C) + 1e-9);
+                float NDCspan = FN * (2 * AA * extent) / (BB * BB);
+
+                if (include_alpha) {
+                  blend_data.extent_loss += blend_data.T * alpha * NDCspan;
+                } else {
+                  blend_data.extent_loss += blend_data.T * NDCspan;
+                }
+
+#if (DEBUG_HIERARCHICAL & 0x200) != 0
+                if (pixpos.x == debug_target_pixel.x &&
+                    pixpos.y == debug_target_pixel.y) {
+                  glm::mat3 inv;
+                  inv[0][0] = cov3Ds_inv[3 * id].x;
+                  inv[0][1] = cov3Ds_inv[3 * id].y;
+                  inv[0][2] = cov3Ds_inv[3 * id].z;
+                  inv[1][0] = cov3Ds_inv[3 * id].y;
+                  inv[1][1] = cov3Ds_inv[3 * id + 1].x;
+                  inv[1][2] = cov3Ds_inv[3 * id + 1].y;
+                  inv[2][0] = cov3Ds_inv[3 * id].z;
+                  inv[2][1] = cov3Ds_inv[3 * id + 1].y;
+                  inv[2][2] = cov3Ds_inv[3 * id + 1].z;
+
+                  glm::vec3 ray_dir(blend_data.ray_dir.x, blend_data.ray_dir.y,
+                                    blend_data.ray_dir.z);
+
+                  float sigma = glm::dot(ray_dir, inv * ray_dir);
+                  sigma = 1.0f / sigma;
+
+                  printf("t: %f, alpha: %f, sigma: %f\n", t, alpha, sigma);
+                }
+#endif
+                // if the depth is larger than the current depth we're looking
+                // at, evaluate at the current position if
+                // (blend_data.contributor > blend_data.max_contributor) {
+
+                // }
+                //++++++++++++++++GOF
+
+                blend_data.T = test_T;
+
+                if (test_T < 0.0001f) {
+                  return false;
+                }
+                return true;
+              };
+          auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
+                                  CudaRasterizer::DebugVisualization debugType,
+                                  int range, float3 o) {
+            uint32_t pix_id = W * pixpos.y + pixpos.x;
+            // A, D, and D^2
+            final_T[pix_id] = blend_data.T;
+            final_T[pix_id + H * W] = blend_data.dist1;
+            final_T[pix_id + 2 * H * W] = blend_data.dist2;
+            final_T[pix_id + 3 * H * W] = blend_data.T_opa;
+            // +++++++++Variance Loss ++++++++++
+            // add variance of blended background color
+            for (int ch = 0; ch < CHANNELS; ch++) {
+              // CHANGED VARIANCE BEHAVIOUR
+              // blend_data.variance += blend_data.T * (blend_data.gt_color[ch]
+              // - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
+            }
+            // +++++++++Variance Loss ++++++++++
+
+            // +++++++++Normal Variance Loss ++++++++++
+            float weighted_normal_sum_length =
+                (blend_data.C[CHANNELS] * blend_data.C[CHANNELS] +
+                 blend_data.C[CHANNELS + 1] * blend_data.C[CHANNELS + 1] +
+                 blend_data.C[CHANNELS + 2] * blend_data.C[CHANNELS + 2] +
+                 1e-7);
+            // T is detached here...
+            float normal_variance =
+                (1.f - blend_data.T) -
+                weighted_normal_sum_length * (1.0f + blend_data.T);
+            // +++++++++Normal Variance Loss ++++++++++
+
+            n_contrib[pix_id] = (blend_data.max_contributor & 0xFFFF) |
+                                ((blend_data.blend_contributor & 0xFFFF) << 16);
+
+            blend_data.confidence /= max((1 - blend_data.T), 1e-3f);
+
+            if constexpr (!ENABLE_DEBUG_VIZ) {
+              for (int ch = 0; ch < CHANNELS; ch++)
+                out_color[ch * H * W + pix_id] =
+                    blend_data.C[ch] + blend_data.T * bg_color[ch];
+              // normal
+              for (int ch = 0; ch < CHANNELS; ch++) {
+                out_color[(CHANNELS + ch) * H * W + pix_id] =
+                    blend_data.C[CHANNELS + ch];
+              }
+              // depth and alpha
+
+              out_color[DEPTH_OFFSET * H * W + pix_id] = blend_data.depth;
+              out_color[ALPHA_OFFSET * H * W + pix_id] = blend_data.opacity;
+              out_color[DISTORTION_OFFSET * H * W + pix_id] =
+                  blend_data.distortion;
+              out_color[OPACITY_LOSS_OFFSET * H * W + pix_id] =
+                  blend_data.extent_loss;
+              out_color[CONFIDENCE_OFFSET * H * W + pix_id] =
+                  blend_data.confidence;
+              out_color[VARIANCE_OFFSET * H * W + pix_id] = blend_data.variance;
+              out_color[NORMAL_VARIANCE_OFFSET * H * W + pix_id] =
+                  normal_variance;
+              out_color[OCCUPATION_OFFSET * H * W + pix_id] =
+                  blend_data.occupation /
+                  fmaxf((float)blend_data.blend_contributor, 1.f);
+              out_color[OCCUPATION2_OFFSET * H * W + pix_id] =
+                  blend_data.occupation2;
+            } else {
+              outputDebugVis(debugType, out_color, pix_id,
+                             blend_data.blend_contributor, blend_data.T,
+                             blend_data.depth, blend_data.opacity,
+                             blend_data.distortion, blend_data.extent_loss,
+                             blend_data.confidence, range,
+                             blend_data.max_contributor, H, W);
+            }
+#if (DEBUG_HIERARCHICAL & 0x200) != 0
+            if (pixpos.x == debug_target_pixel.x &&
+                pixpos.y == debug_target_pixel.y) {
+              printf("+++++++++++++++++++++++++++++++++++++++++++\n");
+            }
+#endif
+#ifdef DEBUG_OPACITY_FIELD
+            if (pixpos.x < 10 && pixpos.y < 10) {
+              float d = blend_data.C[CHANNELS * 2];
+              float3 depth = {o.x + d * blend_data.ray_dir.x,
+                              o.y + d * blend_data.ray_dir.y,
+                              o.z + d * blend_data.ray_dir.z};
+              printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n",
+                     pixpos.y, pixpos.x, blend_data.C[CHANNELS * 2], depth.x,
+                     depth.y, depth.z);
+            }
+#endif
+          };
+
+          sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW,
+                                                CULL_ALPHA>(
+              ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+              points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
+              conic_opacity, debugType, prep_function, store_function,
+              blend_function, fin_function);
+
+        }
+
+
+
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -990,313 +1476,158 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_forw
 	float* __restrict__ out_color,
 	float* __restrict__ gt_color)
 {
-	constexpr uint2 debug_target_pixel = {500, 500};
-	// int num_blends = 0;
-	struct BlendData
-	{
-		float T;
-		float T_opa;
-		float C[CHANNELS*2];
-		uint32_t contributor = 0;
-		float opacity;
-		float depth;
-		float variance;
-		float distortion;
-		float dist1;
-		float dist2;
-		float extent_loss;
-		float confidence{0};
-		float occupation;
-		float occupation2;
-		uint32_t max_contributor{0};
-		uint32_t blend_contributor{0};
-		float3 ray_dir;
-		float gt_color[CHANNELS];
 
-		float weighted_normal_sum[CHANNELS];
-		
-	};
+			constexpr uint BINARY_SEARCH_ITERATIONS = 5;
+			constexpr uint SPLIT = 8;
+			constexpr float SAMPLE_RANGE = 0.4f;
+			constexpr float ONE_OVER_SPLIT = 1.f/((float)SPLIT);
 
-	auto prep_function = [&](bool inside, const uint2& pixpos, const float3 ray_dir)
-		{
-			BlendData bd;
-			bd.ray_dir = ray_dir;
-			bd.T = 1.0f;
-			bd.T_opa = 1.0f;
-			for (int ch = 0; ch < CHANNELS*2; ++ch)
-			{
-				bd.C[ch] = 0.0f;
-			}
-			bd.distortion = 0.f;
-			bd.depth = 0.f;
-			bd.opacity = 0.f;
-			bd.dist1 = 0.f;
-			bd.dist2 = 0.f;
-			bd.extent_loss = 0.f;
-			bd.variance = 0.f;
-			bd.occupation = 0.f;
-			bd.occupation2 = 0.f;
-			
-			uint32_t pix_id = pixpos.y * W + pixpos.x;
-			for(int ch = 0; ch < CHANNELS; ch++)
-			{
-				if (inside)
-				{
-					bd.gt_color[ch] = gt_color[ch * H * W + pix_id];
-				}
-			}
+          struct BlendData {
+			uint32_t iter{0};
+            float T;
+            float depth_min;
+            float depth_max;
+			float T_p[SPLIT+1];
+            float depth_init;
+            float interval;
+            float3 ray_dir;
+            uint32_t contributor = 0;
+            uint32_t max_contributor{0};
+            uint32_t blend_contributor{0};
+            uint32_t forward_max_blend_contributor{0};
+			bool in_range;
+          };
 
-			
-#if (DEBUG_HIERARCHICAL & 0x200) != 0
-			if(pixpos.x == debug_target_pixel.x && pixpos.y == debug_target_pixel.y)
-			{
-				printf("+++++++++++++++++++++++++++++++++++++++++++\n");
-			}
-#endif
-			return bd;
-		};
-	auto store_function = [](const uint2&, int coll_id, float G, float alpha, float depth)
-		{
-			return alpha;
-		};
-	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
-		{
-			//alpha = 0.999f;
-			const float normal[3] = {normal_.x, normal_.y, normal_.z};
-			[[maybe_unused]] const float AA = ABC_.x;
-			[[maybe_unused]] const float BB = ABC_.y;
-			[[maybe_unused]] const float CC = ABC_.z;
-
-			float test_T = blend_data.T * (1.0f - alpha);
-			// Keep track of max transmittance for this Gaussian
-			if(cov2Ds){
-				atomicMax((int *)&cov2Ds[id * 7 + 6],
-						__float_as_int(blend_data.T));
-			}
-
-                        blend_data.blend_contributor++;
-			const float weight = alpha * blend_data.T;
-
-			// only do this when enabled to reduce memory pressure
-			if constexpr (CONSIDER_MAX_WEIGHT) {
-				aMaxFloat(&max_weights[id], weight);
-			}
-
-			// TODO: consider using vectors and better loads?
-			float rgb[CHANNELS];
-			for (int ch = 0; ch < CHANNELS; ch++) {
-				rgb[ch] = features[id * CHANNELS + ch];
-				blend_data.C[ch] += rgb[ch] * weight;
-				// +++++++++Variance Loss ++++++++++
-				blend_data.variance += weight * (blend_data.gt_color[ch] - rgb[ch]) * (blend_data.gt_color[ch] - rgb[ch]);
-				// +++++++++Variance Loss ++++++++++
-			}
-
-			
+          auto prep_function = [&](bool inside, const uint2 &pixpos,
+                                   const float3 ray_dir) {
+            BlendData bd;
+            uint32_t pix_id = pixpos.y * W + pixpos.x;
+            bd.ray_dir = ray_dir;
+            bd.T = 1.0f;
+			bd.in_range = inside ? final_T[pix_id] <= 0.45f : false;
 
 
-			// confidence
-			blend_data.confidence += confidences[id] * weight;
-
-			// NDC mapping is taken from 2DGS paper, please check here https://arxiv.org/pdf/2403.17888.pdf
-			const float max_t = t;
-			const float mapped_max_t = (far_plane * max_t - far_plane * NEAR_PLANE) / ((far_plane - NEAR_PLANE) * max_t);
-			
-			// normalize normal
-			float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + 1e-7);
-			const float normal_normalized[3] = { -normal[0] / length, -normal[1] / length, -normal[2] / length };
-
-
-			// distortion loss is taken from 2DGS paper, please check https://arxiv.org/pdf/2403.17888.pdf
-			float A = 1-blend_data.T;
-			float error = mapped_max_t * mapped_max_t * A + blend_data.dist2 - 2 * mapped_max_t * blend_data.dist1;
-			blend_data.distortion += error * weight;
-
-			blend_data.dist1 += mapped_max_t * weight;
-			blend_data.dist2 += mapped_max_t * mapped_max_t * weight;
-
-			// normal
-			for (int ch = 0; ch < CHANNELS; ch++)
-				blend_data.C[CHANNELS + ch] += normal_normalized[ch] * weight;
-
-			const float geom_intensity = expf(-0.5f * (CC - (BB * BB) / (4.0f * AA)));
-			blend_data.occupation+=geom_intensity;
-			//blend_data.occupation2+=(geom_intensity*geom_intensity);
-
-			const float g_opacity = ABC_.w;
-			
-			// depth and alpha
-            if (blend_data.T > 0.5f)
-            {
-				if constexpr (EXACT_DEPTH) {
-					if (test_T < 0.5f) {
-						float Fp = (-0.5/(blend_data.T*ABC_.w)) + (1.0f/ABC_.w);
-						float con = CC + 2 * logf(Fp);
-						// why does this need to be abs?
-						// TODO: new formulation with variance along the Gaussian
-						float disc = abs(BB*BB - 4* AA*(con));
-						float median_t = sqrtf(disc + 1e-9);
-
-						// TODO: can we somehow scrap fminf
-						// -BB, 1/2A are always positive (experiments)
-						// median_t is always positive, due to being the sqrt of a positive nmber - only this one makes sense
-						median_t = (-BB - median_t)/2.0f/AA;
-						blend_data.depth = median_t;
-					}
-					else {
-						blend_data.depth = t;
-					}
-				}
-				else {
-					blend_data.depth = t;
-				}
-				blend_data.max_contributor++;
+            for (int p = 0; p < SPLIT + 1; ++p) {
+              bd.T_p[p] = 1.0f;
             }
-			else{
-				// TODO: test if t* < t
-				// if so, we have an issue
-				float alpha_point = alpha;
-				if (t > blend_data.depth) {
-					float min_value = (AA * blend_data.depth * blend_data.depth + BB * blend_data.depth + CC);
-					float p = -0.5f * min_value;
-					if (p > 0.0f){
-						p = 0.0f;
-					}
-	
-					alpha_point = min(0.99f, ABC_.w * exp(p));
-				}
-				blend_data.occupation2+=blend_data.T_opa*alpha_point*((rgb[0]*0.299+rgb[1]*0.587+rgb[2]*0.114));
-				blend_data.opacity += alpha_point * blend_data.T_opa;
-				blend_data.T_opa *= (1 - alpha_point);
-			}
-
-			// const float C = (far_plane * NEAR_PLANE * sqrtf(2 * logf(255 * ABC_.w))) / (far_plane - NEAR_PLANE);
-			// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
-
-			const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-			float C = (CC - 2 * logf(255 * ABC_.w));
-			float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
-			float NDCspan = FN * (2 * AA * extent) / (BB * BB);
-
-			if (include_alpha) {
-				blend_data.extent_loss += blend_data.T * alpha * NDCspan;
-			}
-			else {
-				blend_data.extent_loss += blend_data.T * NDCspan;
-			}
+            bd.forward_max_blend_contributor = inside ? (n_contrib[pix_id] >> 16) & 0xFFFF : 0;
+			float depth_init = inside ? out_color[DEPTH_OFFSET * H * W + pix_id] : 0.f;
+			bd.depth_init = depth_init;
+			bd.depth_min = fmaxf(depth_init - SAMPLE_RANGE, 0.f);
+			bd.depth_max = inside ? fmaxf(depth_init + SAMPLE_RANGE, 0.f) : 0.f;
+			bd.interval = (bd.depth_max - bd.depth_min)*ONE_OVER_SPLIT;
 			
-#if (DEBUG_HIERARCHICAL & 0x200) != 0
-			if(pixpos.x == debug_target_pixel.x && pixpos.y == debug_target_pixel.y)
-			{
-				glm::mat3 inv;
-				inv[0][0] = cov3Ds_inv[3*id].x;
-				inv[0][1] = cov3Ds_inv[3*id].y;
-				inv[0][2] = cov3Ds_inv[3*id].z;
-				inv[1][0] = cov3Ds_inv[3*id].y;
-				inv[1][1] = cov3Ds_inv[3*id+1].x;
-				inv[1][2] = cov3Ds_inv[3*id+1].y;
-				inv[2][0] = cov3Ds_inv[3*id].z;
-				inv[2][1] = cov3Ds_inv[3*id+1].y;
-				inv[2][2] = cov3Ds_inv[3*id+1].z;
+            return bd;
+          };
+          auto store_function = [](const uint2 &, int coll_id, float G,
+                                   float alpha, float depth) { return alpha; };
+          auto blend_function =
+              [&](const uint2 &pixpos, BlendData &blend_data, int id,
+                  float G_peak, float t_peak, const float *view2gaussian_j,
+                  float2 ray, CudaRasterizer::DebugVisualization debugType,
+                  float3 normal_, float4 ABC_) {
+					const int START_ID = blend_data.iter == 0 ? 0 : 1;
+					const int END_ID = blend_data.iter == 0 ? SPLIT+1 : SPLIT;
+                [[maybe_unused]] const float AA = ABC_.x;
+                [[maybe_unused]] const float BB = ABC_.y;
+                [[maybe_unused]] const float CC = ABC_.z;
+                [[maybe_unused]] const float op = ABC_.w;
 
-				glm::vec3 ray_dir(blend_data.ray_dir.x, blend_data.ray_dir.y, blend_data.ray_dir.z);
+				//try early return:
+				//sigma
+				const float G_sigma = rsqrtf(AA);
 
-				float sigma = glm::dot(ray_dir, inv * ray_dir);
-				sigma = 1.0f/sigma;
+				if(!blend_data.in_range || 
+					++blend_data.blend_contributor > blend_data.forward_max_blend_contributor) return false;
 				
-				printf("t: %f, alpha: %f, sigma: %f\n", t, alpha, sigma);
-			}
-#endif
-			// if the depth is larger than the current depth we're looking at, evaluate at the current position
-			// if (blend_data.contributor > blend_data.max_contributor) {
+				//if(t_peak < blend_data.depth_min - G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return true;
+				//if(t_peak > blend_data.depth_max + G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return false;
 
-			// }
-			//++++++++++++++++GOF
+//MYCODE: working
+/* 
+				const float q_peak = AA*t_peak*t_peak + BB*t_peak + CC;
+				const float power_peak = -0.5*(q_peak);
+				const float G_peak = op * expf(fminf(power_peak,0.f));
+*/
+				//vacany at peak is squared
+				//const float vacancy2_peak = (1.f-G_peak);
+				//alpha is G_peak thus use it
 
-			blend_data.T = test_T;
+				const float vacancy2_peak = (1.f-G_peak);
+				for(int i = START_ID; i < END_ID;i++){
+					const float t = blend_data.depth_min + i * blend_data.interval;
+					const bool is_past_peak = t > t_peak;
+					const float q = AA*t*t + BB*t + CC;
+					const float power = -0.5*(q);
+					const float G = op * expf(power);
+					const float one_minus_G = fmaxf(1.f - G,0.f);
 
-
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}
-			return true;
-		};
-	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
-		{		
-			uint32_t pix_id = W * pixpos.y + pixpos.x;
-			// A, D, and D^2
-			final_T[pix_id] = blend_data.T;
-			final_T[pix_id + H * W] = blend_data.dist1;
-			final_T[pix_id + 2 * H * W] = blend_data.dist2;
-			final_T[pix_id + 3 * H * W] = blend_data.T_opa;
-			// +++++++++Variance Loss ++++++++++
-			// add variance of blended background color
-			for(int ch = 0; ch < CHANNELS; ch++)
-			{
-				//CHANGED VARIANCE BEHAVIOUR
-				//blend_data.variance += blend_data.T * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
-			}
-			// +++++++++Variance Loss ++++++++++
-
-			// +++++++++Normal Variance Loss ++++++++++
-			float weighted_normal_sum_length = (
-				blend_data.C[CHANNELS] * blend_data.C[CHANNELS] + 
-				blend_data.C[CHANNELS+1] * blend_data.C[CHANNELS+1] + 
-				blend_data.C[CHANNELS+2] * blend_data.C[CHANNELS+2] + 1e-7);
-			// T is detached here...
-			float normal_variance = (1.f - blend_data.T) - weighted_normal_sum_length * (1.0f + blend_data.T);
-			// +++++++++Normal Variance Loss ++++++++++
-
-			n_contrib[pix_id] = (blend_data.max_contributor & 0xFFFF) | ((blend_data.blend_contributor & 0xFFFF) << 16);
-
-			blend_data.confidence /= max((1 - blend_data.T), 1e-3f);
-
-			if constexpr (!ENABLE_DEBUG_VIZ)
-			{
-				for (int ch = 0; ch < CHANNELS; ch++)
-					out_color[ch * H * W + pix_id] = blend_data.C[ch] + blend_data.T * bg_color[ch];
-				// normal
-				for (int ch = 0; ch < CHANNELS; ch++){
-					out_color[(CHANNELS + ch) * H * W + pix_id] = blend_data.C[CHANNELS+ch];
+					const float Ti = is_past_peak ? rsqrtf(one_minus_G) * vacancy2_peak : sqrtf(one_minus_G);
+					blend_data.T_p[i] *= Ti;
 				}
-				// depth and alpha
-				out_color[DEPTH_OFFSET * H * W + pix_id] = blend_data.depth;
-				out_color[ALPHA_OFFSET * H * W + pix_id] = blend_data.opacity;
-				out_color[DISTORTION_OFFSET * H * W + pix_id] = blend_data.distortion;
-				out_color[OPACITY_LOSS_OFFSET * H * W + pix_id] = blend_data.extent_loss;
-				out_color[CONFIDENCE_OFFSET * H * W + pix_id] = blend_data.confidence;
-				out_color[VARIANCE_OFFSET * H * W + pix_id] = blend_data.variance;
-				out_color[NORMAL_VARIANCE_OFFSET * H * W + pix_id] = normal_variance;
-				out_color[OCCUPATION_OFFSET * H * W + pix_id] = blend_data.occupation/fmaxf((float)blend_data.blend_contributor, 1.f);
-				out_color[OCCUPATION2_OFFSET * H * W + pix_id] = blend_data.occupation2;
+
+                return true;
+              };
+          auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
+                                  CudaRasterizer::DebugVisualization debugType,
+                                  int range, float3 o) {
+
+            uint32_t pix_id = W * pixpos.y + pixpos.x;
+			if(blend_data.iter == 0){
+                blend_data.in_range = (blend_data.T_p[0] >= 0.5f) && (blend_data.T_p[SPLIT] <= 0.5f) && blend_data.in_range;
 			}
-			else
-			{
-				outputDebugVis(debugType, out_color, pix_id, blend_data.blend_contributor, blend_data.T, blend_data.depth, blend_data.opacity, blend_data.distortion, blend_data.extent_loss, blend_data.confidence, range, blend_data.max_contributor,H, W);
+            int start_id = 0;
+#pragma unroll
+            for (int p = 1; p < SPLIT; p++) {
+                start_id = blend_data.T_p[p] >= 0.5f ? p : start_id;
+            }
+            blend_data.depth_max  = blend_data.depth_min + (start_id + 1) * blend_data.interval;
+            blend_data.depth_min  = blend_data.depth_min + (start_id + 0) * blend_data.interval;
+			blend_data.interval = (blend_data.depth_max-blend_data.depth_min)*ONE_OVER_SPLIT;
+            blend_data.T_p[0]     = blend_data.T_p[start_id];
+            blend_data.T_p[SPLIT] = blend_data.T_p[start_id + 1];
+			if(++blend_data.iter >= BINARY_SEARCH_ITERATIONS){
+				//saturatef just brings the input inside [0,1]
+				const float w_max = __saturatef((blend_data.T_p[0] - 0.5f) / (blend_data.T_p[0] - blend_data.T_p[SPLIT]));
+				const float w_min = 1.f - w_max;
+				const float final_depth = blend_data.in_range ? w_max * blend_data.depth_max + w_min * blend_data.depth_min : 0.f;
+				if constexpr (!ENABLE_DEBUG_VIZ) {
+					out_color[DEPTH_OFFSET * H * W + pix_id] = final_depth;
+					//out_color[ALPHA_OFFSET * H * W + pix_id] = blend_data.T_p[0];
+				}
+			}else{
+				blend_data.blend_contributor = 0;
+				blend_data.contributor = 0;
+				for (int p = 1; p < SPLIT; ++p) {
+					blend_data.T_p[p] = 1.0f;
+				}
 			}
+
 #if (DEBUG_HIERARCHICAL & 0x200) != 0
-			if(pixpos.x == debug_target_pixel.x && pixpos.y == debug_target_pixel.y)
-			{
-				printf("+++++++++++++++++++++++++++++++++++++++++++\n");
-			}
+            if (pixpos.x == debug_target_pixel.x &&
+                pixpos.y == debug_target_pixel.y) {
+              printf("+++++++++++++++++++++++++++++++++++++++++++\n");
+            }
 #endif
 #ifdef DEBUG_OPACITY_FIELD
-			if (pixpos.x < 10 && pixpos.y < 10) {
-				float d = blend_data.C[CHANNELS * 2];
-				float3 depth = {
-					o.x + d * blend_data.ray_dir.x,
-					o.y + d * blend_data.ray_dir.y,
-					o.z + d * blend_data.ray_dir.z
-				};
-				printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n", pixpos.y, pixpos.x, blend_data.C[CHANNELS * 2], depth.x, depth.y, depth.z);
-			}
+            if (pixpos.x < 10 && pixpos.y < 10) {
+              float d = blend_data.C[CHANNELS * 2];
+              float3 depth = {o.x + d * blend_data.ray_dir.x,
+                              o.y + d * blend_data.ray_dir.y,
+                              o.z + d * blend_data.ray_dir.z};
+              printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n",
+                     pixpos.y, pixpos.x, blend_data.C[CHANNELS * 2], depth.x,
+                     depth.y, depth.z);
+            }
 #endif
-		};
+          };
 
-	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
-		prep_function, store_function, blend_function, fin_function);
+          sortGaussiansRayHierarchicaEvaluation<BINARY_SEARCH_ITERATIONS, HEAD_WINDOW, MID_WINDOW,
+                                                CULL_ALPHA>(
+              ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+              points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
+              conic_opacity, debugType, prep_function, store_function,
+              blend_function, fin_function);
 }
 
 
@@ -1381,7 +1712,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 				out_color[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id] = blend_data.F[ch]*blend_normalization_factor;
 		};
 
-	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
 		ranges, point_list, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
 		prep_function, store_function, blend_function, fin_function);
 }
@@ -1501,7 +1832,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			}
 		};
 
-	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
 		ranges, point_list, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
 		prep_function, store_function, blend_function, fin_function);
 }
@@ -2207,7 +2538,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
                         return;
 		};
 
-	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
 		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, blend_function, fin_function);
 }
@@ -2303,7 +2634,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			return;
 		};
 
-	sortGaussiansRayHierarchicaEvaluation<HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
 		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, blend_function, fin_function);
 }

@@ -974,13 +974,20 @@ void FORWARD::render(
 	}
 	else if (splatting_settings.sort_settings.sort_mode == SortMode::HIERARCHICAL)
 	{
-#define CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT) sortGaussiansRayHierarchicalCUDA_forward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, EXACT_DEPTH, DEBUG, CONSIDER_MAX_WEIGHT><<<grid, {16, 4, 4}>>>( \
+
+#define CALL_HIER_BINARY_SEARCH_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG) sortGaussiansRayHierarchicalCUDA_binarySearchForward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, true, DEBUG><<<grid, {16, 4, 4}>>>( \
+ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
+
+#define CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT) sortGaussiansRayHierarchicalCUDA_renderForward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, EXACT_DEPTH, DEBUG, CONSIDER_MAX_WEIGHT><<<grid, {16, 4, 4}>>>( \
 ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
 #define CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH) if (splatting_settings.consider_max_weight) { CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, true); } else { CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, false); }
 
 #define CALL_HIER_EXACT_DEPTH(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG) if (splatting_settings.exact_depth) { CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, true); } else { CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, false); }
 
 #define CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE) if (debugVisualization.type == DebugVisualization::Disabled || debugVisualization.type == DebugVisualization::Opacity) { CALL_HIER_EXACT_DEPTH(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, false); } else { CALL_HIER_EXACT_DEPTH(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true); }
+
+#define CALL_HIER_BINARY_SEARCH(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE) if (debugVisualization.type == DebugVisualization::Disabled || debugVisualization.type == DebugVisualization::Opacity) { CALL_HIER_BINARY_SEARCH_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, false); } else { CALL_HIER_BINARY_SEARCH_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true); }
+
 
 #ifdef STOPTHEPOP_FASTBUILD
 #define CALL_HIER_HEAD(HIER_CULLING, MID_QUEUE_SIZE) \
@@ -990,12 +997,28 @@ ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatt
 		default: { throw std::runtime_error("Not supported head queue size"); } \
 	}
 
+#define CALL_HIER_HEAD_BINARY_SEARCH(HIER_CULLING, MID_QUEUE_SIZE) \
+	switch (splatting_settings.sort_settings.queue_sizes.per_pixel) \
+	{ \
+		case 4: { CALL_HIER_BINARY_SEARCH(HIER_CULLING, MID_QUEUE_SIZE, 4); break; } \
+		default: { throw std::runtime_error("Not supported head queue size"); } \
+	}
+
+
 #define CALL_HIER_MID(HIER_CULLING) \
 	switch (splatting_settings.sort_settings.queue_sizes.tile_2x2) \
 	{ \
 		case 8: { CALL_HIER_HEAD(HIER_CULLING, 8); break; } \
 		default: { throw std::runtime_error("Not supported mid queue size"); } \
 	}
+
+#define CALL_HIER_MID_BINARY_SEARCH(HIER_CULLING) \
+	switch (splatting_settings.sort_settings.queue_sizes.tile_2x2) \
+	{ \
+		case 8: { CALL_HIER_HEAD_BINARY_SEARCH(HIER_CULLING, 8); break; } \
+		default: { throw std::runtime_error("Not supported mid queue size"); } \
+	}
+
 #else // STOPTHEPOP_FASTBUILD
 #define CALL_HIER_HEAD(HIER_CULLING, MID_QUEUE_SIZE) \
 	switch (splatting_settings.sort_settings.queue_sizes.per_pixel) \
@@ -1018,14 +1041,21 @@ ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatt
 
 	if (splatting_settings.culling_settings.hierarchical_4x4_culling) {
 		CALL_HIER_MID(true);
+		CALL_HIER_MID_BINARY_SEARCH(true);
 	} else {
 		CALL_HIER_MID(false);
+		CALL_HIER_MID_BINARY_SEARCH(false);
 	}
 
+#undef CALL_HIER_MID_BINARY_SEARCH
+#undef CALL_HIER_HEAD_BINARY_SEARCH
+#undef CALL_HIER_BINARY_SEARCH
+#undef CALL_HIER_BINARY_SEARCH_DEBUG
 #undef CALL_HIER_MID
 #undef CALL_HIER_HEAD
 #undef CALL_HIER
 #undef CALL_HIER_EXACT_DEPTH
+#undef CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT
 #undef CALL_HIER_DEBUG
 	}
 }
