@@ -1185,6 +1185,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
                 [[maybe_unused]] const float CC = ABC_.z;
 
                 float test_T = blend_data.T * (1.0f - alpha);
+
+                if (test_T < 0.0001f) {
+                  return false;
+                }
                 // Keep track of max transmittance for this Gaussian
                 if (cov2Ds) {
                   atomicMax((int *)&cov2Ds[id * 7 + 6],
@@ -1346,9 +1350,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
 
                 blend_data.T = test_T;
 
-                if (test_T < 0.0001f) {
-                  return false;
-                }
                 return true;
               };
           auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
@@ -1535,11 +1536,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 
 				//try early return:
 				//sigma
-				const float G_sigma = rsqrtf(AA);
 
 				if(!blend_data.in_range || 
 					++blend_data.blend_contributor > blend_data.forward_max_blend_contributor) return false;
 				
+				//const float G_sigma = rsqrtf(AA);
 				//if(t_peak < blend_data.depth_min - G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return true;
 				//if(t_peak > blend_data.depth_max + G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return false;
 
@@ -1687,6 +1688,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 		{
 			// accumulate the opacity up to the current contributor
 			float test_T = blend_data.T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}
 
 			const float weight = alpha * blend_data.T;
 			// TODO: consider using vectors and better loads?
@@ -1697,10 +1702,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 
 
 			blend_data.T = test_T;
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}
 			return true;
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
@@ -1838,7 +1839,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 }
 
 
-template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false>
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true>
 __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_backward(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
@@ -1867,16 +1868,22 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 	float* __restrict__ dL_dconfidences,
 	float* dL_dview2gaussian)
 {
+	constexpr int ITERATIONS = GSGS_TWO_PASS ? 2 : 1;
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 	// int num_blends = 0;
 	struct BlendData
 	{
+		//for iter=0: compute eq 16 of paper https://arxiv.org/html/2601.17835v1#S4.SS1
+		//for iter=1: compute eq 17 of paper https://arxiv.org/html/2601.17835v1#S4.SS1 and do standard backward
+		float dT_dtmedian;
+		int iter = GSGS_TWO_PASS ? 0 : 1;
 		float T_final;
 		float dL_dpixel[CHANNELS];
 		//++++++++++++GOF
 		float dL_dnormal2D[3]; // Normal
-		float dL_dmax_depth = 0;
+		float dL_dmt_dT_dtm;
+		float dL_dmax_depth;
 		float max_depth = 0.f;
 		float final_D;
 		float final_D2;
@@ -1932,6 +1939,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		{
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
 			BlendData bd;
+			bd.dT_dtmedian = 0.0f;
 			bd.T = 1.0f;
 			bd.T_final = inside ? final_Ts[pix_id] : 0;
 			//++++++++++++GOF
@@ -1964,6 +1972,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			bd.blend_contributor = inside ? (n_contrib[pix_id] >> 16) & 0xFFFF : 0;
 			bd.max_contributor = inside ? n_contrib[pix_id] & 0xFFFF : 0;
 			bd.max_depth = inside ? pixel_colors[DEPTH_OFFSET * H * W + pix_id] : 0;
+			bd.dL_dmt_dT_dtm = 0.f;
 
 			// blend_data.extent_loss /= (blend_data.depth + 1e-9);
 			// depth is detached (for now)
@@ -2042,15 +2051,57 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int global_id, float G, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
 		{
 			const float4 con_o = conic_opacity[global_id];
-
-			//++++++++++++GOF
-			const float normal[3] = {normal_.x, normal_.y, normal_.z};
+			const float alpha = min(0.99f, con_o.w * G);
 			[[maybe_unused]] const float AA = ABC_.x;
 			[[maybe_unused]] const float BB = ABC_.y;
 			[[maybe_unused]] const float CC = ABC_.z;
-
-			const float alpha = min(0.99f, con_o.w * G);
 			float test_T = blend_data.T * (1.0f - alpha);
+			switch(blend_data.iter){
+				case 0:
+				{
+					if (test_T < 0.0001f)
+					{
+						return false;
+					}			
+					//eq 16 from paper https://arxiv.org/html/2601.17835v1#S4.SS1
+					//now t_peak is t
+					const float vacancy2_peak = (1.f-alpha);
+					const float t_med = blend_data.max_depth;
+					const bool is_past_peak = t_med > t;
+					const float q = AA*t_med*t_med + BB*t_med + CC;
+					const float power = -0.5*(q);
+					const float G = ABC_.w * expf(power);
+					const float one_minus_G = fmaxf(1.f - G,0.f);
+					const float Ti_t_med = is_past_peak ? rsqrtf(one_minus_G) * vacancy2_peak : sqrtf(one_minus_G);
+
+
+					const float dq_dt_med = 2.f*AA * t_med + BB;
+					constexpr float dpower_dq = -0.5;
+					const float dG_dpower = ABC_.w * expf(power) ;
+					const float done_minus_G_dG = one_minus_G == 0.f ? 0.f : -1.f;
+
+					float dT = 0.5/(Ti_t_med) * dpower_dq * dq_dt_med * dG_dpower;
+					if(!is_past_peak){
+						dT *= done_minus_G_dG * 0.5*rsqrtf(one_minus_G);
+					}else{
+						dT *= vacancy2_peak * done_minus_G_dG * -0.5f/(one_minus_G)*rsqrtf(one_minus_G);
+					}
+					blend_data.dT_dtmedian += dT;
+
+					
+					blend_data.T = test_T;
+					return true;
+				}
+				break;
+				case 1:
+				{
+
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}			
+			//++++++++++++GOF
+			const float normal[3] = {normal_.x, normal_.y, normal_.z};
 			//++++++++++++GOF		
 
 			// NDC mapping is taken from 2DGS paper, please check here https://arxiv.org/pdf/2403.17888.pdf
@@ -2212,8 +2263,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 
 			float dL_do = 0;
 			float inv_A = 1.f / AA;
+			if constexpr(!GSGS_TWO_PASS){
 			if (++blend_data.current_contributor == blend_data.max_contributor) {
-				blend_data.depth_global_id = global_id;
+					blend_data.depth_global_id = global_id;
 #ifdef CORRECT_EXACT_DEPTH_GRAD
 				//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
 				if (test_T < 0.5f && EXACT_DEPTH) {
@@ -2247,17 +2299,59 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 					blend_data.dt_dw = 0.f;
 				}
 #else
-					dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
-					dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
-					dL_dC += 0* (blend_data.dL_dmax_depth);
-					dL_do += 0* (blend_data.dL_dmax_depth);
+				dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
+				dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
+				dL_dC += 0* (blend_data.dL_dmax_depth);
+				dL_do += 0* (blend_data.dL_dmax_depth);
 
-					blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
-					blend_data.dt_dB = -0.5f * inv_A;
-					blend_data.dt_dC = 0.f;
-					blend_data.dt_dw = 0.f;
+				blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
+				blend_data.dt_dB = -0.5f * inv_A;
+				blend_data.dt_dC = 0.f;
+				blend_data.dt_dw = 0.f;
 #endif
+				}
+			}else{
+				const float op = ABC_.w;
+				const float vacancy2_peak = (1.f-alpha);
+				const float t_med = blend_data.max_depth;
+				const bool is_past_peak = t_med > t;
+				const float q = AA*t_med*t_med + BB*t_med + CC;
+				const float power = -0.5*(q);
+				const float G = op * expf(power);
+				const float one_minus_G = fmaxf(1.f - G,0.f);
+				const float Ti_t_med = is_past_peak ? rsqrtf(one_minus_G) * vacancy2_peak : sqrtf(one_minus_G);
+
+
+				//deriviative of T_t_med wrt A,B,C, alpha, op
+				const float dq_dA = t_med*t_med;
+				const float dq_dB = t_med;
+				constexpr float dq_dC = 1.f;
+				constexpr float dpower_dq = -0.5;
+				const float dG_dpower = op * expf(power);
+				const float done_minus_G_dG = one_minus_G == 0.f ? 0.f : -1.f;
+				const float dG_dop = expf(power);
+
+				float dL = 0.5/(Ti_t_med) * blend_data.dL_dmt_dT_dtm;
+				if(!is_past_peak){
+					//deriviative of sqrt(x) = 1/(2*sqrt(x))
+					dL *= done_minus_G_dG * 0.5*rsqrtf(one_minus_G);
+					dL_dA += dL * dq_dA * dG_dpower * dpower_dq;
+					dL_dB += dL * dq_dB * dG_dpower * dpower_dq;
+					dL_dC += dL * dq_dC * dG_dpower * dpower_dq;
+					dL_do += dL * dG_dop;
+				}else{
+					//deriviative of 1/sqrt(x) = -1/(2x*sqrt(x))
+
+					const float dL_part1 = dL * done_minus_G_dG * 0.5/(one_minus_G) *rsqrtf(one_minus_G) * vacancy2_peak ;
+					const float dL_part2 = dL * rsqrtf(one_minus_G) * (-1.f);
+					dL_dA += dL_part1 * dq_dA * dG_dpower * dpower_dq;
+					dL_dB += dL_part1 * dq_dB * dG_dpower * dpower_dq;
+					dL_dC += dL_part1 * dq_dC * dG_dpower * dpower_dq;
+					dL_do += dL_part1 * dG_dop;
+					dL_dalpha += dL_part2;
+				}
 			}
+
 			
 			dL_dA += 0.5f * BB * inv_A * inv_A * (dL_dmax_t);
 			dL_dB += -0.5f * inv_A* (dL_dmax_t);
@@ -2470,14 +2564,20 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
             }
 #endif
 
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}			
 			return true;
+				}
+				break;
+			}
+
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{
+			if(blend_data.iter++ == 0){
+				//reset
+				blend_data.T = 1.f;
+				blend_data.dL_dmt_dT_dtm = blend_data.dL_dmax_depth / fmaxf(-blend_data.dT_dtmedian, 1e-7f);
+				return;
+			}
 #ifdef DEBUG_OPACITY_FIELD
 			float diff = blend_data.opacity_final - blend_data.opacity;
 			if (abs(diff) > 1e-5)
@@ -2538,7 +2638,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
                         return;
 		};
 
-	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+	sortGaussiansRayHierarchicaEvaluation<ITERATIONS, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
 		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, blend_function, fin_function);
 }
@@ -2615,6 +2715,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 		{
 			// accumulate the opacity up to the current contributor
 			float test_T = blend_data.T * (1.0f - alpha);
+			if (test_T < 0.0001f)
+			{
+				return false;
+			}			
 			const float dchannel_dcolor = alpha * blend_data.T;
 			// TODO: consider using vectors and better loads?
 			for (int ch = 0; ch < N_EXTRA_FEATURES; ch++) {
@@ -2623,10 +2727,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			}
 
 			blend_data.T = test_T;
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}			
 			return true;
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
