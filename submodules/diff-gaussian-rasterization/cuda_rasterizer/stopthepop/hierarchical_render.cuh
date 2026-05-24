@@ -15,8 +15,7 @@ constexpr float SIGMA_THRESHOLD = 3.00f;
 				
 
 struct TransmittanceVacancy {
-    static constexpr float MIN_OMG = 1e-6f;
-    static constexpr float MIN_VG  = 1e-3f;
+    static constexpr float MAX_G = 0.99f;
 
     // G(t) = G_peak * exp(-0.5 * AA * (t - t_peak)^2)
     //      = G_peak * exp(-0.5 * ((t - t_peak) / sigma)^2),  sigma = 1/sqrt(AA)
@@ -29,15 +28,15 @@ struct TransmittanceVacancy {
     float v2_Gpeak;  // precomputed: 1 - G_peak
 
     __device__ TransmittanceVacancy(float AA, float G_peak, float t_peak)
-        : AA(AA), G_peak(G_peak), t_peak(t_peak)
-        , v2_Gpeak(fmaxf(1.f - G_peak, 0.f))
-    {}
+        : AA(AA), G_peak(fminf(G_peak,MAX_G)), t_peak(t_peak)
+    {
+		v2_Gpeak = 1.f-G_peak;
+	}
 
     __device__ float T(float t) const {
         const float dt      = t - t_peak;
-        const float G       = G_peak * __expf(-0.5f * AA * dt * dt);  // one expf
-        const float clamped = fmaxf(1.f - G, MIN_OMG);
-        return (t > t_peak) ? v2_Gpeak * rsqrtf(clamped) : sqrtf(clamped);
+        const float G       = fminf(G_peak * __expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
+        return (t > t_peak) ? v2_Gpeak * 1.f/sqrtf(1.f-G) : sqrtf(1.f-G);
     }
 
  // Returns T(t); writes dT/d(AA, G_peak, t_peak) and dT/dt
@@ -46,47 +45,44 @@ struct TransmittanceVacancy {
                                   float &dAA, float &dG_peak_out,
                                   float &dt_peak_out) const {
         const float dt          = t - t_peak;
-        const float exp_term    = __expf(-0.5f * AA * dt * dt);
-        const float G           = G_peak * exp_term;
-        const float clamped     = fmaxf(1.f - G, MIN_OMG);
-        const float vG          = sqrtf(clamped);
+        const float exp_term    = expf(-0.5f * AA * dt * dt);
+        const float G           = fminf(G_peak * exp_term, MAX_G);
+        const float vG          = sqrtf(1.f-G);
 
         float Ti, dT_dG;
         if (t > t_peak) {
-            Ti    = v2_Gpeak * rsqrtf(clamped);
-            dT_dG = Ti / (2.f * clamped);
+            Ti    = v2_Gpeak * 1.f/sqrtf(1.f-G);
+            dT_dG = Ti / (2.f * (1.f-G));
             // G_peak appears in numerator (1-G_peak) AND in G — two terms
-            dG_peak_out = -rsqrtf(clamped) + dT_dG * exp_term;
+            dG_peak_out = -1.f/sqrtf(1.f-G) + dT_dG * exp_term;
         } else {
             Ti    = vG;
-            dT_dG = -0.5f / fmaxf(vG, MIN_VG);
+            dT_dG = -0.5f / vG;
             dG_peak_out = dT_dG * exp_term;
         }
 
         // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
         const float dG_dt = G * (-AA * dt);
         dAA         = dT_dG * G * (-0.5f * dt * dt);
-        float dt_out = (t > t_peak) ? Ti * dG_dt / (2.f * clamped)
-                                   : -dG_dt / (2.f * fmaxf(vG, MIN_VG));
+        float dt_out = (t > t_peak) ? Ti * dG_dt / (2.f * (1.f-G))
+                                   : -dG_dt / (2.f * vG);
         dt_peak_out = -dt_out; 
 
         return Ti;
     }
 
-    // Convenience: T + dT/dt only (e.g. for ray marching step adjustment)
     __device__ float dT_dt(float t, float &dt_out) const {
         const float dt      = t - t_peak;
-        const float G       = G_peak * __expf(-0.5f * AA * dt * dt);
-        const float clamped = fmaxf(1.f - G, MIN_OMG);
-        const float vG      = sqrtf(clamped);
+        const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
+        const float vG      = sqrtf(1.f-G);
         const float dG_dt   = G * (-AA * dt);
         float Ti;
         if (t > t_peak) {
-            Ti     = v2_Gpeak * rsqrtf(clamped);
-            dt_out = Ti * dG_dt / (2.f * clamped);
+            Ti     = v2_Gpeak * 1.f/sqrtf(1.f-G);
+            dt_out = Ti * dG_dt / (2.f * (1.f-G));
         } else {
             Ti     = vG;
-            dt_out = -dG_dt / (2.f * fmaxf(vG, MIN_VG));
+            dt_out = -dG_dt / (2.f * vG);
         }
         return Ti;
     }
