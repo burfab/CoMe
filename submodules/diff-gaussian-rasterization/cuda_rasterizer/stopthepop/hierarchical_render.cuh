@@ -36,58 +36,52 @@ struct TransmittanceVacancy {
     __device__ float T(float t) const {
         const float dt      = t - t_peak;
         const float G       = fminf(G_peak * __expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
-		const float a = v2_Gpeak * 1.f/sqrtf(1.f-G);
-		const float b = sqrtf(1.f-G);
-        return (t > t_peak) ?  a : b;
+        return (t > t_peak) ? v2_Gpeak * 1.f/sqrtf(1.f-G) : sqrtf(1.f-G);
     }
 
- // Returns T(t); writes dT/d(AA, G_peak, t_peak) and dT/dt
-    // dG/dt_peak = -dG/dt, so both come free from one computation
+	//Idea: Don't take deriviative of T but of T^2
     __device__ float dT_dGaussian(float t,
                                   float &dAA, float &dG_peak_out,
                                   float &dt_peak_out) const {
-
-									/*
-                    float t_delta      = (mDepth - t_peak) * rsigma;
-                    float G_exp        = expf(-0.5f * t_delta * t_delta);
-                    float Gt           = alpha * G_exp;
-
-                    float dL_dGt           = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
-                    dL_dGt                 = mDepth > t_peak ? dL_dGt : -dL_dGt;
-                    dL_dGt                 = rsigma > 0 ? dL_dGt : 0.f;
-                    dL_dopa_sigma          = dL_dGt * G_exp - dL_dmt_dT_dtm * (t_delta > 0 ? 0.5f / (1.f - alpha) : 0.f);
-                    float dL_ddelta        = -dL_dGt * Gt * t_delta;
-                    dL_drsigma_local       = dL_ddelta * (mDepth - t_peak);
-                    const float dL_dt_peak = -dL_ddelta * rsigma;
-
-                    dL_dt = dL_dt_peak;
-									*/
-
-
         const float dt          = t - t_peak;
         const float exp_term    = expf(-0.5f * AA * dt * dt);
         const float G           = fminf(G_peak * exp_term, MAX_G);
-		const auto Ti = 1.f-G;
 
-		const auto dT_dG = dt > 0 ? 1.f : -1.f;
-		dG_peak_out = exp_term * dT_dG - 1 * (dt > 0.f ? exp_term : 0.f);
-		const float dG_dexp_term = G_peak;
-		const float dexp_term_dAA = exp_term * -0.5f*dt*dt;
-		const float dexp_term_dt = exp_term * -1.f*AA*dt;
-		constexpr float dt_dt_peak = -1;
+        float Ti, dTi_dG;
+        if (t > t_peak) {
+            Ti    = v2_Gpeak*v2_Gpeak * 1.f/(1.f-G);
+			dTi_dG = v2_Gpeak * v2_Gpeak / ((1.f - G) * (1.f - G));
+            // G_peak appears in numerator (1-G_peak) AND in G — two terms
+            dG_peak_out = 2 * (v2_Gpeak) * -1.f + dTi_dG * (exp_term);
+        } else {
+            Ti    = 1.f-G;
+            dTi_dG = -1.f;
+            dG_peak_out = dTi_dG * exp_term;
+        }
 
-		dAA = dexp_term_dAA * dG_dexp_term * dT_dG;
-		dt_peak_out = dt_dt_peak * dexp_term_dt * dG_dexp_term * dT_dG;
+        // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
+        const float dG_ddt = G * (-AA * dt);
+		const float ddt_dtpeak = -1.f;
+        dAA         = dTi_dG * G * (-0.5f * dt * dt);
+        dt_peak_out = dG_ddt * dTi_dG * ddt_dtpeak;
+
         return Ti;
     }
 
+	//Idea: Don't take deriviative of T but of T^2
     __device__ float dT_dt(float t, float &dt_out) const {
         const float dt      = t - t_peak;
         const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
-		const auto Ti = 1.f-G;
-		//note G = G_peak * expf(-0.5f*AA*dt*dt)
-        const float dG_dt   = G * (-AA * fabsf(dt)) ;
-		dt_out = -dG_dt * -1;
+        const float dG_dt   = G * (-AA * dt);
+        float Ti;
+        if (t > t_peak) {
+            Ti     = v2_Gpeak*v2_Gpeak * 1.f/(1.f-G);
+			float dTi_dG = v2_Gpeak * v2_Gpeak / ((1.f - G) * (1.f - G));
+            dt_out = dTi_dG * dG_dt;
+        } else {
+            Ti     = 1.f-G;
+            dt_out = -dG_dt;
+        }
         return Ti;
     }
 };
@@ -2374,6 +2368,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
 				float dT_dA; float dT_dalpha; float dT_dtpeak;
 				const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dA, dT_dalpha, dT_dtpeak);
+				//alpha is a function of tpeak
+				dT_dtpeak += dT_dalpha * (-0.5f * (AA * t * 2.f + BB)) * alpha;
 				float dL_dT_dtmed = (0.5/T_tmed) * blend_data.dL_dmt_dT_dtm;
 				dL_dA += dL_dT_dtmed * (dT_dA + dT_dtpeak * (0.5f * BB*inv_A*inv_A));
 				dL_dB += dL_dT_dtmed * (-0.5f * inv_A) * dT_dtpeak;
