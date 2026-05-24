@@ -36,7 +36,9 @@ struct TransmittanceVacancy {
     __device__ float T(float t) const {
         const float dt      = t - t_peak;
         const float G       = fminf(G_peak * __expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
-        return (t > t_peak) ? v2_Gpeak * 1.f/sqrtf(1.f-G) : sqrtf(1.f-G);
+		const float a = v2_Gpeak * 1.f/sqrtf(1.f-G);
+		const float b = sqrtf(1.f-G);
+        return (t > t_peak) ?  a : b;
     }
 
  // Returns T(t); writes dT/d(AA, G_peak, t_peak) and dT/dt
@@ -44,46 +46,48 @@ struct TransmittanceVacancy {
     __device__ float dT_dGaussian(float t,
                                   float &dAA, float &dG_peak_out,
                                   float &dt_peak_out) const {
+
+									/*
+                    float t_delta      = (mDepth - t_peak) * rsigma;
+                    float G_exp        = expf(-0.5f * t_delta * t_delta);
+                    float Gt           = alpha * G_exp;
+
+                    float dL_dGt           = dL_dmt_dT_dtm * 0.25f / (1.f - Gt);
+                    dL_dGt                 = mDepth > t_peak ? dL_dGt : -dL_dGt;
+                    dL_dGt                 = rsigma > 0 ? dL_dGt : 0.f;
+                    dL_dopa_sigma          = dL_dGt * G_exp - dL_dmt_dT_dtm * (t_delta > 0 ? 0.5f / (1.f - alpha) : 0.f);
+                    float dL_ddelta        = -dL_dGt * Gt * t_delta;
+                    dL_drsigma_local       = dL_ddelta * (mDepth - t_peak);
+                    const float dL_dt_peak = -dL_ddelta * rsigma;
+
+                    dL_dt = dL_dt_peak;
+									*/
+
+
         const float dt          = t - t_peak;
         const float exp_term    = expf(-0.5f * AA * dt * dt);
         const float G           = fminf(G_peak * exp_term, MAX_G);
-        const float vG          = sqrtf(1.f-G);
+		const auto Ti = 1.f-G;
 
-        float Ti, dT_dG;
-        if (t > t_peak) {
-            Ti    = v2_Gpeak * 1.f/sqrtf(1.f-G);
-            dT_dG = Ti / (2.f * (1.f-G));
-            // G_peak appears in numerator (1-G_peak) AND in G — two terms
-            dG_peak_out = -1.f/sqrtf(1.f-G) + dT_dG * exp_term;
-        } else {
-            Ti    = vG;
-            dT_dG = -0.5f / vG;
-            dG_peak_out = dT_dG * exp_term;
-        }
+		const auto dT_dG = dt > 0 ? 1.f : -1.f;
+		dG_peak_out = exp_term * dT_dG - 1 * (dt > 0.f ? exp_term : 0.f);
+		const float dG_dexp_term = G_peak;
+		const float dexp_term_dAA = exp_term * -0.5f*dt*dt;
+		const float dexp_term_dt = exp_term * -1.f*AA*dt;
+		constexpr float dt_dt_peak = -1;
 
-        // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
-        const float dG_dt = G * (-AA * dt);
-        dAA         = dT_dG * G * (-0.5f * dt * dt);
-        float dt_out = (t > t_peak) ? Ti * dG_dt / (2.f * (1.f-G))
-                                   : -dG_dt / (2.f * vG);
-        dt_peak_out = -dt_out; 
-
+		dAA = dexp_term_dAA * dG_dexp_term * dT_dG;
+		dt_peak_out = dt_dt_peak * dexp_term_dt * dG_dexp_term * dT_dG;
         return Ti;
     }
 
     __device__ float dT_dt(float t, float &dt_out) const {
         const float dt      = t - t_peak;
         const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
-        const float vG      = sqrtf(1.f-G);
-        const float dG_dt   = G * (-AA * dt);
-        float Ti;
-        if (t > t_peak) {
-            Ti     = v2_Gpeak * 1.f/sqrtf(1.f-G);
-            dt_out = Ti * dG_dt / (2.f * (1.f-G));
-        } else {
-            Ti     = vG;
-            dt_out = -dG_dt / (2.f * vG);
-        }
+		const auto Ti = 1.f-G;
+		//note G = G_peak * expf(-0.5f*AA*dt*dt)
+        const float dG_dt   = G * (-AA * fabsf(dt)) ;
+		dt_out = -dG_dt * -1;
         return Ti;
     }
 };

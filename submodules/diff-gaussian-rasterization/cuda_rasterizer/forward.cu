@@ -1485,7 +1485,8 @@ integrateCUDA(
 		[[maybe_unused]] float T_blend = 1.0f;
 		[[maybe_unused]] float C[CHANNELS] = { 0.f };
 		
-		float alpha = 0.0f;
+		float alpha = 1.0f;
+		float alpha_final = 0.0f;
 
 		// get point info
 		int p_progress = p_round * BLOCK_SIZE + thread_idx;
@@ -1545,7 +1546,7 @@ integrateCUDA(
 				collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 				for (int ii = 0; ii < VIEW2GAUSSIAN_OFFSET; ii++)
 					collected_view2gaussian[VIEW2GAUSSIAN_OFFSET * block.thread_rank() + ii] = view2gaussian[coll_id * VIEW2GAUSSIAN_OFFSET + ii];
-				if constexpr (MIN_Z_BOUNDING)
+				if constexpr (MIN_Z_BOUNDING && false)
 					collected_gaussiandepth[block.thread_rank()] = __uint_as_float(gaussian_depths[range.x + progress]);
 				if constexpr (RETURN_COLOR) {
 					for (int ii = 0; ii < CHANNELS; ii++)
@@ -1568,7 +1569,7 @@ integrateCUDA(
 				float4 con_o = collected_conic_opacity[j];
 				float* view2gaussian_j = collected_view2gaussian + j * VIEW2GAUSSIAN_OFFSET;
 
-				if constexpr (MIN_Z_BOUNDING) {
+				if constexpr (MIN_Z_BOUNDING && false) {
 					float gaussian_depth = collected_gaussiandepth[j];
 					if (gaussian_depth > current_point_depth) {
 						done = true;
@@ -1587,16 +1588,29 @@ integrateCUDA(
 				double BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
 				float CC = view2gaussian_j[9];
 				
+				const float t_peak = -BB/(2*AA);
 				// depth must be positive otherwise it is not valid and we skip it
-				float tt = fminf(-BB/(2*AA), current_point_depth);
+				const float tt = fminf(t_peak, current_point_depth);
 				double min_value = (AA * tt * tt + BB * tt + CC);
 
 				float power = -0.5f * min_value;
 				if (power > 0.0f){
 					power = 0.0f;
 				}
-
 				float alpha_point = min(0.99f, con_o.w * exp(power));
+
+				float G_peak = [&]()
+				{
+					double min_value = (AA * t_peak * t_peak + BB * t_peak + CC);
+
+					float power = -0.5f * min_value;
+					if (power > 0.0f){
+						power = 0.0f;
+					}
+					float alpha_point = min(0.99f, con_o.w * exp(power));
+					return alpha_point;
+				}();
+
 
 #ifdef DEBUG_INTEGRATE
 				if (point_id == POINT_TO_DEBUG) {
@@ -1604,19 +1618,16 @@ integrateCUDA(
 				}
 #endif 
 
-				if (alpha_point < 1.0f / ALPHA_THRESHOLD_INV) {
+				if (G_peak < 1.0f / ALPHA_THRESHOLD_INV) {
 					continue;
 				}
+
+				TransmittanceVacancy transmittance_helper(AA, G_peak, t_peak);
+				alpha *= transmittance_helper.T(tt);
+
 				if constexpr (RETURN_COLOR) {
 					// t is the depth of the gaussian
-					float t = -BB/(2*AA);
-					min_value = (AA * t * t + BB * t + CC);
-
-					power = -0.5f * min_value;
-					if (power > 0.0f){
-						power = 0.0f;
-					}
-					float alpha_blend = min(0.99f, con_o.w * exp(power));
+					float alpha_blend = G_peak;
 					float test_T = T_blend * (1 - alpha_blend);
 					if (test_T >= 0.0001f) {
 						for (int ch = 0; ch < CHANNELS; ch++) {
@@ -1625,23 +1636,23 @@ integrateCUDA(
 					}
 					T_blend = test_T;
 				}
-				
-				alpha += alpha_point * T;
 
 
 				// hmm, isnt this already opa
-				T *= (1 - alpha_point);
+				T *= (1 - G_peak);
+				if(T < 0.0001f) done = true;
 
-				if constexpr (ALPHA_EARLY_STOP && !RETURN_COLOR) {
-					if (alpha > 0.5000001f) {
+				if constexpr (false && ALPHA_EARLY_STOP && !RETURN_COLOR) {
+					if (alpha < 0.5f) {
 						done = true;
 					}
 				}
 
 			}
 		}
+		alpha_final = 1-alpha;
 		if (active) {
-			out_alpha_integrated[point_id] = fminf(alpha, out_alpha_integrated[point_id]);
+			out_alpha_integrated[point_id] = fminf(alpha_final, out_alpha_integrated[point_id]);
 #ifdef DEBUG_OPACITY_FIELD
 			// filter out the really wrong one
 			if (alpha < 0.5f) {

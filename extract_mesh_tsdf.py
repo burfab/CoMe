@@ -102,7 +102,7 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
     makedirs(render_path, exist_ok=True)
     o3d_device = o3d.core.Device("CUDA:0")
     # = 0.002
-    ALPHA_THRESH=0.1
+    ALPHA_THRESH=0.0
     
     vbg = o3d.t.geometry.VoxelBlockGrid(
             attr_names=('tsdf', 'weight', 'color'),
