@@ -791,6 +791,7 @@ void CudaRasterizer::Rasterizer::backward(
 			imgState.n_contrib,\
 			pixel_colors,\
 			dL_dpix,\
+			(float3*)dL_dmean2D, (float4*)dL_dconic, dL_dopacity, dL_dview2gaussian,\
 			dL_dextra_features
 
           switch (splatting_settings.blend_extra_features) {

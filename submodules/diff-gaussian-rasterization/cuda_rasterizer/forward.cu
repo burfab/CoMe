@@ -1041,10 +1041,12 @@ ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatt
 
 	if (splatting_settings.culling_settings.hierarchical_4x4_culling) {
 		CALL_HIER_MID(true);
-		CALL_HIER_MID_BINARY_SEARCH(true);
+		if(splatting_settings.render_geometry)
+			CALL_HIER_MID_BINARY_SEARCH(true);
 	} else {
 		CALL_HIER_MID(false);
-		CALL_HIER_MID_BINARY_SEARCH(false);
+		if(splatting_settings.render_geometry)
+			CALL_HIER_MID_BINARY_SEARCH(false);
 	}
 
 #undef CALL_HIER_MID_BINARY_SEARCH

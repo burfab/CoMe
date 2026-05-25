@@ -397,6 +397,13 @@ def fuse_fragments(fragments1:Fragments, fragments2:Fragments):
         pix_to_face,
     )
 
+def return_delaunay_tets(points: torch.Tensor, method: str) -> torch.Tensor:
+    from tetranerf.utils.extension import cpp
+    if method == "tetranerf":
+        with torch.no_grad():
+            return cpp.triangulate(points.detach()).cuda().long()
+    else:
+        raise ValueError(f"Invalid method: {method}")
     
 class ScalableMeshRenderer(torch.nn.Module):
     """

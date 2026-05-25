@@ -1172,16 +1172,16 @@ void BACKWARD::render(
 	}
 	else if (splatting_settings.sort_settings.sort_mode == SortMode::HIERARCHICAL)
 	{
-#define CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DETACH_ALPHA, EXACT_DEPTH) \
-	sortGaussiansRayHierarchicalCUDA_backward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, DETACH_ALPHA, EXACT_DEPTH><<<grid, {16, 4, 4}>>>( \
+#define CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DETACH_ALPHA, EXACT_DEPTH, RENDER_GEOMETRY) \
+	sortGaussiansRayHierarchicalCUDA_backward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, DETACH_ALPHA, EXACT_DEPTH, RENDER_GEOMETRY, RENDER_GEOMETRY><<<grid, {16, 4, 4}>>>( \
 		ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.detach_alpha_extent, splatting_settings.include_alpha, view2gaussian, bg_color, means2D, cov3D_inv, projmatrix_inv, (float3*) cam_pos, conic_opacity, \
 		colors, final_Ts, n_contrib, pixel_colors, gt_colors,  dL_dpixels, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dconfidences, dL_dview2gaussian)
 
-#define CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE) \
-if (splatting_settings.detach_alpha && splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true, true); } \
-if (splatting_settings.detach_alpha && !splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true, false); }\
-if (!splatting_settings.detach_alpha && splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, false, true); }\
-else { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, false, false); }
+#define CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, RENDER_GEOMETRY) \
+if (splatting_settings.detach_alpha && splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true, true, RENDER_GEOMETRY); } \
+if (splatting_settings.detach_alpha && !splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true, false, RENDER_GEOMETRY); }\
+if (!splatting_settings.detach_alpha && splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, false, true, RENDER_GEOMETRY); }\
+else { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, false, false, RENDER_GEOMETRY); }
 
 #ifndef STOPTHEPOP_FASTBUILD
 #define CALL_HIER_HEAD(HIER_CULLING, MID_QUEUE_SIZE) \
@@ -1203,25 +1203,36 @@ else { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, fals
 		default: { throw std::runtime_error("Not supported mid queue size " + std::to_string(splatting_settings.sort_settings.queue_sizes.tile_2x2)); } \
 	}
 #else
-#define CALL_HIER_HEAD(HIER_CULLING, MID_QUEUE_SIZE) \
+#define CALL_HIER_HEAD(HIER_CULLING, MID_QUEUE_SIZE, RENDER_GEOMETRY) \
 	switch (splatting_settings.sort_settings.queue_sizes.per_pixel) \
 	{ \
-		case 4: { CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, 4); break; } \
+		case 4: { CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, 4, RENDER_GEOMETRY); break; } \
 		default: { throw std::runtime_error("Not supported head queue size " + std::to_string(splatting_settings.sort_settings.queue_sizes.per_pixel)); } \
 	}
 
-#define CALL_HIER_MID(HIER_CULLING) \
+#define CALL_HIER_MID(HIER_CULLING, RENDER_GEOMETRY) \
 	switch (splatting_settings.sort_settings.queue_sizes.tile_2x2) \
 	{ \
-		case 8: { CALL_HIER_HEAD(HIER_CULLING, 8); break; } \
+		case 8: { CALL_HIER_HEAD(HIER_CULLING, 8, RENDER_GEOMETRY); break; } \
 		default: { throw std::runtime_error("Not supported mid queue size " + std::to_string(splatting_settings.sort_settings.queue_sizes.tile_2x2)); } \
-	}
+	}\
+
 #endif // STOPTHEPOP_FASTBUILD
 
 	if (splatting_settings.culling_settings.hierarchical_4x4_culling) {
-		CALL_HIER_MID(true);
+		if(splatting_settings.render_geometry){
+			CALL_HIER_MID(true, true)
+		}
+		else{
+			CALL_HIER_MID(true, false)
+		}
 	} else {
-		CALL_HIER_MID(false);
+		if(splatting_settings.render_geometry){
+			CALL_HIER_MID(false, true)
+		}
+		else {
+			CALL_HIER_MID(false, false)
+		}
 	}
 
 #undef CALL_HIER_MID

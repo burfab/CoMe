@@ -93,6 +93,7 @@ def gui_visualize(
     other_args,
     segmentation=None,
     segmentation_network = None,
+    learned_normals=None,
     occupation = None,
     occupation2 = None
 ):
@@ -108,6 +109,7 @@ def gui_visualize(
     render_color_variance = indict("render_color_variance")
     render_normal_variance = indict("render_normal_variance")
     render_segmentation = other_args["custom_message"].startswith("segmentation")
+    render_learned_normals = other_args["custom_message"].startswith("learned_normals")
     if render_segmentation:
         if other_args["custom_message"].find("_class") != -1:
             image = segmentation_network(segmentation.unsqueeze(0))
@@ -194,7 +196,16 @@ def gui_visualize(
             I = (nabla_I.max() - nabla_I) / (nabla_I.max() - nabla_I.min() + 1e-12)
             normal_error = (I * normal_error)
         return torch.tensor(cmap(normal_error.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
-        
+    elif render_learned_normals:               
+        # to view space
+        view_space_normal = False 
+        normals_to_render = learned_normals
+        if view_space_normal:
+            w2c = render_cam.world_view_transform[:3,:3]
+            learned_normals_cam = w2c @ learned_normals.reshape(3, -1)
+            learned_normals_cam = learned_normals_cam.reshape(3, *learned_normals.shape[1:])
+            normals_to_render = learned_normals_cam
+        return (-normals_to_render + 1) / 2
     elif render_depth_normal:               
         # depth to normal
         depth_normal, _ = depth_to_normal(render_cam, depth)

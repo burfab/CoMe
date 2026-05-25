@@ -115,7 +115,19 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
         
     # get confidence
     confidences = torch.exp(pc.get_confidence)
-    segmentation = torch.zeros((0,0)).float().to(confidences.device).requires_grad_(False) if splat_args.blend_extra_features == 0 else pc.get_segmentation
+    
+    if splat_args.render_learned_normals: assert splat_args.blend_extra_features >= 3
+    
+    if splat_args.blend_extra_features == 0:
+        extra_features = torch.zeros((0,0)).float().to(confidences.device).requires_grad_(False) 
+    elif splat_args.render_learned_normals:
+        extra_features = pc.get_learned_normals 
+        if splat_args.blend_extra_features > 3:
+            assert splat_args.blend_extra_features == pc.segmentation_dimension + 3
+            extra_features = torch.stack(extra_features, pc.get_segmentation)
+    elif splat_args.blend_extra_features > 0:
+        assert splat_args.blend_extra_features == pc.segmentation_dimension
+        extra_features = pc.get_segmentation 
     
     if gaussians_mask is not None:
         opacity = gaussians_mask * opacity
@@ -131,7 +143,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe : PipelineParams, bg_color
         scales = scales,
         rotations = rotations,
         confidences = confidences,
-        extra_features = segmentation,
+        extra_features = extra_features,
         cov3D_precomp = cov3D_precomp,
         view2gaussian_precomp=view2gaussian_precomp,
         filter_3d = filter_3d,
@@ -248,7 +260,18 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
 
     # get confidence
     confidences = torch.exp(pc.get_confidence)
-    segmentation = torch.zeros((0,0)).float().to(confidences.device).requires_grad_(False) if splat_args.blend_extra_features == 0 else pc.get_segmentation
+    if splat_args.render_learned_normals: assert splat_args.blend_extra_features >= 3
+    if splat_args.blend_extra_features == 0:
+        extra_features = torch.zeros((0,0)).float().to(confidences.device).requires_grad_(False) 
+    elif splat_args.render_learned_normals:
+        assert splat_args.blend_extra_features >= 3
+        extra_features = pc.get_learned_normals 
+        if splat_args.blend_extra_features > 3:
+            assert splat_args.blend_extra_features == pc.segmentation_dimension + 3
+            extra_features = torch.stack(extra_features, pc.get_segmentation)
+    elif splat_args.blend_extra_features > 0:
+        assert splat_args.blend_extra_features == pc.segmentation_dimension
+        extra_features = pc.get_segmentation 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     rendered_image, radii, max_weights, accum_alpha = rasterizer(
@@ -260,7 +283,7 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
         scales = scales,
         rotations = rotations,
         confidences = confidences,
-        extra_features=segmentation,
+        extra_features=extra_features,
         cov3D_precomp = cov3D_precomp,
         view2gaussian_precomp=view2gaussian_precomp,
         filter_3d=filter_3d, extract_final_T=extract_final_T

@@ -202,6 +202,7 @@ class GaussianModel:
 
 
     def __init__(self, sh_degree : int, use_SBs : bool = False):
+        self.cnt_learned_normals_features = 4
         self.segmentation_dimension = 8
         self.active_sh_degree = 0
         self.max_sh_degree = sh_degree  
@@ -211,6 +212,7 @@ class GaussianModel:
         self._scaling = torch.empty(0)
         self._rotation = torch.empty(0)
         self._opacity = torch.empty(0)
+        self._learned_normals_features = torch.empty(0)
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
@@ -249,6 +251,7 @@ class GaussianModel:
             self._scaling,
             self._rotation,
             self._confidence,
+            self._learned_normals_features,
             self._segmentation,
             self._opacity,
             self.max_radii2D,
@@ -267,6 +270,7 @@ class GaussianModel:
         self._scaling, 
         self._rotation, 
         self._confidence,
+        self._learned_normals_features,
         self._segmentation,
         self._opacity,
         self.max_radii2D, 
@@ -331,6 +335,66 @@ class GaussianModel:
     @property
     def get_confidence(self):
         return self._confidence
+    
+    @property
+    def get_learned_normals(self):
+        return self.convert_features_to_normals(True, None)
+    
+    @property
+    def get_smallest_axis(self):
+        # Get scaling
+        scaling = self.get_scaling_with_3D_filter  # (N, 3)
+        
+        # Get index of axis with smallest scaling
+        min_axis_idx = torch.argmin(scaling, dim=-1, keepdim=True)  # (N, 1)
+        
+        # Get rotation matrices
+        rotation_matrices = build_rotation(self._rotation)  # (N, 3, n_axes)
+        
+        # Get smallest axis as the corresponding column of the rotation matrix
+        smallest_axis = torch.gather(
+            input=rotation_matrices,  # (N, 3, n_axes)
+            dim=-1,
+            index=min_axis_idx.unsqueeze(1).repeat(1, 3, 1),  # (N, 3, 1)
+        ).squeeze(-1)  # (N, 3)
+        
+        return smallest_axis 
+    
+    #Warning, these normals are not normalized even if normalize is True!!! normalize just normalizes the directions
+    def convert_features_to_normals(self, normalize: bool = True, use_smallest_axis: bool = None):
+        assert self.cnt_learned_normals_features
+        
+        # If None, falls back to default behavior:
+        # - If n_gaussian_features == 1, use the smallest axis
+        # - If n_gaussian_features == 4, use the full learnable normals
+        if use_smallest_axis is None:
+            assert self.cnt_learned_normals_features in [1, 4], "Invalid number of Gaussian features"
+            use_smallest_axis = self.cnt_learned_normals_features == 1
+        
+        # Check that the number of Gaussian features is consistent with the chosen mode
+        if use_smallest_axis:
+            assert self.cnt_learned_normals_features == 1
+        else:
+            assert self.cnt_learned_normals_features == 4
+            
+        # Get the Gaussian features
+        features = self._learned_normals_features
+        
+        # Get the normal directions
+        if use_smallest_axis:
+            normal_directions = self.get_smallest_axis  # (N_gaussians, 3)
+        else:
+            normal_directions = features[:, :3]  # (N_gaussians, 3)
+            if normalize:
+                normal_directions = torch.nn.functional.normalize(normal_directions, dim=-1)
+
+        # Get the normal signs
+        normal_signs = torch.tanh(features[:, -1:])  # (N_gaussians, 1)
+
+        # Get the normal vectors by multiplying the directions and signs
+        feature_normals = normal_directions * normal_signs  # (N_gaussians, 3)
+        return feature_normals 
+    
     
     @property
     def get_segmentation(self):
@@ -463,6 +527,11 @@ class GaussianModel:
         self._confidence = nn.Parameter(
             torch.zeros_like(self._opacity)
         ).requires_grad_(True)
+        
+        self._learned_normals_features = nn.Parameter(
+            torch.zeros((fused_point_cloud.shape[0], self.cnt_learned_normals_features)).to(self._opacity.device).float().requires_grad_(True)
+        ).requires_grad_(True)
+        
         #per-Gaussian segmentation
         self._segmentation = nn.Parameter(
             torch.randn((fused_point_cloud.shape[0], self.segmentation_dimension)).to(self._opacity.device).float()
@@ -506,6 +575,8 @@ class GaussianModel:
             {'params': [self._segmentation], 'lr': training_args.segmentation_lr, "name": "segmentation"},
 
         ]
+        if self.cnt_learned_normals_features > 0:
+            l+=[{'params': [self._learned_normals_features], 'lr': training_args.learned_normals_lr, "name": "learned_normals_features"}]
         if appearance_net is not None:
             if isinstance(appearance_net, VastGaussianAppearanceEmbedding):
                 l += [
@@ -576,6 +647,8 @@ class GaussianModel:
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
         l.append('confidence')
+        for i in range(self.cnt_learned_normals_features):
+            l.append(f'learned_normals_features_{i}')
         for i in range(self.segmentation_dimension):
             l.append(f'segmentation_{i}')
         l.append('filter_3D')
@@ -597,12 +670,13 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
         confidence = self._confidence.detach().cpu().numpy()
+        learned_normals_features = self._learned_normals_features.detach().cpu().numpy()
         segmentation = self._segmentation.detach().cpu().numpy()
         filter_3D = self.filter_3D.detach().cpu().numpy()
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, confidence, segmentation, filter_3D), axis=1)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, confidence, learned_normals_features, segmentation, filter_3D), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -615,6 +689,43 @@ class GaussianModel:
     def reset_confidence(self):
         optimizable_tensors = self.replace_tensor_to_optimizer(torch.zeros_like(self._confidence), "confidence")
         self._confidence = optimizable_tensors["confidence"]
+        
+    @torch.no_grad()
+    def reset_learned_normal_features(self, reset_directions: bool = True, reset_signs: bool = True):
+        assert self.cnt_learned_normals_features > 0
+        assert self.cnt_learned_normals_features  in [1,4]
+        
+        new_normal_features = self._learned_normals_features.clone()
+        # Reset the normal signs to 0
+        if reset_signs:
+            new_normal_features[:, -1:] = 0.0
+        
+        # Reset the normal directions to shortest Gaussian axis
+        if reset_directions:
+            if self.cnt_learned_normals_features == 1:
+                pass
+            elif self.cnt_learned_normals_features == 4:
+                # Reset the normal directions to shortest Gaussian axis
+                #   > Get min scale
+                scale = self.get_scaling_with_3D_filter  # (N_gaussians, 3)
+                min_scaling_idx = torch.argmin(scale, dim=-1, keepdim=True)  # (N_gaussians, 1)
+                #   > Get rotation matrix
+                rotation_matrices = build_rotation(self._rotation)  # (N_gaussians, 3, 3)
+                #   > Get column of rotation matrix corresponding to min scale
+                gaussian_shortest_axis = torch.gather(
+                    input=rotation_matrices,  # (N_gaussians, 3, 3)
+                    index=min_scaling_idx.unsqueeze(1).repeat(1, 3, 1),  # (N_gaussians, 3, 1)
+                    dim=2,
+                ).squeeze(-1)  # (N_gaussians, 3)
+                
+                new_normal_features[:, :3] = gaussian_shortest_axis
+            
+            else:
+                raise ValueError(f"Invalid number of Gaussian features: {self.cnt_learned_normals_features}") 
+            
+            
+        optimizable_tensors = self.replace_tensor_to_optimizer(new_normal_features, "learned_normals_features")
+        self._learned_normals_features = optimizable_tensors["learned_normals_features"]
 
     def reset_opacity(self):
         # reset opacity by considering 3D filter
@@ -708,6 +819,9 @@ class GaussianModel:
         segmentation_names = sorted(segmentation_names, key = lambda x: int(x.split('_')[-1]))
         self.segmentation_dimension = len(segmentation_names)
         
+        learned_normals_features_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("learned_normals_features_")]
+        learned_normals_features_names = sorted(learned_normals_features_names, key = lambda x: int(x.split('_')[-1]))
+        self.cnt_learned_normals_features = len(learned_normals_features_names)
 
         filter_3D = None
         if "filter_3D" in plydata.elements[0]:
@@ -719,12 +833,17 @@ class GaussianModel:
         if "confidence" in plydata.elements[0]:
             confidence = np.asarray(plydata.elements[0]["confidence"])[..., np.newaxis]
             self._confidence = nn.Parameter(torch.tensor(confidence, dtype=torch.float, device="cuda").requires_grad_(True))
+            
+        learned_normals_features = None if self.cnt_learned_normals_features == 0 else np.zeros((xyz.shape[0], self.cnt_learned_normals_features))
+        for idx, attr_name in enumerate(learned_normals_features_names):
+            learned_normals_features[:, idx] = np.asarray(plydata.elements[0][attr_name])
+        if self.cnt_learned_normals_features > 0:
+            self._learned_normals_features = nn.Parameter(torch.tensor(learned_normals_features, dtype=torch.float, device="cuda").requires_grad_(True))
+            
         
         segmentation = None if self.segmentation_dimension == 0 else np.zeros((xyz.shape[0], self.segmentation_dimension))
         for idx, attr_name in enumerate(segmentation_names):
             segmentation[:, idx] = np.asarray(plydata.elements[0][attr_name])
-            
-            
         if self.segmentation_dimension > 0:
             self._segmentation = nn.Parameter(torch.tensor(segmentation, dtype=torch.float, device="cuda").requires_grad_(True))
 
@@ -785,6 +904,11 @@ class GaussianModel:
                 continue
             if group["name"] == name:
                 stored_state = self.optimizer.state.get(group['params'][0], None)
+                if stored_state is None:
+                    print("WARNING, stored state is None")
+                    group["params"][0] = nn.Parameter(tensor.requires_grad_(True))
+                    optimizable_tensors[group["name"]] = group["params"][0]
+                    break
                 stored_state["exp_avg"] = torch.zeros_like(tensor)
                 stored_state["exp_avg_sq"] = torch.zeros_like(tensor)
 
@@ -826,6 +950,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._confidence = optimizable_tensors["confidence"]
+        self._learned_normals_features = optimizable_tensors["learned_normals_features"]
         self._segmentation = optimizable_tensors["segmentation"]
 
         self.xyz_gradient_accum = self.xyz_gradient_accum[valid_points_mask]
@@ -884,7 +1009,7 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter3d,reset_params=True):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_learned_normals_features, new_segmentation, new_tmp_radii, new_filter3d,reset_params=True):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -892,6 +1017,7 @@ class GaussianModel:
         "scaling" : new_scaling,
         "rotation" : new_rotation,
         "confidence" : new_confidence,
+        "learned_normals_features" : new_learned_normals_features,
         "segmentation" : new_segmentation,
         }
 
@@ -903,6 +1029,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
         self._confidence = optimizable_tensors["confidence"]
+        self._learned_normals_features = optimizable_tensors["learned_normals_features"]
         self._segmentation = optimizable_tensors["segmentation"]
         if self.tmp_radii is None:
             self.tmp_radii = torch.zeros((self.get_xyz.shape[0] - new_tmp_radii.shape[0]), device="cuda")
@@ -952,6 +1079,7 @@ class GaussianModel:
         new_scaling_list = []
         new_rotation_list = []
         new_confidence_list = []
+        new_learned_normals_features_list = []
         new_segmentation_list = []
         new_radii_list = []
         new_filter_3D_list = []
@@ -1030,6 +1158,7 @@ class GaussianModel:
         new_filter_3D = self.filter_3D[split_indices].repeat_interleave(repeats, dim=0)
         new_densify_count = (self.densify_count[split_indices] + 1).repeat_interleave(repeats)
         new_confidence = self._confidence[split_indices].repeat_interleave(repeats, dim=0)
+        new_learned_normals_features = self._learned_normals_features[split_indices].repeat_interleave(repeats, dim=0)
         new_segmentation = self._segmentation[split_indices].repeat_interleave(repeats, dim=0)
 
         # 2. Generate Grid Coordinates
@@ -1100,6 +1229,7 @@ class GaussianModel:
         new_opacity_list.append(new_opacity)
         new_radii_list.append(new_radii)
         new_confidence_list.append(new_confidence)
+        new_learned_normals_features_list.append(new_learned_normals_features)
         new_segmentation_list.append(new_segmentation)
         new_filter_3D_list.append(new_filter_3D)
         new_densify_count_list.append(new_densify_count)
@@ -1123,6 +1253,7 @@ class GaussianModel:
                 torch.cat(new_scaling_list),
                 torch.cat(new_rotation_list),
                 torch.cat(new_confidence_list),
+                torch.cat(new_learned_normals_features_list),
                 torch.cat(new_segmentation_list),
                 torch.cat(new_radii_list),
                 torch.cat(new_filter_3D_list)
@@ -1184,13 +1315,14 @@ class GaussianModel:
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
         new_filter_3D = self.filter_3D[selected_pts_mask]
         new_confidence = self._confidence[selected_pts_mask]
+        new_learned_normals_features = self._learned_normals_features[selected_pts_mask]
         new_segmentation = self._segmentation[selected_pts_mask]
         
         # [NEW] Clone inherits parent's densify_count (no increment)
         parent_counts = self.densify_count[selected_pts_mask]
         n_old = self.get_xyz.shape[0]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter_3D)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_learned_normals_features, new_segmentation, new_tmp_radii, new_filter_3D)
         
         # Overwrite the zeros appended by densification_postfix with inherited counts
         n_new = new_xyz.shape[0]
@@ -1354,12 +1486,13 @@ class GaussianModel:
         
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_confidence = self._confidence[selected_pts_mask].repeat(N,1)
+        new_learned_normals_features = self._learned_normals_features[selected_pts_mask].repeat(N,1)
         new_segmentation = self._segmentation[selected_pts_mask].repeat(N,1)
         
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
         new_filter_3D = self.filter_3D[selected_pts_mask].repeat(N, 1)
         
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter_3D)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_confidence, new_learned_normals_features, new_segmentation, new_tmp_radii, new_filter_3D)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -1396,12 +1529,13 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_confidence = self._confidence[selected_pts_mask]
+        new_learned_normals_features = self._learned_normals_features[selected_pts_mask]
         new_segmentation = self._segmentation[selected_pts_mask]
         
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
         new_filter_3D = self.filter_3D[selected_pts_mask] 
         
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_segmentation, new_tmp_radii, new_filter_3D)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_confidence, new_learned_normals_features, new_segmentation, new_tmp_radii, new_filter_3D)
 
     def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii, abs_grad_for_densification=False, clone_with_sampling=False):
         self.tmp_radii = radii
@@ -1463,6 +1597,7 @@ class GaussianModel:
             "scaling" : self._scaling,
             "rotation" : self._rotation,
             "confidence" : self._confidence,
+            "learned_normals_features" : self._learned_normals_features,
             "segmentation" : self._segmentation
             }
         optimizable_tensors = {}
@@ -1492,6 +1627,7 @@ class GaussianModel:
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"] 
         self._confidence = optimizable_tensors["confidence"]
+        self._learned_normals_features = optimizable_tensors["learned_normals_features"]
         self._segmentation = optimizable_tensors["segmentation"]
         torch.cuda.empty_cache()
         return optimizable_tensors

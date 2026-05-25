@@ -182,6 +182,7 @@ namespace CudaRasterizer
         bool proper_ewa_scaling;
 		// new stuff
         bool exact_depth;
+        bool render_geometry;
         bool detach_alpha;
 		float far_plane;
 		bool detach_alpha_extent;
@@ -233,6 +234,7 @@ namespace CudaRasterizer
             {"load_balancing", s.load_balancing},
             {"proper_ewa_scaling", s.proper_ewa_scaling},
             {"exact_depth", s.exact_depth},
+            {"render_geometry", s.render_geometry},
             {"detach_alpha", s.detach_alpha},
             {"far_plane", s.far_plane},
             {"detach_alpha_extent", s.detach_alpha_extent},
@@ -272,6 +274,7 @@ namespace CudaRasterizer
         j.at("load_balancing").get_to(s.load_balancing);
         j.at("proper_ewa_scaling").get_to(s.proper_ewa_scaling);
         j.at("exact_depth").get_to(s.exact_depth);
+        j.at("render_geometry").get_to(s.render_geometry);
         j.at("detach_alpha").get_to(s.detach_alpha);
         j.at("far_plane").get_to(s.far_plane);
         j.at("detach_alpha_extent").get_to(s.detach_alpha_extent);
@@ -370,7 +373,7 @@ namespace CudaRasterizer
                    char *image_buffer, const float *dL_dpix, float *dL_dmean2D,
                    float *dL_dconic, float *dL_dopacity, float *dL_dcolor,
                    float *dL_dmean3D, float *dL_dcov3D, float *dL_dsh,
-                   float *dL_dscale, float *dL_drot, float *dL_dconfidences,
+                   float *dL_dscale, float *dL_drot, float *dL_dconfidences, 
                    float *dL_dextra_features, float *dL_dview2gaussian,
                    bool debug);
 

@@ -28,6 +28,7 @@ from utils.vis_utils import gui_visualize, export_image
 from utils import segmentation_utils
 from utils import deform_utils
 from utils import densify_utils
+import utils.normal_field 
 from scene.gaussian_model import build_scaling_rotation
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
 from decoupled_fused_ssim import fused_ssim
@@ -173,7 +174,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         "occupation_lambda": 10,
         "variational_depth_normal_fusion_lambda": 0.000,
         "depth_smoothness": 0* 0.001 * (1/scene.cameras_extent),
-        "surface_L_lambda": 0
+        "surface_L_lambda": 0,
+        "learned_normal_error": 0.05 * 0.6 #thats what they have even though they set it to 0.05 ,but they also have some ratio thats 0.6
         }
     batch = None
     
@@ -181,10 +183,27 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
     
     gaussians.compute_3D_filter(cameras=trainCameras, CUDA=not pipe.compute_filter3D_python)
+    
+    normal_field_state = utils.normal_field.initialize_normal_field(
+        scene=scene,
+    ) 
+    
+    
+    
     viewpoint_stack = None
     ema_loss_for_log = 0.0
+    ema_normal_field_alignment_loss_for_log = 0.0
+    ema_front_pivots_visibility_loss_for_log = 0.0
+    ema_back_pivots_occlusion_loss_for_log = 0.0
+    ema_gaussian_flattening_loss_for_log = 0.0
+    ema_sdf_and_normal_field_consistency_loss_for_log = 0.0 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
+    
+    
+    
+    
+    
     for iteration in range(first_iter, opt.iterations + 1):        
         if batch is None or batch.complete():
             batch = BatchStats(opt.batch_size,gaussians.get_xyz.device)
@@ -202,7 +221,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                         deformation = deform_model.deformation(gaussians, deform_time) if deform_time >= 0 else deform_utils.Deformation()
                         
                         render_segmentation = message["custom_message"].startswith("segmentation")
-                        splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
+                        splat_args.render_learned_normals = message["custom_message"].startswith("learned_normals")
+                        splat_args.blend_extra_features = (gaussians.segmentation_dimension if render_segmentation else 0) + (3 if splat_args.render_learned_normals else 0)
                         
                         gaussians_mask = None
                         if message["custom_message"] == "no_bg_gaussians":
@@ -228,6 +248,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                             other_args=message,
                             occupation=net_image[13:14],
                             occupation2=net_image[14:15],
+                            learned_normals=net_image[15:18] if splat_args.render_learned_normals else None,
                             segmentation=None if not render_segmentation else net_image[-gaussians.segmentation_dimension:],
                             segmentation_network = segmentation_network
                         )
@@ -245,14 +266,18 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 print(e)
                 network_gui.conn = None
                 
+        if iteration == mesh.normal_field_from_iter: gaussians.reset_learned_normal_features()
+            
         bg = torch.rand((3), device="cuda") if opt.random_background else background
-        if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
         if iteration % opt.self_generated_masks_interval == 0 and iteration > 0 or (iteration == first_iter and first_iter >= opt.self_generated_masks_interval):
             with torch.no_grad():
                 all_cameras = scene.getTrainCameras().copy()
                 import cv2
                 cv2.namedWindow("MASK", cv2.WINDOW_NORMAL)
                 for c in tqdm(all_cameras):
+                    splat_args.render_learned_normals = False
+                    splat_args.render_geometry = True
+                    splat_args.blend_extra_features = 0
                     render_pkg = render(c, gaussians, pipe, bg, splat_args=splat_args, gt_color=None, deformation=deform_utils.Deformation(), extract_final_T=True)
                     mask = 1-render_pkg["final_T"].squeeze(0)
                     masks_selfgenerated[c.uid] = mask.detach().cpu() #torch.nn.functional.sigmoid((mask.detach()- 0.9) * 20).cpu()  
@@ -266,6 +291,10 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     cv2.waitKey(1)
                 cv2.destroyAllWindows()
         if iteration == opt.reset_confidence_iteration: gaussians.reset_confidence()
+        normal_field_kick_on = (iteration >= mesh.normal_field_from_iter) 
+        if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
+        
+        if normal_field_kick_on: splat_args.render_learned_normals = True
                 
 
         iter_start.record()
@@ -291,6 +320,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
+        if iteration > (mesh.depth_normal_from_iter and mesh.lambda_depth_normal > 0.0) or normal_field_kick_on:
+            splat_args.render_geometry = True
+            
         if iteration > mesh.distortion_from_iter and mesh.lambda_opacity_field > 0.0:
             splat_args.render_opacity = True
 
@@ -298,7 +330,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         # not sure we need detach here
         
         render_segmentation = (iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0) and False
-        splat_args.blend_extra_features = gaussians.segmentation_dimension if render_segmentation else 0
+        splat_args.blend_extra_features = (gaussians.segmentation_dimension if render_segmentation else 0 + (3 if splat_args.render_learned_normals else 0))
         
         if iteration >= opt.deform_first_step:
             deformation = deform_model.deformation(gaussians, viewpoint_cam.uid/(number_views_for_deform_model-1))
@@ -382,6 +414,11 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         occupation = rendering[13:14]
         occupation2 = rendering[14:15]
         
+        learned_normals = None
+        if splat_args.render_learned_normals:
+            learned_normals = rendering[15:18]
+            #Don't normalize them!
+        
         
             
         # depth distortion regularization
@@ -403,6 +440,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         
         mask_no_normal1 = (depth_normal == torch.zeros_like(depth_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
         mask_no_normal2 = (render_normal == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
+        mask_no_normal3 = None if learned_normals is None else (learned_normals == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
         mask_no_normal = mask_no_normal1 | mask_no_normal2
         
         c2w = (viewpoint_cam.world_view_transform)
@@ -461,6 +499,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         rgb_to_gray = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32, device=gt_image.device)[:,None,None]
         surface_L = (((occupation2 - (gt_image * rgb_to_gray).sum(0,keepdim=True))**2)*2 + ((occupation2 - (image * rgb_to_gray).sum(0,keepdim=True))**2))
         
+        
+        
+        
+        
+        
+        
         if iteration < opt.position_lr_max_steps:
             loss =  rgb_loss_mean + \
                     depth_normal_loss    * lambda_depth_normal + \
@@ -479,6 +523,14 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
                     (temp_lambdas["surface_L_lambda"] if iteration >= mesh.distortion_from_iter else 0) * (surface_L*mask).mean() + \
                     lambda_depth_smoothness * depth_smoothness_loss
+                    
+                    
+            if normal_field_kick_on:
+                normal3 = c2w[:3, :3] @ learned_normals.reshape(3, -1)
+                render_learned_normal_world = normal3.reshape(3, *learned_normals.shape[1:])
+                learned_normal_error = (1 - (render_learned_normal_world * depth_normal).sum(dim=0)) * (~(mask_no_normal1).squeeze(0) * mask)
+                loss = loss + learned_normal_error.mean() * temp_lambdas["learned_normal_error"]
+                    
                     #freq_loss * opt.lambda_freq
         else:
             loss = rgb_loss_mean

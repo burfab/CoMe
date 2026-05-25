@@ -295,6 +295,7 @@ class ExtendedSettings:
     meshing_settings : MeshingSettings = MeshingSettings()
     load_balancing : bool = False
     proper_ewa_scaling : bool = False
+    render_geometry : bool = False
     exact_depth : bool = True
     detach_alpha : bool = True
     far_plane : float = 100.
@@ -302,6 +303,7 @@ class ExtendedSettings:
     include_alpha : bool = False
     render_opacity : bool = True
     blend_extra_features: int = 0
+    render_learned_normals: bool = False
 
     consider_max_weight : bool = False
     

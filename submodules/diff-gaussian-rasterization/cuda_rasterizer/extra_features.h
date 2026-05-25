@@ -25,6 +25,7 @@ public:
                      const float *view2gaussian, const float *viewmatrix,
                      const float *final_Ts, const uint32_t *n_contrib,
                      const float *pixel_colors, const float *dL_dpixels,
+                    float3* dL_dmean2D, float4* dL_dconic2D, float* dL_dopacity, float* dL_dview2gaussian,
                      float *dL_dextra_features) {
     using namespace CudaRasterizer;
 #define CALL_KBUFFER(WINDOW) throw std::runtime_error("Not Impl")
@@ -66,7 +67,7 @@ public:
       splatting_settings.far_plane, view2gaussian, means2D, cov3D_inv,         \
       projmatrix_inv, (float3 *)cam_pos, conic_opacity, bg_color,              \
       extra_features, final_Ts, n_contrib, pixel_colors, dL_dpixels,           \
-      dL_dextra_features)
+      dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dview2gaussian,dL_dextra_features)
 
 #define CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE)               \
   if (splatting_settings.detach_alpha) {                                       \

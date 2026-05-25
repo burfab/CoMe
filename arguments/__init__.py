@@ -195,6 +195,7 @@ class OptimizationParams(ParamGroup):
         self.position_lr_max_steps = 30_000
         self.feature_lr = 0.0025 * 3
         self.confidence_lr = 0.00025 * 3
+        self.learned_normals_lr = 0.05/2.0
         self.segmentation_lr = 1e-3 
         self.segmentation_network_lr = 1e-4
         self.segmentation_network_first_step = 0
@@ -321,6 +322,8 @@ class MeshingParams(ParamGroup):
         self.min_opacity = 1./255.
         #My Losses
         self.lambda_background_loss = 0.05
+        
+        self.normal_field_from_iter = 15000
         
         super().__init__(parser, "Meshing Parameters")
 

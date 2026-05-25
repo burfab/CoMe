@@ -13,8 +13,7 @@ namespace cg = cooperative_groups;
 
 constexpr float SIGMA_THRESHOLD = 3.00f;
 				
-
-struct TransmittanceVacancy {
+struct TransmittanceVacancyGSGS {
     static constexpr float MAX_G = 0.99f;
 
     // G(t) = G_peak * exp(-0.5 * AA * (t - t_peak)^2)
@@ -27,7 +26,7 @@ struct TransmittanceVacancy {
     float t_peak;
     float v2_Gpeak;  // precomputed: 1 - G_peak
 
-    __device__ TransmittanceVacancy(float AA, float G_peak, float t_peak)
+    __device__ TransmittanceVacancyGSGS(float AA, float G_peak, float t_peak)
         : AA(AA), G_peak(fminf(G_peak,MAX_G)), t_peak(t_peak)
     {
 		v2_Gpeak = 1.f-G_peak;
@@ -85,6 +84,74 @@ struct TransmittanceVacancy {
         return Ti;
     }
 };
+
+struct TransmittanceVacancyBlobsToSpokes {
+    static constexpr float MAX_G = 0.99f;
+
+    // G(t) = G_peak * exp(-0.5 * AA * (t - t_peak)^2)
+    //      = G_peak * exp(-0.5 * ((t - t_peak) / sigma)^2),  sigma = 1/sqrt(AA)
+    // T(t) = sqrt(1-G)                  for t <= t_peak
+    //      = (1-G_peak) / sqrt(1-G)     for t >  t_peak
+
+    float AA;        // = 1/sigma^2
+    float G_peak;
+    float t_peak;
+    float v2_Gpeak;  // precomputed: 1 - G_peak
+
+    __device__ TransmittanceVacancyBlobsToSpokes(float AA, float G_peak, float t_peak)
+        : AA(AA), G_peak(fminf(G_peak,MAX_G)), t_peak(t_peak)
+    {
+		v2_Gpeak = 1.f-G_peak;
+	}
+
+    __device__ float T(float t) const {
+        const float dt      = t - t_peak;
+        const float G       = fminf(G_peak * __expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
+        return (t > t_peak) ? 1.f-G_peak : 1.f-G;
+    }
+
+	//Idea: Don't take deriviative of T but of T^2
+    __device__ float dT_dGaussian(float t,
+                                  float &dAA, float &dG_peak_out,
+                                  float &dt_peak_out) const {
+        const float dt          = t - t_peak;
+        const float exp_term    = expf(-0.5f * AA * dt * dt);
+        const float G           = fminf(G_peak * exp_term, MAX_G);
+
+		const float Ti = 1.f-G;
+		const float dTi_dG = -1.f;
+		dG_peak_out = dTi_dG * exp_term;
+        // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
+        const float dG_ddt = G * (-AA * dt);
+		const float ddt_dtpeak = -1.f;
+        dAA         = dTi_dG * G * (-0.5f * dt * dt);
+        dt_peak_out = dG_ddt * dTi_dG * ddt_dtpeak;
+
+		dG_peak_out *= gradient_scale(t);
+		dAA *= gradient_scale(t);
+		dt_peak_out *= gradient_scale(t);
+
+        return Ti;
+    }
+
+	__device__ inline float gradient_scale(float t) const{
+		return t > t_peak ? 1e-3f : 1.f;
+	}
+    __device__ float dT_dt(float t, float &dt_out) const {
+        const float dt      = t - t_peak;
+        const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
+        const float dG_dt   = G * (-AA * dt);
+		//gradient is computed as if dt < 0, but scaled later
+		const float Ti = 1.f-G;
+        if (t > t_peak) {
+			dt_out = -dG_dt * gradient_scale(t);
+        } else {
+            dt_out = -dG_dt * gradient_scale(t);
+        }
+        return Ti;
+    }
+};
+using TransmittanceVacancy = TransmittanceVacancyBlobsToSpokes;
 
 template<typename T, size_t S>
 __device__ void initArray(T(&arr)[S], T v = 0)
@@ -1633,9 +1700,13 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 				TransmittanceVacancy transmittance_helper(ABC_.x, G_peak, t_peak);
 
 				const float vacancy2_peak = (1.f-G_peak);
-				for(int i = START_ID; i < END_ID;i++){
+				#pragma unroll
+				for(int i = 0; i < SPLIT+1;i++){
+					//maybe faster as the loop can be unrolled and no divergence should be possible as last op should be compiled without if/else
+					const bool zero_op = i < START_ID || !(i < END_ID);
 					const float t = blend_data.depth_min + i * blend_data.interval;
-					blend_data.T_p[i] *= transmittance_helper.T(t);
+					const float T_i = transmittance_helper.T(t);
+					blend_data.T_p[i] *= (zero_op ? 1.f:T_i);
 				}
 
                 return true;
@@ -1778,10 +1849,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{		
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
-			const float blend_normalization_factor = 1.f/max((1 - blend_data.T), 1e-3f);
+			//const float blend_normalization_factor = 1.f/max((1 - blend_data.T), 1e-3f);
 
 			for(int ch = 0; ch < N_EXTRA_FEATURES;ch++)
-				out_color[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id] = blend_data.F[ch]*blend_normalization_factor;
+				out_color[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id] = blend_data.F[ch];//*blend_normalization_factor;
 		};
 
 	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
@@ -1910,7 +1981,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 }
 
 
-template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true>
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true, bool RENDER_GEOMETRY=true>
 __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_backward(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
@@ -1939,7 +2010,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 	float* __restrict__ dL_dconfidences,
 	float* dL_dview2gaussian)
 {
-	constexpr int ITERATIONS = GSGS_TWO_PASS ? 2 : 1;
+	constexpr int ITERATIONS = GSGS_TWO_PASS && RENDER_GEOMETRY ? 2 : 1;
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 	// int num_blends = 0;
@@ -1948,7 +2019,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		//for iter=0: compute eq 16 of paper https://arxiv.org/html/2601.17835v1#S4.SS1
 		//for iter=1: compute eq 17 of paper https://arxiv.org/html/2601.17835v1#S4.SS1 and do standard backward
 		float dT_dtmedian;
-		int iter = GSGS_TWO_PASS ? 0 : 1;
+		int iter = 0;
 		float T_final;
 		float dL_dpixel[CHANNELS];
 		//++++++++++++GOF
@@ -2129,7 +2200,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			float test_T = blend_data.T * (1.0f - alpha);
 			switch(blend_data.iter){
 				case 0:
-				{
+				//fallthrough
+				if constexpr(RENDER_GEOMETRY && GSGS_TWO_PASS) {
 					if (test_T < 0.0001f)
 					{
 						return false;
@@ -2144,8 +2216,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 					
 					blend_data.T = test_T;
 					return true;
+					break;
 				}
-				break;
 				case 1:
 				{
 
@@ -2363,7 +2435,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				blend_data.dt_dw = 0.f;
 #endif
 				}
-			}else{
+			}else if(RENDER_GEOMETRY && GSGS_TWO_PASS){
 				blend_data.depth_global_id = (uint32_t)-1;
 				TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
 				float dT_dA; float dT_dalpha; float dT_dtpeak;
@@ -2598,7 +2670,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{
-			if(blend_data.iter++ == 0){
+			if(GSGS_TWO_PASS && RENDER_GEOMETRY && blend_data.iter++ == 0){
 				//reset
 				blend_data.T = 1.f;
 				blend_data.dL_dmt_dT_dtm = blend_data.dL_dmax_depth / fmaxf(-blend_data.dT_dtmedian, 1e-7f);
@@ -2688,16 +2760,23 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 	const uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ pixel_colors,
 	const float* __restrict__ dL_dpixels,
+	float3* __restrict__ dL_dmean2D,
+	float4* __restrict__ dL_dconic2D,
+	float* __restrict__ dL_dopacity,
+	float* dL_dview2gaussian,
 	float* __restrict__ dL_dextra_features)
 {
 	constexpr uint2 debug_target_pixel = {500, 500};
+	const float ddelx_dx = 0.5 * W;
+	const float ddely_dy = 0.5 * H;
 	// int num_blends = 0;
 	struct BlendData
 	{
 		uint32_t contributor{0};
 		float T;
 		float T_final;
-		//float final_extra_features[N_EXTRA_FEATURES];
+		float final_extra_features[N_EXTRA_FEATURES];
+		float F[N_EXTRA_FEATURES];
 		float dL_dextra_features[N_EXTRA_FEATURES];
 	};
 
@@ -2710,8 +2789,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			bd.T_final = inside ? final_Ts[pix_id] : 0;
 			//TODO: was this a bug or intentional, was 1e-9f
 			const float blend_normalization = 1.f/max(1 - bd.T_final, 1e-3f);
-			for(int ch = 0; ch < N_EXTRA_FEATURES; ch++)
-				bd.dL_dextra_features[ch] = inside ? dL_dpixels[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id]*blend_normalization : 0;
+			for(int ch = 0; ch < N_EXTRA_FEATURES; ch++){
+				bd.dL_dextra_features[ch] = inside ? dL_dpixels[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id] /* *blend_normalization*/ : 0;
+				bd.final_extra_features[ch] = inside ? pixel_colors[(EXTRA_FEATURES_OFFSET+ch) * H * W + pix_id] /* *blend_normalization*/ : 0;
+				bd.F[ch] = 0.f;
+			}
 
 			//++++++++++++GOF
 			/*
@@ -2734,23 +2816,103 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 		};
 	auto store_function = [](const uint2&, int coll_id, float G, float alpha, float depth)
 		{
-			return alpha;
+			return G;
 		};
 		//could use alpha right?
-	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float alpha, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
+	auto blend_function = [&](const uint2& pixpos, BlendData& blend_data, int id, float G, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
 		{
 			// accumulate the opacity up to the current contributor
+			const float4 con_o = conic_opacity[id];
+			[[maybe_unused]] const float AA = ABC_.x;
+			[[maybe_unused]] const float BB = ABC_.y;
+			[[maybe_unused]] const float CC = ABC_.z;
+			const float alpha = min(0.99f, con_o.w * G);
+
 			float test_T = blend_data.T * (1.0f - alpha);
 			if (test_T < 0.0001f)
 			{
 				return false;
 			}			
+			const float2 xy = points_xy_image[id];
+			const float2 d = { xy.x - static_cast<float>(pixpos.x), xy.y - static_cast<float>(pixpos.y) };
+
 			const float dchannel_dcolor = alpha * blend_data.T;
 			// TODO: consider using vectors and better loads?
+			float dL_dalpha = 0.f;
 			for (int ch = 0; ch < N_EXTRA_FEATURES; ch++) {
 				//const float val = extra_features[id * N_EXTRA_FEATURES + ch];
-				atomicAdd(&(dL_dextra_features[id * N_EXTRA_FEATURES + ch]), dchannel_dcolor * blend_data.dL_dextra_features[ch]);
+				const float f= extra_features[id * N_EXTRA_FEATURES + ch];
+				blend_data.F[ch]+= f * alpha * blend_data.T;
+				const float dL_dchannel = blend_data.dL_dextra_features[ch];
+				const float accum_rec_ch = (blend_data.final_extra_features[ch] - blend_data.F[ch])/test_T;
+				dL_dalpha += (blend_data.F[ch] - accum_rec_ch) * dL_dchannel;
+				atomicAdd(&(dL_dextra_features[id * N_EXTRA_FEATURES + ch]), dchannel_dcolor * dL_dchannel);
 			}
+			dL_dalpha *= blend_data.T;
+
+			const float dL_dG = con_o.w * dL_dalpha;
+			const float gdx = G * d.x;
+			const float gdy = G * d.y;
+			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+			// Update gradients w.r.t. 2D mean position of the Gaussian
+			atomicAdd(&dL_dmean2D[id].x, dL_dG * dG_ddelx * ddelx_dx);
+			atomicAdd(&dL_dmean2D[id].y, dL_dG * dG_ddely * ddely_dy);
+			const float abs_dL_dmean2D = abs(dL_dG * dG_ddelx * ddelx_dx) + abs(dL_dG * dG_ddely * ddely_dy);
+            atomicAdd(&dL_dmean2D[id].z, abs_dL_dmean2D);
+
+
+			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+			// atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+			// atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
+			// atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+
+			// Update gradients w.r.t. opacity of the Gaussian
+			float dL_do = 0.f;
+			atomicAdd(&(dL_dopacity[id]), G * dL_dalpha + dL_do);
+
+			//++++++++++++GOF
+			const float dG_dpower = G;
+			const float dL_dpower = dL_dG * dG_dpower;
+
+			// // float power = -0.5f * min_value;
+			const float dL_dmin_value = dL_dpower * -0.5f;
+			// float min_value = -(BB*BB)/(4*AA) + CC;
+			// const float dL_dA = dL_dmin_value * (BB*BB)/4 *  1. / (AA*AA);
+			float dL_dA = dL_dmin_value * (BB / AA) * (BB / AA) / 4.f;
+			float dL_dB = dL_dmin_value * -BB / (2 *AA);
+			float dL_dC = dL_dmin_value * 1.0f;
+
+			// const float normal[3] = { view2gaussian_j[0] * ray.x + view2gaussian_j[1] * ray.y + view2gaussian_j[2], 
+			// 						view2gaussian_j[1] * ray.x + view2gaussian_j[3] * ray.y + view2gaussian_j[4],
+			// 						view2gaussian_j[2] * ray.x + view2gaussian_j[4] * ray.y + view2gaussian_j[5]};
+
+			// use AA, BB, CC so that the name is unique
+			// float AA = ray.x * normal[0] + ray.y * normal[1] + normal[2];
+			// float BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
+			// float CC = view2gaussian_j[9];
+			
+
+			float dL_dnormal[3];
+			dL_dnormal[0] = dL_dA * ray.x;
+			dL_dnormal[1] = dL_dA * ray.y;
+			dL_dnormal[2] = dL_dA;
+			
+			// write the gradients to global memory directly
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 0]), dL_dnormal[0] * ray.x);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 1]), dL_dnormal[0] * ray.y + dL_dnormal[1] * ray.x);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 2]), dL_dnormal[0] + dL_dnormal[2] * ray.x);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 3]), dL_dnormal[1] * ray.y);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 4]), dL_dnormal[1] + dL_dnormal[2] * ray.y);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 5]), dL_dnormal[2]);
+			
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 6]), dL_dB * 2 * ray.x);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 7]), dL_dB * 2 * ray.y);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 8]), dL_dB * 2);
+			atomicAdd(&(dL_dview2gaussian[id * VIEW2GAUSSIAN_OFFSET + 9]), dL_dC);
+
+
 
 			blend_data.T = test_T;
 			return true;

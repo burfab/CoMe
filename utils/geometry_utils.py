@@ -150,6 +150,23 @@ def depth_to_normal(view, depth1, depth2=None):
     points = points[None] if depth2 is None else points
     return point_to_normal(view, *points)
 
+def depth_to_normal_with_mask(view, depth:torch.Tensor):
+    W, H = view.image_width, view.image_height
+    x = (torch.arange(W, device="cuda", dtype=torch.float32) - view.Cx) / view.Fx
+    y = (torch.arange(H, device="cuda", dtype=torch.float32) - view.Cy) / view.Fy
+    points = torch.cat([depth * x[None, None], depth * y[None, :, None], depth], dim=0)
+    dy = points[:, 2:, 1:-1] - points[:, :-2, 1:-1]
+    dx = points[:, 1:-1, 2:] - points[:, 1:-1, :-2]
+    normal_map = torch.nn.functional.normalize(torch.cross(dy, dx, dim=0), dim=0)
+    output = torch.nn.functional.pad(normal_map, (1, 1, 1, 1))
+
+    valid_depths = depth > 0
+    valid_depths = (
+        valid_depths[:, 2:, 1:-1] & valid_depths[:, :-2, 1:-1] & valid_depths[:, 1:-1, 2:] & valid_depths[:, 1:-1, :-2] & valid_depths[:, 1:-1, 1:-1]
+    )
+    valid_points = torch.zeros_like(depth, dtype=torch.bool)
+    valid_points[:, 1:-1, 1:-1] = valid_depths
+    return output, valid_points
 
 def is_in_view_frustum(
     points:torch.Tensor,
