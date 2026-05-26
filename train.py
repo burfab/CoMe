@@ -463,7 +463,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff_normals(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), epsilon=0.000,alpha=0.05) * torch.exp(-nabla_I)
+        normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), return_squared_norm=True) * torch.exp(-nabla_I)
         #normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0])) * torch.exp(-nabla_I)
         normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
         lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0

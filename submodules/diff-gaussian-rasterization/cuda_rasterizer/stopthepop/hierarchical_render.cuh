@@ -48,12 +48,12 @@ struct TransmittanceVacancyGSGS {
 
         float Ti, dTi_dG;
         if (t > t_peak) {
-            Ti    = v2_Gpeak*v2_Gpeak * 1.f/(1.f-G);
+            Ti    = v2_Gpeak * 1.f/sqrtf(1.f-G);
 			dTi_dG = v2_Gpeak * v2_Gpeak / ((1.f - G) * (1.f - G));
             // G_peak appears in numerator (1-G_peak) AND in G — two terms
-            dG_peak_out = 2 * (v2_Gpeak) * -1.f + dTi_dG * (exp_term);
+            dG_peak_out = 2 * (v2_Gpeak/(1.f-G)) * -1.f + dTi_dG * (exp_term);
         } else {
-            Ti    = 1.f-G;
+            Ti    = sqrtf(1.f-G);
             dTi_dG = -1.f;
             dG_peak_out = dTi_dG * exp_term;
         }
@@ -119,7 +119,7 @@ struct TransmittanceVacancyBlobsToSpokes {
         const float G           = fminf(G_peak * exp_term, MAX_G);
 
 		const float Ti = 1.f-G;
-		const float dTi_dG = -1.f;
+		const float dTi_dG = dt > 0 ? 1.f : -1.f;
 		dG_peak_out = dTi_dG * exp_term;
         // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
         const float dG_ddt = G * (-AA * dt);
@@ -140,13 +140,13 @@ struct TransmittanceVacancyBlobsToSpokes {
     __device__ float dT_dt(float t, float &dt_out) const {
         const float dt      = t - t_peak;
         const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
-        const float dG_dt   = G * (-AA * dt);
+        const float dG_dt   = G * (-AA * fabsf(dt));
 		//gradient is computed as if dt < 0, but scaled later
 		const float Ti = 1.f-G;
         if (t > t_peak) {
-			dt_out = -dG_dt * gradient_scale(t);
+			dt_out = dG_dt * gradient_scale(t);
         } else {
-            dt_out = -dG_dt * gradient_scale(t);
+            dt_out = dG_dt * gradient_scale(t);
         }
         return Ti;
     }
@@ -2441,13 +2441,39 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				float dT_dA; float dT_dalpha; float dT_dtpeak;
 				const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dA, dT_dalpha, dT_dtpeak);
 				//alpha is a function of tpeak
-				dT_dtpeak += dT_dalpha * (-0.5f * (AA * t * 2.f + BB)) * alpha;
+				//dT_dtpeak += dT_dalpha * (-0.5f * (AA * t * 2.f + BB)) * alpha;
 				float dL_dT_dtmed = (0.5/T_tmed) * blend_data.dL_dmt_dT_dtm;
-				dL_dA += dL_dT_dtmed * (dT_dA + dT_dtpeak * (0.5f * BB*inv_A*inv_A));
-				dL_dB += dL_dT_dtmed * (-0.5f * inv_A) * dT_dtpeak;
+				//dL_dA += dL_dT_dtmed * dT_dA;// (dT_dA + dT_dtpeak * (0.5f * BB*inv_A*inv_A));
+				//dL_dB += dL_dT_dtmed * ((-0.5f * inv_A) * dT_dtpeak);
 
 				//divide by blend_data.T as its later multiplied by it
-				dL_dalpha += (dL_dT_dtmed * dT_dalpha)/blend_data.T;
+				//dL_dalpha += (dL_dT_dtmed * (dT_dalpha + dT_dtpeak * alpha * -(AA * t + 0.5 * BB) + dT_dA * alpha * -0.5 * t * t))/blend_data.T;
+
+				//lets take derivaite of alpha wrt B and A and op
+				//alpha is a function of tpeak and of A
+				//alpha = op * exp(-0.5 * (A * tt + B * t + C))
+				//dalpha/dA = alpha * (-0.5*tt)
+				//dalpha/dt = alpha * (A * -1 * t - 0.5 * B) = alpha * -(A * t + 0.5 * B)
+
+
+				//alpha = op * exp(-0.5 * (A * tt + B * t + C))
+				//dalpha/dA = alpha * (-0.5*tt)
+				//dalpha/dB = alpha * (-0.5*t)
+				//dalpha/dC = alpha * (-0.5)
+				//dalpha/dt = alpha * (A * -1 * t - 0.5 * B) = alpha * -(A * t + 0.5 * B)
+				//dalpha/do = G
+				//t = -B/(2A)
+				//dt/dA = 0.5 * B * inv_A * inv_A
+				//dt/dB = -0.5 * inv_A
+
+				dL_do += dL_dT_dtmed * (dT_dalpha * G);
+				dL_dA += dL_dT_dtmed * (-0.5 * t*t * dT_dalpha * alpha + dT_dtpeak * 0.5f * BB * inv_A * inv_A + dT_dA);
+				dL_dB += dL_dT_dtmed * (-0.5 * t * dT_dalpha* alpha  + dT_dtpeak * inv_A * -0.5f);
+				dL_dC += dL_dT_dtmed * (-0.5 * dT_dalpha* alpha );
+
+
+
+
 			}
 
 			
