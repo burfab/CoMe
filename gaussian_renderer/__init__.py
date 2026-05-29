@@ -305,6 +305,9 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
         "normal_variance": rendered_image[12:13],
         "final_T": accum_alpha,
     }
+    
+    
+    
 
 def integrate(points3D, alpha, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, kernel_size: float, scaling_modifier = 1.0, override_color = None, subpixel_offset=None, splat_args=None):
     """
@@ -416,3 +419,378 @@ def integrate(points3D, alpha, viewpoint_camera, pc : GaussianModel, pipe, bg_co
             "color_integrated": color_integrated,
             "viewspace_points": None,
             "radii": radii}
+
+
+@torch.no_grad()
+def compute_transmittance(
+    points3D, viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
+    kernel_size : float, scaling_modifier = 1.0,
+    subpixel_offset=None, splat_args=None, override_color = None
+):  
+     # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+    
+    if subpixel_offset is None:
+        subpixel_offset = torch.zeros((int(viewpoint_camera.image_height), int(viewpoint_camera.image_width), 2), dtype=torch.float32, device="cuda")
+        
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        inv_viewprojmatrix=viewpoint_camera.full_proj_transform_inverse,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        settings=splat_args,
+        debug_data=DebugVisualization(),
+    )
+    
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+    
+    means3D = pc.get_xyz
+    rotations = pc.get_rotation
+    scales, opacity = pc.get_scaling_n_opacity_with_3D_filter(False)
+    
+    cov3D_precomp = None
+    view2gaussian_precomp = None
+    # pipe.compute_view2gaussian_python = True
+    if pipe.compute_view2gaussian_python:
+        view2gaussian_precomp = pc.get_view2gaussian(raster_settings.viewmatrix)
+
+    
+    
+    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    shs = None
+    colors_precomp = None
+    if override_color is None:
+        if pipe.convert_SHs_python:
+            shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1))
+            # # we local direction
+            # cam_pos_local = view2gaussian_precomp[:, 3, :3]
+            # cam_pos_local_scaled = cam_pos_local / scales
+            # dir_pp = -cam_pos_local_scaled
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True)
+            sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+        elif pipe.convert_SBs_python:
+            spherical_betas_paramscount = 3 + pc.max_sh_degree * 6
+            # shs_view = pc.get_features.transpose(1, 2).view(-1, 3, (pc.max_sh_degree+1)**2)
+            shs_view = pc.get_features.view(-1, spherical_betas_paramscount)
+            shs_view = shs_view[:, :(3 + 6 * pc.active_sh_degree)]
+            dir_pp = (pc.get_xyz - viewpoint_camera.camera_center.repeat(pc.get_features.shape[0], 1)) 
+            dir_pp_normalized = dir_pp/dir_pp.norm(dim=1, keepdim=True) 
+            # sh2rgb = eval_sh(pc.active_sh_degree, shs_view, dir_pp_normalized)
+            sb2rgb = eval_sb(shs_view, dir_pp_normalized)
+            #colors_precomp = torch.clamp_min(sh2rgb + 0.5, 0.0)
+            colors_precomp = torch.clamp_min(sb2rgb, 0.0)
+        else:
+            shs = pc.get_features
+    else:
+        colors_precomp = override_color
+    
+    
+        
+    # Rasterize visible Gaussians to image, obtain their radii (on screen). 
+    transmittance, color,radii = rasterizer.compute_transmittance(
+            points3D = points3D,
+            means3D = means3D,
+            opacities = opacity,
+            shs = shs,
+            colors_precomp = colors_precomp,
+            scales = scales,
+            rotations = rotations,
+            cov3D_precomp = cov3D_precomp,
+            view2gaussian_precomp=view2gaussian_precomp)
+    
+    
+    
+    
+    return {
+        "transmittance": transmittance,
+        "visibility_filter" : radii > 0,
+        "radii": radii
+    }
+
+def evaluate_transmittance(
+points3D,
+viewpoint_camera,
+pc: GaussianModel,
+pipe,
+kernel_size: float,
+scaling_modifier=1.0,
+bg_color : torch.Tensor = torch.rand((3), device="cuda"),
+splat_args: ExtendedSettings=None,
+debugVis : DebugVisualization = DebugVisualization()
+):
+    """
+    Compute the transmittances of 3D query points under the given `viewpoint_camera`
+    """
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        bg=bg_color,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        inv_viewprojmatrix=viewpoint_camera.full_proj_transform_inverse,
+        sh_degree=pc.active_sh_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        settings=splat_args,
+        debug_data=debugVis,
+        debug=pipe.debug,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity_with_3D_filter
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3Ds_precomp = None
+    if pipe.compute_filter3D_python:
+        cov3Ds_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling_with_3D_filter
+        rotations = pc.get_rotation
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    transmittance, inside, radii = rasterizer.evaluate_transmittance(
+        points3D=points3D,
+        means3D=means3D,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3D_precomp = cov3Ds_precomp,
+    )
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {"transmittance": transmittance, "inside": inside}
+
+
+def evaluate_sdf(
+    points3D,
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    kernel_size: float,
+    scaling_modifier=1.0,
+):
+    """
+    Compute the signed distance field (SDF) values of 3D query points under the given `viewpoint_camera`
+    """
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        bg=None,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        #sg_degree=pc.active_sg_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        #require_depth=True,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity_with_3D_filter
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3Ds_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3Ds_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling_with_3D_filter
+        rotations = pc.get_rotation
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    depth, sdf, inside = rasterizer.evaluate_sdf(
+        points3D=points3D,
+        means3D=means3D,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3Ds_precomp=cov3Ds_precomp,
+    )
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {"depth": depth, "sdf": sdf, "inside": inside}
+
+
+def evaluate_color(
+    points3D,
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe,
+    kernel_size: float,
+    background,
+    scaling_modifier=1.0,
+):
+    """
+    Compute the colors of 3D query points under the given `viewpoint_camera`
+    """
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        bg=background,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        #sg_degree=pc.active_sg_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        #require_depth=True,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity_with_3D_filter
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3Ds_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3Ds_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling_with_3D_filter
+        rotations = pc.get_rotation
+
+    # If precomputed colors are provided, use them. Otherwise, if it is desired to precompute colors
+    # from SHs in Python, do it. If not, then SH -> RGB conversion will be done by rasterizer.
+    shs = pc.get_features
+    colors_precomp = None
+
+    sg_axis = None#pc.get_sg_axis
+    sg_sharpness = None#pc.get_sg_sharpness
+    sg_color = None#pc.get_sg_color
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    color, inside = rasterizer.evaluate_color(
+        points3D=points3D,
+        means3D=means3D,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        shs=shs,
+        sg_axis=sg_axis,
+        sg_sharpness=sg_sharpness,
+        sg_color=sg_color,
+        colors_precomp=colors_precomp,
+        cov3Ds_precomp=cov3Ds_precomp,
+    )
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {"color": color, "inside": inside}
+
+
+def sample_depth(
+    points3D,
+    viewpoint_camera,
+    pc: GaussianModel,
+    pipe: torch.Tensor,
+    kernel_size: float,
+    scaling_modifier=1.0,
+):
+
+    # Set up rasterization configuration
+    tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
+    tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
+
+    raster_settings = GaussianRasterizationSettings(
+        image_height=int(viewpoint_camera.image_height),
+        image_width=int(viewpoint_camera.image_width),
+        tanfovx=tanfovx,
+        tanfovy=tanfovy,
+        kernel_size=kernel_size,
+        bg=0,
+        scale_modifier=scaling_modifier,
+        viewmatrix=viewpoint_camera.world_view_transform,
+        projmatrix=viewpoint_camera.full_proj_transform,
+        sh_degree=pc.active_sh_degree,
+        #sg_degree=pc.active_sg_degree,
+        campos=viewpoint_camera.camera_center,
+        prefiltered=False,
+        debug=pipe.debug,
+        #require_depth=True,
+    )
+
+    rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+    means3D = pc.get_xyz
+    opacity = pc.get_opacity_with_3D_filter
+
+    # If precomputed 3d covariance is provided, use it. If not, then it will be computed from
+    # scaling / rotation by the rasterizer.
+    scales = None
+    rotations = None
+    cov3Ds_precomp = None
+    if pipe.compute_cov3D_python:
+        cov3Ds_precomp = pc.get_covariance(scaling_modifier)
+    else:
+        scales = pc.get_scaling_with_3D_filter
+        rotations = pc.get_rotation
+
+    # Rasterize visible Gaussians to image, obtain their radii (on screen).
+    depth, inside = rasterizer.sample_depth(
+        points3D=points3D,
+        means3D=means3D,
+        opacities=opacity,
+        scales=scales,
+        rotations=rotations,
+        cov3Ds_precomp=cov3Ds_precomp,
+    )
+
+    # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
+    # They will be excluded from value updates used in the splitting criteria.
+    return {"sampled_depth": depth, "inside": inside}
+ 

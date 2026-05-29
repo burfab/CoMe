@@ -204,11 +204,12 @@ def readColmapSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts
                            ply_path=ply_path)
     return scene_info
 
-def readCamerasJson(cameras_file, images_folder):
+def readCamerasJson(cameras_file, images_folder, read_redundant=False):
     with open(cameras_file, "r", encoding="utf-8") as f:
         meta = json.load(f)
 
     cam_infos = []
+    redundant_cam_infos = []
     frames = meta["frames"]
     per_frame_cams = meta["cameras"]
     per_frame_cams_dict = {}
@@ -216,6 +217,7 @@ def readCamerasJson(cameras_file, images_folder):
 
     for idx, fr in enumerate(frames):
         sys.stdout.write('\r')
+        if fr["redundant"] and not read_redundant: continue
         sys.stdout.write(f"Reading camera {idx+1}/{len(frames)}")
         sys.stdout.flush()
         cam = per_frame_cams_dict[fr["camera_id"]]
@@ -249,15 +251,23 @@ def readCamerasJson(cameras_file, images_folder):
             width=width,
             height=height,
         )
+        if not fr["redundant"]:
+            cam_infos.append(cam_info)
+        else:
+            redundant_cam_infos.append(cam_info)
+        
         cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
-    return cam_infos
-
+    return cam_infos, redundant_cam_infos
+iphone_reader_read_redundant=False
 def readIPhoneSceneInfo(path, images, eval, llffhold=8, init_type="sfm", num_pts=100000):
+    global iphone_reader_read_redundant
+    print(f"---------INFO---------\nRedundant Frames reading: {iphone_reader_read_redundant}")
     cameras_file = os.path.join(path, "cameras.json")
-    cam_infos_unsorted = readCamerasJson(cameras_file, os.path.join(path, "images"))
-    cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.uid)
+    cam_infos , redundant_cam_infos = readCamerasJson(cameras_file, os.path.join(path, "images"), read_redundant=iphone_reader_read_redundant)
+    if iphone_reader_read_redundant: cam_infos = cam_infos + redundant_cam_infos
+    cam_infos = sorted(cam_infos, key = lambda x : x.uid)
 
     if eval:
         train_cam_infos = [c for idx, c in enumerate(cam_infos) if idx % llffhold != 0]

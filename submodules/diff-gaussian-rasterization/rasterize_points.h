@@ -95,6 +95,57 @@ torch::Tensor markVisible(
 		torch::Tensor& viewmatrix,
 		torch::Tensor& projmatrix);
 
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+ComputeTransmittanceCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& points3D,
+	const torch::Tensor& means3D,
+    const torch::Tensor& colors,
+	const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& view2gaussian_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const torch::Tensor &inv_viewprojmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& sh,
+	const int degree,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const nlohmann::json& settings_dict,
+	const bool debug);
+
+std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+EvaluateTransmittanceToPointsCUDA(
+	const torch::Tensor& background,
+	const torch::Tensor& points3D,
+	const torch::Tensor& means3D,
+    const torch::Tensor& opacity,
+	const torch::Tensor& scales,
+	const torch::Tensor& rotations,
+	const float scale_modifier,
+	const torch::Tensor& cov3D_precomp,
+	const torch::Tensor& view2gaussian_precomp,
+	const torch::Tensor& viewmatrix,
+	const torch::Tensor& projmatrix,
+	const torch::Tensor &inv_viewprojmatrix,
+	const float tan_fovx, 
+	const float tan_fovy,
+    const int image_height,
+    const int image_width,
+	const torch::Tensor& campos,
+	const bool prefiltered,
+	const nlohmann::json& settings_dict,
+	const bool debug);
+
+
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 IntegrateGaussiansToPointsCUDA(
 	const torch::Tensor& background,

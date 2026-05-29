@@ -282,6 +282,7 @@ class CullingSettings:
 @dataclass
 class MeshingSettings:
     alpha_early_stop : bool = False
+    transmittance_threshold : float = 0.5
     return_color : bool = False
     
     def set_value(self, key, value):
@@ -428,6 +429,65 @@ class GaussianRasterizer(nn.Module):
             gt_color, extract_final_T
         )
 
+    def evaluate_transmittance(self, points3D, means3D, opacities, scales = None, rotations = None, cov3D_precomp = None, view2gaussian_precomp = None):
+
+            raster_settings = self.raster_settings
+            if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+                raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+
+            if scales is None:
+                scales = torch.Tensor([])
+            if rotations is None:
+                rotations = torch.Tensor([])
+            if cov3D_precomp is None:
+                cov3D_precomp = torch.Tensor([])
+
+            # TODO check and raise exception for precomputed view2gaussian
+            if view2gaussian_precomp is None:
+                view2gaussian_precomp = torch.Tensor([])
+
+            # Invoke C++/CUDA rasterization routine
+            # Restructure arguments the way that the C++ lib expects them
+            
+            
+            args = (
+                raster_settings.bg, 
+                points3D,
+                means3D,
+                opacities,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
+                cov3D_precomp,
+                view2gaussian_precomp,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.inv_viewprojmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
+                raster_settings.image_height,
+                raster_settings.image_width,
+                raster_settings.campos,
+                raster_settings.prefiltered,
+                raster_settings.settings.to_dict(),
+                raster_settings.debug
+            )
+
+            # Invoke C++/CUDA rasterizer
+            if raster_settings.debug:
+                cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
+                try:
+                    num_rendered, transmittance, inside, radii, geomBuffer, binningBuffer, imgBuffer = _C.evaluate_transmittance_points(*args)
+                except Exception as ex:
+                    torch.save(cpu_args, "snapshot_fw.dump")
+                    print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
+                    raise ex
+            else:
+                num_rendered, transmittance, inside, radii, geomBuffer, binningBuffer, imgBuffer = _C.evaluate_transmittance_points(*args)
+
+            return 1-transmittance, inside, radii
+
 
     def integrate(self, points3D, means3D, opacities, alpha, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, view2gaussian_precomp = None):
 
@@ -497,3 +557,74 @@ class GaussianRasterizer(nn.Module):
                 num_rendered, color, color_integrated, radii, geomBuffer, binningBuffer, imgBuffer = _C.integrate_gaussians_to_points(*args)
 
             return color, color_integrated, radii
+
+
+    def compute_transmittance(self, points3D, means3D, opacities, shs = None, colors_precomp = None, scales = None, rotations = None, cov3D_precomp = None, view2gaussian_precomp = None):
+
+            raster_settings = self.raster_settings
+
+            if (shs is None and colors_precomp is None) or (shs is not None and colors_precomp is not None):
+                raise Exception('Please provide excatly one of either SHs or precomputed colors!')
+
+            if ((scales is None or rotations is None) and cov3D_precomp is None) or ((scales is not None or rotations is not None) and cov3D_precomp is not None):
+                raise Exception('Please provide exactly one of either scale/rotation pair or precomputed 3D covariance!')
+
+            if shs is None:
+                shs = torch.Tensor([])
+            if colors_precomp is None:
+                colors_precomp = torch.Tensor([])
+
+            if scales is None:
+                scales = torch.Tensor([])
+            if rotations is None:
+                rotations = torch.Tensor([])
+            if cov3D_precomp is None:
+                cov3D_precomp = torch.Tensor([])
+
+            # TODO check and raise exception for precomputed view2gaussian
+            if view2gaussian_precomp is None:
+                view2gaussian_precomp = torch.Tensor([])
+
+            # Invoke C++/CUDA rasterization routine
+            # Restructure arguments the way that the C++ lib expects them
+            
+            args = (
+                raster_settings.bg, 
+                points3D,
+                means3D,
+                colors_precomp,
+                opacities,
+                scales,
+                rotations,
+                raster_settings.scale_modifier,
+                cov3D_precomp,
+                view2gaussian_precomp,
+                raster_settings.viewmatrix,
+                raster_settings.projmatrix,
+                raster_settings.inv_viewprojmatrix,
+                raster_settings.tanfovx,
+                raster_settings.tanfovy,
+                raster_settings.image_height,
+                raster_settings.image_width,
+                shs,
+                raster_settings.sh_degree,
+                raster_settings.campos,
+                raster_settings.prefiltered,
+                raster_settings.settings.to_dict(),
+                raster_settings.debug
+            )
+
+            # Invoke C++/CUDA rasterizer
+            if raster_settings.debug:
+                cpu_args = cpu_deep_copy_tuple(args) # Copy them before they can be corrupted
+                try:
+                    num_rendered, transmittance, color_integrated, radii, geomBuffer, binningBuffer, imgBuffer = _C.compute_transmittance(*args)
+                except Exception as ex:
+                    torch.save(cpu_args, "snapshot_fw.dump")
+                    print("\nAn error occured in forward. Please forward snapshot_fw.dump for debugging.")
+                    raise ex
+            else:
+                num_rendered, transmittance, color_integrated, radii, geomBuffer, binningBuffer, imgBuffer = _C.compute_transmittance(*args)
+                
+            return transmittance, color_integrated, radii
+

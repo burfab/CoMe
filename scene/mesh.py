@@ -460,12 +460,17 @@ class ScalableMeshRenderer(torch.nn.Module):
         # Filter mesh and fragments to keep only rasterized faces. This will decrease the number of faces to at most H * W.
         # Reducing the number of faces is necessary to avoid errors when running dr.interpolate and dr.antialias
         if True:
+            original_shape = fragments.pix_to_face.shape  # save (1, H, W, 1)
+
             filtered_face_idx, filtered_pix_to_face = fragments.pix_to_face.unique(return_inverse=True)
             filtered_face_idx = filtered_face_idx[1:]
             filtered_faces = mesh.faces[filtered_face_idx]
-            filtered_pix_to_face = filtered_pix_to_face - 1
+
+            # Reshape BEFORE reassigning
+            filtered_pix_to_face = filtered_pix_to_face.reshape(original_shape) - 1
+
             mesh = Meshes(verts=mesh.verts, faces=filtered_faces, verts_colors=mesh.verts_colors)
-            fragments.pix_to_face = filtered_pix_to_face
+            fragments.pix_to_face = filtered_pix_to_face  # now correctly (1, H, W, 1)
         
         # Rebuild rast_out
         rast_out = torch.zeros(*fragments.zbuf.shape[:-1], 4, device=fragments.zbuf.device)

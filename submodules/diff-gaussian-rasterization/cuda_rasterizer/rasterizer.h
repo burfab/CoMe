@@ -129,6 +129,8 @@ namespace CudaRasterizer
 	{
 		bool alpha_early_stop = false;
 		bool return_color = false;
+		//for computeTransmittancy
+		float transmittance_threshold = 0.5;
 	};
 
 	inline std::string toString(SortMode m) {
@@ -229,6 +231,7 @@ namespace CudaRasterizer
             }},
             {"meshing_settings", {
                 {"alpha_early_stop", s.meshing_settings.alpha_early_stop},
+				{"transmittance_threshold", s.meshing_settings.transmittance_threshold},
                 {"return_color", s.meshing_settings.return_color},
             }},
             {"load_balancing", s.load_balancing},
@@ -269,6 +272,7 @@ namespace CudaRasterizer
         {
             const nlohmann::json& j_meshing = j["meshing_settings"];
             j_meshing.at("alpha_early_stop").get_to(s.meshing_settings.alpha_early_stop);
+            j_meshing.at("transmittance_threshold").get_to(s.meshing_settings.transmittance_threshold);
             j_meshing.at("return_color").get_to(s.meshing_settings.return_color);
         }
         j.at("load_balancing").get_to(s.load_balancing);
@@ -398,8 +402,62 @@ namespace CudaRasterizer
                     const bool prefiltered, float *out_color,
                     int *radii = nullptr, float *out_alpha_integrated = nullptr,
                     float *out_color_integrated = nullptr, bool debug = false);
+
+static int computeTransmittance(
+	std::function<char* (size_t)> geometryBuffer,
+	std::function<char* (size_t)> binningBuffer,
+	std::function<char* (size_t)> imageBuffer,
+	std::function<char* (size_t)> pointBuffer,
+	std::function<char* (size_t)> point_binningBuffer,
+	const int PN, const int P, int D, int M,
+	const float* background,
+	const int width, int height,
+	SplattingSettings splatting_settings,
+	DebugVisualizationData& debugVisualization,
+	const float* points3D,
+	const float* means3D,
+	const float* shs,
+	const float* colors_precomp,
+	const float* opacities,
+	const float* scales,
+	const float scale_modifier,
+	const float* rotations,
+	const float* cov3D_precomp,
+	const float* view2gaussian_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const float* inv_viewprojmatrix,
+	const float* cam_pos,
+	const float tan_fovx, float tan_fovy,
+	const bool prefiltered,
+	int* radii=nullptr, // remove 
+	float* out_transmittance=nullptr,
+	float* out_color_integrated=nullptr,
+	bool debug=false);
+
+
+          static int
+          evaluateTransmittance(std::function<char *(size_t)> geometryBuffer,
+                    std::function<char *(size_t)> binningBuffer,
+                    std::function<char *(size_t)> imageBuffer,
+                    std::function<char *(size_t)> pointBuffer,
+                    std::function<char *(size_t)> point_binningBuffer,
+                    const int PN, const int P, int D, int M,
+                    const float *background, const int width, int height,
+                    const SplattingSettings splatting_settings,
+                    DebugVisualizationData &debugVisualization,
+                    const float *points3D, const float *means3D,
+                    const float *opacities, const float *scales,
+                    const float scale_modifier, const float *rotations,
+                    const float *cov3D_precomp,
+                    const float *view2gaussian_precomp, const float *viewmatrix,
+                    const float *projmatrix, const float *inv_viewprojmatrix,
+                    const float *cam_pos, const float tan_fovx, float tan_fovy,
+                    const bool prefiltered, 
+                    int *radii = nullptr, float *out_transmittance= nullptr,
+                    bool *out_inside= nullptr, bool debug = false);
+
 	};
-	
 
 };
 

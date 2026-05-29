@@ -180,7 +180,7 @@ def gui_visualize(
     elif render_depth_normal_loss:
         cmap = matplotlib.colormaps.get_cmap('magma')
         # TODO: update
-        depth_normal, _ = depth_to_normal(render_cam, depth)
+        depth_normal, _ = depth_to_normal(render_cam, depth,False, depth>0)
         depth_normal = depth_normal.permute(2, 0, 1)
         
         render_normal = torch.nn.functional.normalize(normal, p=2, dim=0)

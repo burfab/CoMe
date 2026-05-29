@@ -30,7 +30,7 @@ def depths_to_points(view, depthmap, cam_space=False):
 
 
 threshold = 2
-def depth_to_normal(view, depth, cam_space=False):
+def depth_to_normal(view, depth, cam_space=False, mask = None):
     """
         view: view camera
         depth: depthmap 
@@ -40,11 +40,14 @@ def depth_to_normal(view, depth, cam_space=False):
     dx = torch.cat([points[2:, 1:-1] - points[:-2, 1:-1]], dim=0)
     dy = torch.cat([points[1:-1, 2:] - points[1:-1, :-2]], dim=1)
     normal_map = torch.cross(dx, dy, dim=-1)
-    
+    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
     #w = torch.clamp_max(1.0 / (dx*dx + dy*dy), 2.0).detach()
     #boundary_mask = torch.abs(dx[0,:]) > threshold | torch.abs(dy[0,:]) > threshold
-    normal_map = torch.nn.functional.normalize(torch.cross(dx, dy, dim=-1), dim=-1)
-    output[1:-1, 1:-1, :] = normal_map
+    if mask is not None:
+        valid_mask = mask[2:, 1:-1] & mask[:-2, 1:-1] & mask[1:-1, 2:] & mask[1:-1, :-2] & mask[1:-1, 1:-1] 
+        output[1:-1, 1:-1, :][valid_mask,:] = normal_map[valid_mask,:]
+    else:
+        output[1:-1, 1:-1, :] = normal_map
     return output, points
 
 def central_diff(image, ignore_inval = None, op=torch.eq, return_squared_norm=False, scale_x=1, scale_y=1):

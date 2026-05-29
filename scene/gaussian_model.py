@@ -311,6 +311,21 @@ class GaussianModel:
         scales = torch.sqrt(scales)
         return scales
     
+    def get_scaling_n_opacity_with_3D_filter(self, use_mip_filter:bool=True):
+        if use_mip_filter:
+            opacity = self.opacity_activation(self._opacity)
+            scales = self.get_scaling
+            scales_square = torch.square(scales)
+            det1 = scales_square.prod(dim=1)
+            scales_after_square = scales_square + torch.square(self.filter_3D) 
+            det2 = scales_after_square.prod(dim=1) 
+            coef = torch.sqrt(det1 / det2)
+            scales = torch.sqrt(scales_after_square)
+            return scales, opacity * coef[..., None]
+        else:
+            return self.get_scaling_with_3D_filter, self.get_opacity_with_3D_filter
+    
+    
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
@@ -746,6 +761,173 @@ class GaussianModel:
 
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
         self._opacity = optimizable_tensors["opacity"]
+        
+        
+    def _get_tetra_points_blobs_as_spokes(
+        self, 
+        downsample_ratio:float=None, 
+        return_sdf_values:bool=False, 
+        xyz_idx:torch.Tensor=None, 
+        verbose:bool=False,
+        scale_points_with_downsample_ratio:bool=True,
+        scale_points_factor:float=None,
+        opacity_threshold:float=None,
+        override_opacity:torch.Tensor=None,
+        return_min_scales:bool=False,
+        point_shifts:torch.Tensor=None,
+    ):
+        """
+        Get the tetra points of the Gaussian model.
+
+        Args:
+            downsample_ratio (float, optional): The ratio to downsample the tetra points. Defaults to None.
+            return_sdf_values (bool, optional): Whether to return the SDF values. Defaults to False.
+            xyz_idx (torch.Tensor, optional): The indices of the tetra points to return. 
+                If opacity_threshold is provided, xyz_idx should index points that are not filtered out by the opacity threshold,
+                such that xyz_idx.max() < (self.get_opacity_with_3D_filter > opacity_threshold).sum().
+                Defaults to None. 
+                Overrides downsample_ratio if both are provided.
+            verbose (bool, optional): Whether to print verbose information. Defaults to False.
+            scale_points_with_downsample_ratio (bool, optional): Whether to scale the points with the downsample ratio. 
+                Defaults to True. Overrides scale_points_factor if both are provided.
+            scale_points_factor (float, optional): The factor to scale the points. Defaults to None.
+            opacity_threshold (float, optional): The opacity threshold to filter the points. Defaults to None.
+            override_opacity (torch.Tensor, optional): The opacities to use for the tetra points. 
+            return_min_scales (bool, optional): Whether to return the minimum scales of the vertices. Defaults to False.
+            point_shifts (torch.Tensor, optional): The shifts to apply to the points. Defaults to None. Has shape (N_points, 9, 3).
+        Raises:
+            ValueError: If SDF values are not used but return_sdf_values is True.
+
+        Returns:
+            vertices (torch.Tensor): The vertices of the tetra points.
+            vertices_scale (torch.Tensor): The scale of the vertices.
+            sdf_values (torch.Tensor, optional): The SDF values of the tetra points.
+        """
+        M = trimesh.creation.box()
+        M.vertices *= 2
+        
+        use_downsample_ratio = (downsample_ratio is not None) and (downsample_ratio < 1.0)
+        use_xyz_idx = xyz_idx is not None
+        if verbose:
+            print(f"[INFO] Downsample ratio: {downsample_ratio}.")
+            
+        xyz = self.get_xyz
+        scale = self.get_scaling_with_3D_filter * 3.
+        rots = build_rotation(self._rotation)
+        if return_sdf_values:
+            if not self.use_sdf_values:
+                raise ValueError("SDF values are not used")
+            sdf_values = self.get_sdf_values
+        
+        # Filter points with small opacity
+        if (opacity_threshold is not None) and (opacity_threshold > 0.0):
+            if override_opacity is not None:
+                opacity = override_opacity
+                if verbose:
+                    print(f"[INFO] Using provided opacity values.")
+            else:
+                opacity = self.get_opacity_with_3D_filter
+            mask = (opacity > opacity_threshold).squeeze()
+            xyz = xyz[mask]
+            scale = scale[mask]
+            rots = rots[mask]
+            if return_sdf_values:
+                sdf_values = sdf_values[mask]
+                
+            if verbose:
+                print(f"[INFO] Number of tetra points after opacity threshold: {xyz.shape[0]}.")
+            
+            # Update downsample ratio
+            if use_downsample_ratio:
+                downsample_ratio = min(downsample_ratio * self._xyz.shape[0] / xyz.shape[0], 1.0)
+                use_downsample_ratio = downsample_ratio < 1.0
+                if verbose:
+                    print(f"[INFO] Updated downsample ratio: {downsample_ratio}.")
+        
+        if use_downsample_ratio or use_xyz_idx:
+            if use_xyz_idx:
+                downsample_ratio = xyz_idx.shape[0] / xyz.shape[0]
+                if verbose:
+                    print(f"[INFO] Using provided xyz_idx to downsample tetra points, with ratio {downsample_ratio}.")
+            else:
+                xyz_idx = torch.randperm(xyz.shape[0])[:int(xyz.shape[0] * downsample_ratio)]
+                if verbose:
+                    print(f"[INFO] Downsampling tetra points by {downsample_ratio}.")
+                
+            xyz = xyz[xyz_idx]
+            scale = scale[xyz_idx]
+            if scale_points_with_downsample_ratio:
+                scale = scale / (downsample_ratio ** (1/3))
+            elif scale_points_factor is not None:
+                scale = scale * scale_points_factor
+            rots = rots[xyz_idx]
+            if return_sdf_values:
+                sdf_values = sdf_values[xyz_idx]
+            if verbose:
+                print(f"[INFO] Number of tetra points after downsampling: {xyz.shape[0] * self.n_pivots_per_gaussian}.")
+        
+        vertices = M.vertices.T    
+        vertices = torch.from_numpy(vertices).float().cuda().unsqueeze(0).repeat(xyz.shape[0], 1, 1)  # (N_points, 3, 8)
+        
+        # Add point shifts if provided
+        if point_shifts is not None:
+            vertices = torch.cat(
+                [
+                    vertices,  # (N_points, 3, 8)
+                    torch.zeros_like(vertices[:, :, :1]),  # (N_points, 3, 1)
+                ], 
+                dim=-1,
+            )
+            vertices = vertices + point_shifts.permute(0, 2, 1)  # (N_points, 3, 9)
+
+            # scale vertices first
+            vertices = vertices * scale.unsqueeze(-1)  # (N_points, 3, 9)
+            vertices = torch.bmm(rots, vertices).squeeze(-1) + xyz.unsqueeze(-1)  # (N_points, 3, 9)
+            vertices = vertices.permute(0, 2, 1)  # (N_points, 9, 3)
+            
+            # Reshape + concatenate centers at the end
+            vertices = torch.cat(
+                [
+                    vertices[:, :-1, :].reshape(-1, 3),  # (N_points * 8, 3)
+                    vertices[:, -1, :],  # (N_points, 3)
+                ],
+                dim=0,
+            )  # (N_points * 9, 3)
+            
+        else:
+            # scale vertices first
+            vertices = vertices * scale.unsqueeze(-1)
+            vertices = torch.bmm(rots, vertices).squeeze(-1) + xyz.unsqueeze(-1)
+            vertices = vertices.permute(0, 2, 1).reshape(-1, 3).contiguous()
+            # concat center points
+            vertices = torch.cat([vertices, xyz], dim=0)
+        
+        if return_min_scales: scale_min = scale.min(dim=-1, keepdim=True)[0]
+        # scale is not a good solution but use it for now
+        scale = scale.max(dim=-1, keepdim=True)[0]
+        scale_corner = scale.repeat(1, 8).reshape(-1, 1)
+        vertices_scale = torch.cat([scale_corner, scale], dim=0)
+        
+        if return_min_scales:
+            print(f"[INFO] Returning min scales in tetra points computation.")
+            scale_corner_min = scale_min.repeat(1, 8).reshape(-1, 1)
+            vertices_scale_min = torch.cat([scale_corner_min, scale_min], dim=0)
+            return vertices, vertices_scale, vertices_scale_min
+        if return_sdf_values:
+            return vertices, vertices_scale, sdf_values
+        else:
+            return vertices, vertices_scale
+        
+    def get_tetra_points_blobs_as_spokes(
+        self, 
+        let_gradients_flow:bool=False,
+        **kwargs
+    ):
+        if let_gradients_flow:
+            return self._get_tetra_points_blobs_as_spokes(**kwargs)
+        else:
+            with torch.no_grad():
+                return self._get_tetra_points_blobs_as_spokes(**kwargs) 
 
     @torch.no_grad()
     def get_tetra_points(self, views: List[Camera], meshing_settings : MeshingSettings):

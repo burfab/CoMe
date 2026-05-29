@@ -325,6 +325,27 @@ class MeshingParams(ParamGroup):
         
         self.normal_field_from_iter = 15000
         
+        #Multiview
+        self.multi_view_lambda = 0.05
+        self.multi_view_first_iter = 7000
+
+        # Camera neighbors
+        self.multi_view_max_angle= 30.0
+        self.multi_view_min_dis_relative= 0.002  # = 0.01 / 5.0
+        self.multi_view_max_dis_relative= 0.3  # = 1.5 / 5.0
+        self.multi_view_num= 8
+
+        # Multiview loss
+        self.multi_view_patch_size= 3
+        self.multi_view_pixel_noise_th= 1.0
+
+        self.multi_view_depth_ratio= 0.6
+        self.multi_view_znear_relative= 0.02  # znear relative to scene radius (0.02 = 0.1 / 5.0 with 5.0 the standard COLMAP radius)
+        self.multi_view_interpolation= "bilinear"
+
+        self.multi_view_ncc_weight= 0.6
+        self.multi_view_geo_weight= 0.02 
+        
         super().__init__(parser, "Meshing Parameters")
 
 

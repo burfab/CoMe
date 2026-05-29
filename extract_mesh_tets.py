@@ -2,7 +2,7 @@ import torch
 from scene import Scene
 import os
 from os import makedirs
-from gaussian_renderer import render, integrate, ExtendedSettings, GlobalSortOrder
+from gaussian_renderer import render, integrate, compute_transmittance, ExtendedSettings, GlobalSortOrder
 from arguments import BoundingSetting, MeshingSettings
 import random
 from tqdm import tqdm
@@ -24,6 +24,7 @@ EXPORT_STEPS = [7]
 
 # This file is based on code from GOF (https://github.com/autonomousvision/gaussian-opacity-fields)
 # https://github.com/autonomousvision/gaussian-opacity-fields/blob/5245b20e5d11acd6d1ff5af4b890dc2bedd99693/extract_mesh.py#L17
+
 
 @torch.no_grad()
 def evaluate_alpha(points, views, gaussians, pipeline, background, kernel_size, splat_args: ExtendedSettings, exact_alpha_eval = False):

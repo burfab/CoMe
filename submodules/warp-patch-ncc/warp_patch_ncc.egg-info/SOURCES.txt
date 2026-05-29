@@ -1,0 +1,9 @@
+ext.cpp
+setup.py
+warp_patch_ncc.cu
+cuda_warp_patch_ncc/warp_patch_ncc_impl.cu
+warp_patch_ncc/__init__.py
+warp_patch_ncc.egg-info/PKG-INFO
+warp_patch_ncc.egg-info/SOURCES.txt
+warp_patch_ncc.egg-info/dependency_links.txt
+warp_patch_ncc.egg-info/top_level.txt

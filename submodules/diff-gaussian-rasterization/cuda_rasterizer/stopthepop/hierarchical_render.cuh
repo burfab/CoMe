@@ -106,7 +106,7 @@ struct TransmittanceVacancyBlobsToSpokes {
 
     __device__ float T(float t) const {
         const float dt      = t - t_peak;
-        const float G       = fminf(G_peak * __expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
+        const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
         return (t > t_peak) ? 1.f-G_peak : 1.f-G;
     }
 
@@ -151,7 +151,7 @@ struct TransmittanceVacancyBlobsToSpokes {
         return Ti;
     }
 };
-using TransmittanceVacancy = TransmittanceVacancyBlobsToSpokes;
+using TransmittanceVacancy = TransmittanceVacancyGSGS;
 
 template<typename T, size_t S>
 __device__ void initArray(T(&arr)[S], T v = 0)
@@ -1504,9 +1504,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
             // +++++++++Variance Loss ++++++++++
             // add variance of blended background color
             for (int ch = 0; ch < CHANNELS; ch++) {
-              // CHANGED VARIANCE BEHAVIOUR
-              // blend_data.variance += blend_data.T * (blend_data.gt_color[ch]
-              // - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
+				blend_data.variance += blend_data.T * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
             }
             // +++++++++Variance Loss ++++++++++
 
@@ -2038,6 +2036,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 		float last_normal[3] = { 0 };
 		float last_dL_dT = 0;
 
+		float variance_bg_color_term; 
 		float remaining_variance;
 		float remaining_normal_variance;
 		float remaining_A;
@@ -2142,16 +2141,29 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			}
 			if(inside)
 			{
-				bd.remaining_variance = pixel_colors[VARIANCE_OFFSET* H * W + pix_id];
+
+				bd.variance_bg_color_term = 0.f;
+				for(int ch = 0; ch < CHANNELS; ch++){
+					const float diff = (bd.gt_color[ch] - bg_color[ch]);
+					bd.variance_bg_color_term += (diff*diff);
+				}
+				bd.variance_bg_color_term *= bd.T_final;
+
+
+				bd.remaining_variance = pixel_colors[VARIANCE_OFFSET* H * W + pix_id] - bd.variance_bg_color_term;
 				bd.remaining_normal_variance = pixel_colors[NORMAL_VARIANCE_OFFSET* H * W + pix_id];
 				bd.dL_dvariance = dL_dpixels[VARIANCE_OFFSET * H * W + pix_id];
 				bd.dL_dnormal_variance = dL_dpixels[NORMAL_VARIANCE_OFFSET * H * W + pix_id];
+				
 			}
 			else
 			{
 				bd.remaining_variance = 0.f;
+				bd.remaining_normal_variance = 0.f;
 				bd.dL_dvariance = 0.f;
 				bd.dL_dnormal_variance = 0.f;
+
+				bd.variance_bg_color_term = 0.f;
 			}
 
 			//++++++++++++GOF
@@ -2388,6 +2400,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 
 			float dL_do = 0;
 			float inv_A = 1.f / AA;
+			float dLdepth_dG = 0.f;
 			if constexpr(!GSGS_TWO_PASS){
 			if (++blend_data.current_contributor == blend_data.max_contributor) {
 					blend_data.depth_global_id = global_id;
@@ -2465,6 +2478,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				//t = -B/(2A)
 				//dt/dA = 0.5 * B * inv_A * inv_A
 				//dt/dB = -0.5 * inv_A
+				
+				//also add this, this is just added to the 2d mean positions
+				dLdepth_dG = con_o.w * dT_dalpha * dL_dT_dtmed;
 
 				dL_do += dL_dT_dtmed * (dT_dalpha * G);
 				dL_dA += dL_dT_dtmed * (-0.5 * t*t * dT_dalpha * alpha + dT_dtpeak * 0.5f * BB * inv_A * inv_A + dT_dA);
@@ -2596,8 +2612,18 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			float bg_dot_dpixel = 0;
 			for (int i = 0; i < CHANNELS; i++)
 				bg_dot_dpixel += bg_color[i] * blend_data.dL_dpixel[i];
-			dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * bg_dot_dpixel;
 
+
+
+			dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * bg_dot_dpixel;
+				
+			//alpha also influences how much the background color adds to the variance loss
+			//variance wrt bg: blend_data.T_final * sum_ch ((blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]));
+			//dVar_dalpha = d_T_final/d_alpha * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch])
+			//d_T_final/d_alpha = -blend_data.T_final / (1.f-alpha)
+			#ifndef DETACH_ALPHA_COLOR_VARIANCE
+			dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * blend_data.variance_bg_color_term * blend_data.dL_dvariance;
+			#endif
 
 			// Helpful reusable temporary variables
 			const float dL_dG = con_o.w * dL_dalpha;
@@ -2607,16 +2633,19 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
 
 			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+			atomicAdd(&dL_dmean2D[global_id].x, (dL_dG + dLdepth_dG)* dG_ddelx * ddelx_dx);
+			atomicAdd(&dL_dmean2D[global_id].y, (dL_dG + dLdepth_dG)* dG_ddely * ddely_dy);
 			const float abs_dL_dmean2D = abs(dL_dG * dG_ddelx * ddelx_dx) + abs(dL_dG * dG_ddely * ddely_dy);
             atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
 
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			// atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			// atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			// atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+			//not needed anymore
+			/*
+			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * (0*dL_dG+dLdepth_dG));
+			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * (0*dL_dG+dLdepth_dG));
+			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * (0*dL_dG+dLdepth_dG));
+			*/
 
 			// Update gradients w.r.t. opacity of the Gaussian
 			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha + dL_do);
@@ -2890,9 +2919,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 
 
 			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			// atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-			// atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * dL_dG);
-			// atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+			/*
+			atomicAdd(&dL_dconic2D[id].x, -0.5f * gdx * d.x * dL_dG);
+			atomicAdd(&dL_dconic2D[id].y, -0.5f * gdx * d.y * dL_dG);
+			atomicAdd(&dL_dconic2D[id].w, -0.5f * gdy * d.y * dL_dG);
+			*/
 
 			// Update gradients w.r.t. opacity of the Gaussian
 			float dL_do = 0.f;

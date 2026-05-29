@@ -171,9 +171,45 @@ extern template class ExtraFeaturesBlender<16>;
 		const dim3 grid,
 		uint32_t* tiles_touched,
 		float* alpha,
+		bool prefiltered,bool cull);
+
+
+	void PreprocessPointsForTransmittanceEval(int PN, int D, int M,
+		const float* points3D,
+		const float* viewmatrix,
+		const float* projmatrix,
+		const glm::vec3* cam_pos,
+		const int W, int H,
+		const float focal_x, float focal_y,
+		const float tan_fovx, float tan_fovy,
+		float2* points2D,
+		float* opacity_field,
+		float* depths,
+		const dim3 grid,
+		uint32_t* tiles_touched,
+		float* alpha,
 		bool prefiltered);
 
-	// Main rasterization method.
+
+	void evaluateTransmittance(
+		const dim3 grid, dim3 block, const uint2 *gaussian_ranges,
+		const uint2 *point_ranges, const uint2 *tile_tile_mapping,
+		const uint32_t *gaussian_list, const uint32_t *point_list,
+		const uint64_t *gaussian_depths, int W, int H, int PN,
+		float focal_x, float focal_y, const float2 *points2D,
+		const float *view2gaussian,
+		const float *cov3Ds, const float4 *cov3D_inv,
+		const float *viewmatrix, const float *projmatrix_inv,
+		const float3 *means3D, const float3 *scales, const float *depths,
+		const float4 *conic_opacity, float *final_T, uint32_t *n_contrib,
+		// float* center_depth,
+		// float4* center_alphas,
+		const float *bg_color, const glm::vec3 *cam_pos,
+		const float2 *means2D, float *out_transmittance, bool *out_inside,
+		DebugVisualizationData &debugVisualization,
+		const SplattingSettings splatting_settings);
+
+        // Main rasterization method.
 	void integrate(
 		const dim3 grid, dim3 block,
 		const uint2* gaussian_ranges,
@@ -204,6 +240,37 @@ extern template class ExtraFeaturesBlender<16>;
 		const float2* means2D,
 		float* out_color,
 		float* out_alpha_integrated,
+		float* out_color_integrated,
+		DebugVisualizationData& debugVisualization,
+		const SplattingSettings splatting_settings);
+
+	void computeTransmittance(
+		const dim3 grid, dim3 block,
+		const uint2* gaussian_ranges,
+		const uint2* point_ranges,
+		const uint2* tile_tile_mapping,
+		const uint32_t* gaussian_list,
+		const uint32_t* point_list,
+		const uint64_t* gaussian_depths,
+		int W, int H, int PN,
+		float focal_x, float focal_y,
+		const float2* points2D,
+		const float * features,
+		const float* view2gaussian,
+		const float* cov3Ds,
+		const float4* cov3D_inv,
+		const float* viewmatrix,
+		const float* projmatrix_inv,
+		const float3* means3D,
+		const float3* scales,
+		const float* depths,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		const float *bg_color,
+		const glm::vec3* cam_pos,
+		const float2* means2D,
+		float* out_transmittance,
 		float* out_color_integrated,
 		DebugVisualizationData& debugVisualization,
 		const SplattingSettings splatting_settings);

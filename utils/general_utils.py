@@ -174,6 +174,75 @@ def build_rotation(r):
     R[:, 2, 2] = 1 - 2 * (x*x + y*y)
     return R
 
+def robust_sigma_inv(
+    g_scales: torch.Tensor,
+    g_rotation: torch.Tensor,
+    return_invscale_rot: bool = False,
+) -> torch.Tensor:
+    """
+    Compute the robust inverse covariance matrix for an anisotropic Gaussian,
+    given its scales and rotations.
+
+    Specifically, computes S^-1 @ R^T @ R @ S^-1 = (S^-1 @ R^T) @ (S^-1 @ R^T)^T,
+    where S is a scaling (diagonal) matrix and R is a rotation matrix.
+
+    Args:
+        g_scales (torch.Tensor): Shape (N, 3) or (B, k, 3)
+            The scaling components (standard deviations along each axis).
+        g_rotation (torch.Tensor): Shape (N, 4) or (B, k, 4)
+            The quaternion rotation of each Gaussian.
+
+    Returns:
+        torch.Tensor: The inverse covariance matrices with shape (N, 3, 3) or (B, k, 3, 3).
+    """
+    using_batches = g_scales.ndim == 3
+    if using_batches:
+        B, k, _ = g_scales.shape
+        g_scales = g_scales.view(-1, 3)
+        g_rotation = g_rotation.view(-1, 4)
+    # Build S^-1 @ R^T
+    M = build_scaling_rotation(
+        s=1. / g_scales,
+        r=g_rotation,
+    ).transpose(-1, -2)  # (..., 3, 3)
+    # Compute the full inverse covariance matrix
+    sigma_inv = M.transpose(-1, -2) @ M  # (..., 3, 3)
+    if using_batches:
+        sigma_inv = sigma_inv.view(B, k, 3, 3)
+        M = M.view(B, k, 3, 3)
+    if return_invscale_rot:
+        return sigma_inv, M
+    else:
+        return sigma_inv
+
+def robust_gaussian_eval_shifted_points(
+    shifted_points: torch.Tensor,
+    gaussian_invscale_rot: torch.Tensor,
+    gaussian_opacity: torch.Tensor,
+):
+    """
+    Evaluate the Gaussian density at given shifted points.
+
+    Args:
+        shifted_points (torch.Tensor): The shifted points. Shape (N, 3).
+        gaussian_invscale_rot (torch.Tensor): The inverse scale and rotation of the Gaussians. Shape (N, 3, 3).
+        gaussian_opacity (torch.Tensor): The opacity of the Gaussians. Shape (N, 1).
+    """
+    N = shifted_points.shape[0]
+
+    # M @ (x - mu)
+    transformed_shifts = torch.bmm(
+        gaussian_invscale_rot,  # (N, 3, 3)
+        shifted_points.unsqueeze(-1),  # (N, 3, 1)
+    ).squeeze(-1)  # (N, 3)
+
+    dist_sq = (transformed_shifts ** 2).sum(dim=-1, keepdim=True) # (N, 1)
+    gaussian_density = gaussian_opacity * torch.exp(
+        -0.5 * dist_sq
+    )  # (N, 1)
+
+    return gaussian_density
+
 def build_scaling_rotation(s, r):
     L = torch.zeros((s.shape[0], 3, 3), dtype=torch.float, device="cuda")
     R = build_rotation(r)

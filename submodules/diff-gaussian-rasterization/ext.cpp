@@ -17,6 +17,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rasterize_gaussians", &RasterizeGaussiansCUDA);
   m.def("extract_accum_alpha", &ExtractAccumAlphaCUDA);
   m.def("integrate_gaussians_to_points", &IntegrateGaussiansToPointsCUDA);
+  m.def("evaluate_transmittance_points", &EvaluateTransmittanceToPointsCUDA);
+  m.def("compute_transmittance", &ComputeTransmittanceCUDA);
   m.def("rasterize_gaussians_backward", &RasterizeGaussiansBackwardCUDA);
   m.def("mark_visible", &markVisible);
   

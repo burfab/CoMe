@@ -131,9 +131,9 @@ def tsdf_fusion(model_path, name, iteration, views, gaussians, pipeline, backgro
         cv2.namedWindow("WIN", cv2.WINDOW_NORMAL)
         for _, view in enumerate(tqdm(views_subsampled, desc="Rendering progress")):
             
+            splat_args.render_geometry=True
             rendering = render(view, gaussians, pipeline, background, splat_args=splat_args#, kernel_size=kernel_size
                                )["render"]
-            
             depth = rendering[6:7, :, :]
             alpha = rendering[7:8, :, :]
             rgb = rendering[:3, :, :]

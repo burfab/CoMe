@@ -377,7 +377,7 @@ __global__ void preprocessCUDA(int P, int D, int M,
 
 	// If colors have been precomputed, use them, otherwise convert
 	// spherical harmonics coefficients to RGB color.
-	if (colors_precomp == nullptr)
+	if (colors_precomp == nullptr && shs != nullptr)
 	{
 		glm::vec3 result;
 		result = computeColorFromSH(idx, D, M, mean3D, *cam_pos, shs, clamped);
@@ -1397,6 +1397,415 @@ void FORWARD::render_debug(DebugVisualizationData& debugVisualization, int P, fl
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
+template <uint32_t CHANNELS, bool ALPHA_EARLY_STOP=true, bool MIN_Z_BOUNDING=true>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+computeTransmittanceCUDA(
+	const uint2* __restrict__ gaussian_ranges,
+	const uint2* __restrict__ point_ranges,
+	const uint2* __restrict__ tile_tile_mapping,
+	const uint32_t* __restrict__ gaussian_list,
+	const uint32_t* __restrict__ point_list,
+	const uint64_t* __restrict__ gaussian_depths,
+	int W, int H,
+	float focal_x, float focal_y,
+	const float2* __restrict__ points2D,
+	const float* __restrict__ view2gaussian,
+	const float* __restrict__ cov3Ds,
+	const float* viewmatrix,
+	const float3* __restrict__ means3D,
+	const float3* __restrict__ scales,
+	const float* __restrict__ depths,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	float* __restrict__ out_transmittance,
+	float transmittance_threshold)
+{
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+
+	// indicates which point we're currently treating
+	const uint32_t thread_idx = block.thread_rank();
+
+	// Tile index computation is different
+	// 	- first, lookup in tile_tile_mapping for the actual tile_id (TTM.x)
+	// 	- then, lookup for the start_range (TTM.y)
+#ifdef OPT_TILE_LAUNCHES
+	const uint32_t BLOCK_IDX = block.group_index().y * horizontal_blocks + block.group_index().x;
+	// lookup for tile id
+	const uint32_t TILE_IDX = tile_tile_mapping[BLOCK_IDX].x;
+
+	uint2 p_range = point_ranges[TILE_IDX];
+	p_range.x += tile_tile_mapping[BLOCK_IDX].y;
+	// we do not do more than 256 points, no way in hell
+	p_range.y = min(p_range.x + BLOCK_SIZE, p_range.y);
+#else
+	const uint32_t TILE_IDX = block.group_index().y * horizontal_blocks + block.group_index().x;
+
+	uint2 p_range = point_ranges[TILE_IDX];
+#endif
+	const int p_rounds = ((p_range.y - p_range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int p_toDo = p_range.y - p_range.x;
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	// todo: pack depth and opacity with view2gaussian maybe?
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE]; // only need opacity
+	__shared__ float collected_view2gaussian[BLOCK_SIZE * 10];
+	__shared__ float collected_gaussiandepth[BLOCK_SIZE];
+
+	const uint2 range = gaussian_ranges[TILE_IDX];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	// first loop: how often to iterate over Points
+	for (int p_round = 0; p_round < p_rounds; p_round++, p_toDo -= BLOCK_SIZE)
+	{
+		float T = 1.0f;
+
+		// get point info
+		int p_progress = p_round * BLOCK_SIZE + thread_idx;
+
+		float2 current_point;
+		float current_point_depth;
+		uint32_t point_id;
+		float3 ray_point;
+
+		if (p_range.x + p_progress < p_range.y)
+		{
+			point_id = point_list[p_range.x + p_progress];
+
+			current_point = points2D[point_id];
+			current_point_depth = depths[point_id];
+			ray_point = { 
+				(current_point.x - W/2.f) / focal_x, 
+				(current_point.y - H/2.f) / focal_y, 
+				1.0f 
+			};
+		}
+		block.sync();
+
+		int toDo = range.y - range.x;
+
+		bool active = thread_idx < p_toDo;
+		bool done = !active;
+
+		// Iterate over batches until all done or range is complete
+		for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+		{
+			// End if entire block votes that it is done rasterizing
+			int num_done = __syncthreads_count(done);
+			if (num_done == BLOCK_SIZE)
+				break;
+
+			// Collectively fetch per-Gaussian data from global to shared
+			int progress = i * BLOCK_SIZE + block.thread_rank();
+			if (range.x + progress < range.y)
+			{
+				int coll_id = gaussian_list[range.x + progress];
+				collected_id[block.thread_rank()] = coll_id;
+				collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+				for (int ii = 0; ii < 10; ii++)
+					collected_view2gaussian[10 * block.thread_rank() + ii] = view2gaussian[coll_id * 10 + ii];
+				if constexpr (MIN_Z_BOUNDING)
+					collected_gaussiandepth[block.thread_rank()] = __uint_as_float(gaussian_depths[range.x + progress]);
+			}
+			block.sync();
+
+			// Iterate over current batch
+			for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+			{
+				float4 con_o = collected_conic_opacity[j];
+				float* view2gaussian_j = collected_view2gaussian + j * 10;
+
+				if constexpr (MIN_Z_BOUNDING) {
+					float gaussian_depth = collected_gaussiandepth[j];
+					if (gaussian_depth > current_point_depth) {
+						done = true;
+						continue;
+					}
+				}
+
+				const float normal[3] = { 
+					view2gaussian_j[0] * ray_point.x + view2gaussian_j[1] * ray_point.y + view2gaussian_j[2], 
+					view2gaussian_j[1] * ray_point.x + view2gaussian_j[3] * ray_point.y + view2gaussian_j[4],
+					view2gaussian_j[2] * ray_point.x + view2gaussian_j[4] * ray_point.y + view2gaussian_j[5]
+				};
+
+				// use AA, BB, CC so that the name is unique
+				double AA = ray_point.x * normal[0] + ray_point.y * normal[1] + normal[2];
+				double BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
+				float CC = view2gaussian_j[9];
+				
+				// t is the depth of the gaussian
+				float t = -BB/(2*AA);
+				// depth must be positive otherwise it is not valid and we skip it
+
+				t = fminf(t, current_point_depth);
+				
+				double min_value = (AA * t * t + BB * t + CC);
+
+				float power = -0.5f * min_value;
+				if (power > 0.0f){
+					power = 0.0f;
+				}
+
+				float alpha_point = min(0.99f, con_o.w * exp(power));
+
+				if (alpha_point < 1.0f / 255.0f) {
+					continue;
+				}
+
+				TransmittanceVacancy helper(AA, alpha_point, t);
+				auto Ti = helper.T(current_point_depth);
+
+				T *= Ti;
+
+				if constexpr (ALPHA_EARLY_STOP) {
+					if (T < transmittance_threshold) {
+						done = true;
+					}
+				}
+
+			}
+		}
+		if (active) {
+			out_transmittance[point_id] = T;
+		}
+	}
+}
+
+template <bool ALPHA_EARLY_STOP=true, bool MIN_Z_BOUNDING=true>
+__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
+evaluateTransmittanceCUDA(
+	const uint2* __restrict__ gaussian_ranges,
+	const uint2* __restrict__ point_ranges,
+	const uint2* __restrict__ tile_tile_mapping,
+	const uint32_t* __restrict__ gaussian_list,
+	const uint32_t* __restrict__ point_list,
+	const uint64_t* __restrict__ gaussian_depths,
+	int W, int H,
+	float focal_x, float focal_y,
+	const float2* __restrict__ points2D,
+	const float* __restrict__ view2gaussian,
+	const float* __restrict__ cov3Ds,
+	const float* viewmatrix,
+	const float3* __restrict__ means3D,
+	const float3* __restrict__ scales,
+	const float* __restrict__ depths,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ out_transmittance,
+	bool* __restrict__ out_inside)
+{
+	// Identify current tile and associated min/max pixel range.
+	auto block = cg::this_thread_block();
+	const uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+
+	// indicates which point we're currently treating
+	const uint32_t thread_idx = block.thread_rank();
+
+	// Tile index computation is different
+	// 	- first, lookup in tile_tile_mapping for the actual tile_id (TTM.x)
+	// 	- then, lookup for the start_range (TTM.y)
+#ifdef OPT_TILE_LAUNCHES
+	const uint32_t BLOCK_IDX = block.group_index().y * horizontal_blocks + block.group_index().x;
+	// lookup for tile id
+	const uint32_t TILE_IDX = tile_tile_mapping[BLOCK_IDX].x;
+
+	uint2 p_range = point_ranges[TILE_IDX];
+	p_range.x += tile_tile_mapping[BLOCK_IDX].y;
+	// we do not do more than 256 points, no way in hell
+	p_range.y = min(p_range.x + BLOCK_SIZE, p_range.y);
+	#ifdef DEBUG_TILE_LAUNCHES
+		if (block.thread_rank() == 0) {
+			printf("BLOCK/TILE %d/%d: range [%d,%d]\n", BLOCK_IDX, TILE_IDX, p_range.x, p_range.y);
+		}
+	#endif
+#else
+	const uint32_t TILE_IDX = block.group_index().y * horizontal_blocks + block.group_index().x;
+
+	uint2 p_range = point_ranges[TILE_IDX];
+#endif
+	const int p_rounds = ((p_range.y - p_range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+	int p_toDo = p_range.y - p_range.x;
+
+	assert(p_rounds <= 1);
+
+#ifdef DEBUG_TILE_LAUNCHES
+	assert(p_toDo <= 256);
+#endif
+
+#ifdef DEBUG_INTEGRATE
+	if (thread_idx == 0) {
+		printf("TILE %d: points rounds todo %d for %d points\n", TILE_IDX, p_rounds, p_toDo);
+	}
+#endif
+
+	// Allocate storage for batches of collectively fetched data.
+	__shared__ int collected_id[BLOCK_SIZE];
+	// todo: pack depth and opacity with view2gaussian maybe?
+	__shared__ float4 collected_conic_opacity[BLOCK_SIZE]; // only need opacity
+	__shared__ float collected_view2gaussian[BLOCK_SIZE * VIEW2GAUSSIAN_OFFSET];
+	__shared__ float collected_gaussiandepth[BLOCK_SIZE];
+	
+
+	const uint2 range = gaussian_ranges[TILE_IDX];
+	const int rounds = ((range.y - range.x + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+	// first loop: how often to iterate over Points
+	for (int p_round = 0; p_round < p_rounds; p_round++, p_toDo -= BLOCK_SIZE)
+	{
+		float T = 1.0f;
+		float T_blend = 1.0f;
+
+		// get point info
+		int p_progress = p_round * BLOCK_SIZE + thread_idx;
+
+		float2 current_point;
+		float current_point_depth;
+		uint32_t point_id;
+		float3 ray_point;
+
+		if (p_range.x + p_progress < p_range.y)
+		{
+			point_id = point_list[p_range.x + p_progress];
+
+			current_point = points2D[point_id];
+			current_point_depth = depths[point_id];
+			ray_point = { 
+				(current_point.x - W/2.f) / focal_x, 
+				(current_point.y - H/2.f) / focal_y, 
+				1.0f 
+			};
+		}
+		block.sync();
+
+#ifdef DEBUG_INTEGRATE
+		if (point_id == POINT_TO_DEBUG) {
+			printf("Point %f/%f -> %f\n", current_point.x, current_point.y, current_point_depth);
+			printf("Ray %f/%f/%f\n", (current_point.x - W/2.) / focal_x, (current_point.y - H/2.) / focal_y, 1.0f );
+		}
+#endif 
+
+		int toDo = range.y - range.x;
+
+#ifdef DEBUG_INTEGRATE
+		if (block.thread_rank() == 0 && p_rounds > 1) {
+			printf("TILE %d: Round %d/%d, points left: %d\n", TILE_IDX, p_round, p_rounds, p_toDo);
+		}
+#endif
+
+		uint32_t contributor = 0;
+		bool active = thread_idx < p_toDo;
+		bool done = !active;
+
+		// Iterate over batches until all done or range is complete
+		for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
+		{
+			// End if entire block votes that it is done rasterizing
+			int num_done = __syncthreads_count(done);
+			if (num_done == BLOCK_SIZE)
+				break;
+
+			// Collectively fetch per-Gaussian data from global to shared
+			int progress = i * BLOCK_SIZE + block.thread_rank();
+			if (range.x + progress < range.y)
+			{
+				int coll_id = gaussian_list[range.x + progress];
+				collected_id[block.thread_rank()] = coll_id;
+				collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
+				for (int ii = 0; ii < VIEW2GAUSSIAN_OFFSET; ii++)
+					collected_view2gaussian[VIEW2GAUSSIAN_OFFSET * block.thread_rank() + ii] = view2gaussian[coll_id * VIEW2GAUSSIAN_OFFSET + ii];
+				if constexpr (MIN_Z_BOUNDING)
+					collected_gaussiandepth[block.thread_rank()] = __uint_as_float(gaussian_depths[range.x + progress]);
+			}
+			block.sync();
+
+			// Iterate over current batch
+			for (int j = 0; !done && j < min(BLOCK_SIZE, toDo); j++)
+			{
+				// Keep track of current position in range
+				contributor++;
+
+#ifdef DEBUG_MIN_Z_BOUNDING
+				if (thread_idx == 0 && BLOCK_IDX == 0) {
+					printf("G %d/%d: \t%.4f\n", collected_id[j], contributor, collected_gaussiandepth[j]);
+				}
+#endif
+				float4 con_o = collected_conic_opacity[j];
+				float* view2gaussian_j = collected_view2gaussian + j * VIEW2GAUSSIAN_OFFSET;
+
+				if constexpr (MIN_Z_BOUNDING) {
+					float gaussian_depth = collected_gaussiandepth[j];
+					if (gaussian_depth > current_point_depth) {
+						done = true;
+						continue;
+					}
+				}
+
+				const float normal[3] = { 
+					view2gaussian_j[0] * ray_point.x + view2gaussian_j[1] * ray_point.y + view2gaussian_j[2], 
+					view2gaussian_j[1] * ray_point.x + view2gaussian_j[3] * ray_point.y + view2gaussian_j[4],
+					view2gaussian_j[2] * ray_point.x + view2gaussian_j[4] * ray_point.y + view2gaussian_j[5]
+				};
+
+				// use AA, BB, CC so that the name is unique
+				double AA = ray_point.x * normal[0] + ray_point.y * normal[1] + normal[2];
+				double BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
+				float CC = view2gaussian_j[9];
+				
+				// depth must be positive otherwise it is not valid and we skip it
+				//TODO: not sure about this one
+				float tt = -BB/(2*AA);
+				tt = fminf(tt, current_point_depth);
+				float min_value = (AA * tt * tt + BB * tt + CC);
+
+				float power = -0.5f * min_value;
+				if (power > 0.0f){
+					power = 0.0f;
+				}
+
+				float alpha_point = min(0.99f, con_o.w * exp(power));
+
+#ifdef DEBUG_INTEGRATE
+				if (point_id == POINT_TO_DEBUG) {
+					printf("Gaussian %d: alpha %f/%f, T %f, depth %f\n", collected_id[j], alpha, alpha_point, T, t);
+				}
+#endif 
+
+				if (alpha_point < 1.0f / 255.0f) {
+					continue;
+				}
+
+				float test_T = T_blend * (1.f - alpha_point);
+				if(test_T < 0.0001) {done = true; continue;}
+
+				TransmittanceVacancy helper(AA, alpha_point, tt);
+				const auto Ti = helper.T(current_point_depth);
+
+				T=T*Ti;
+					
+				T_blend = test_T;
+			}
+		}
+		if (active) {
+			out_transmittance[point_id] = T;
+			out_inside[point_id] = true;
+#ifdef DEBUG_OPACITY_FIELD
+			// filter out the really wrong one
+			if (alpha < 0.5f) {
+				printf("[%.2f, %.2f]: depth %.4f, dir %.3f/%.3f/%.3f\n", points2D[point_id].x, points2D[point_id].y, depths[point_id],
+					(current_point.x - W/2.f) / focal_x, (current_point.y -H/2.f) / focal_y, 1.0f);
+			}
+#endif
+		}
+	}
+}
+
+
+// Main rasterization method. Collaboratively works on one tile per
+// block, each thread treats one pixel. Alternates between fetching 
+// and rasterizing data.
 template <uint32_t CHANNELS, bool ALPHA_EARLY_STOP=true, bool MIN_Z_BOUNDING=true, bool RETURN_COLOR=true>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 integrateCUDA(
@@ -1487,8 +1896,7 @@ integrateCUDA(
 		[[maybe_unused]] float T_blend = 1.0f;
 		[[maybe_unused]] float C[CHANNELS] = { 0.f };
 		
-		float alpha = 1.0f;
-		float alpha_final = 0.0f;
+		float alpha = 0.0f;
 
 		// get point info
 		int p_progress = p_round * BLOCK_SIZE + thread_idx;
@@ -1548,7 +1956,7 @@ integrateCUDA(
 				collected_conic_opacity[block.thread_rank()] = conic_opacity[coll_id];
 				for (int ii = 0; ii < VIEW2GAUSSIAN_OFFSET; ii++)
 					collected_view2gaussian[VIEW2GAUSSIAN_OFFSET * block.thread_rank() + ii] = view2gaussian[coll_id * VIEW2GAUSSIAN_OFFSET + ii];
-				if constexpr (MIN_Z_BOUNDING && false)
+				if constexpr (MIN_Z_BOUNDING)
 					collected_gaussiandepth[block.thread_rank()] = __uint_as_float(gaussian_depths[range.x + progress]);
 				if constexpr (RETURN_COLOR) {
 					for (int ii = 0; ii < CHANNELS; ii++)
@@ -1571,7 +1979,7 @@ integrateCUDA(
 				float4 con_o = collected_conic_opacity[j];
 				float* view2gaussian_j = collected_view2gaussian + j * VIEW2GAUSSIAN_OFFSET;
 
-				if constexpr (MIN_Z_BOUNDING && false) {
+				if constexpr (MIN_Z_BOUNDING) {
 					float gaussian_depth = collected_gaussiandepth[j];
 					if (gaussian_depth > current_point_depth) {
 						done = true;
@@ -1590,29 +1998,16 @@ integrateCUDA(
 				double BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
 				float CC = view2gaussian_j[9];
 				
-				const float t_peak = -BB/(2*AA);
 				// depth must be positive otherwise it is not valid and we skip it
-				const float tt = fminf(t_peak, current_point_depth);
+				float tt = fminf(-BB/(2*AA), current_point_depth);
 				double min_value = (AA * tt * tt + BB * tt + CC);
 
 				float power = -0.5f * min_value;
 				if (power > 0.0f){
 					power = 0.0f;
 				}
+
 				float alpha_point = min(0.99f, con_o.w * exp(power));
-
-				float G_peak = [&]()
-				{
-					double min_value = (AA * t_peak * t_peak + BB * t_peak + CC);
-
-					float power = -0.5f * min_value;
-					if (power > 0.0f){
-						power = 0.0f;
-					}
-					float alpha_point = min(0.99f, con_o.w * exp(power));
-					return alpha_point;
-				}();
-
 
 #ifdef DEBUG_INTEGRATE
 				if (point_id == POINT_TO_DEBUG) {
@@ -1620,16 +2015,22 @@ integrateCUDA(
 				}
 #endif 
 
-				if (G_peak < 1.0f / ALPHA_THRESHOLD_INV) {
+				if (alpha_point < 1.0f / 255.0f) {
 					continue;
 				}
 
-				TransmittanceVacancy transmittance_helper(AA, G_peak, t_peak);
-				alpha *= transmittance_helper.T(tt);
+				alpha += alpha_point * T;
 
 				if constexpr (RETURN_COLOR) {
 					// t is the depth of the gaussian
-					float alpha_blend = G_peak;
+					float t = -BB/(2*AA);
+					min_value = (AA * t * t + BB * t + CC);
+
+					power = -0.5f * min_value;
+					if (power > 0.0f){
+						power = 0.0f;
+					}
+					float alpha_blend = min(0.99f, con_o.w * exp(power));
 					float test_T = T_blend * (1 - alpha_blend);
 					if (test_T >= 0.0001f) {
 						for (int ch = 0; ch < CHANNELS; ch++) {
@@ -1639,22 +2040,19 @@ integrateCUDA(
 					T_blend = test_T;
 				}
 
-
 				// hmm, isnt this already opa
-				T *= (1 - G_peak);
-				if(T < 0.0001f) done = true;
+				T *= (1 - alpha_point);
 
-				if constexpr (false && ALPHA_EARLY_STOP && !RETURN_COLOR) {
-					if (alpha < 0.5f) {
+				if constexpr (ALPHA_EARLY_STOP && !RETURN_COLOR) {
+					if (alpha > 0.5000001f) {
 						done = true;
 					}
 				}
 
 			}
 		}
-		alpha_final = 1-alpha;
 		if (active) {
-			out_alpha_integrated[point_id] = fminf(alpha_final, out_alpha_integrated[point_id]);
+			out_alpha_integrated[point_id] = fminf(alpha, out_alpha_integrated[point_id]);
 #ifdef DEBUG_OPACITY_FIELD
 			// filter out the really wrong one
 			if (alpha < 0.5f) {
@@ -1664,12 +2062,33 @@ integrateCUDA(
 #endif
 			if constexpr (RETURN_COLOR) {
 				for (int ch = 0; ch < CHANNELS; ch++)
-				//replaced T with T_blend
-				//further, trying to normalize color by T_blend
-					out_color_integrated[point_id * CHANNELS + ch] = C[ch]+ T_blend * bg_color[ch];
+					out_color_integrated[point_id * CHANNELS + ch] = C[ch] + T * bg_color[ch];
 			}
 		}
 	}
+}
+
+void FORWARD::evaluateTransmittance(
+    const dim3 grid, dim3 block, const uint2 *gaussian_ranges,
+    const uint2 *point_ranges, const uint2 *tile_tile_mapping,
+    const uint32_t *gaussian_list, const uint32_t *point_list,
+    const uint64_t *gaussian_depths, int W, int H, int PN, float focal_x,
+    float focal_y, const float2 *points2D, 
+    const float *view2gaussian, const float *cov3Ds, const float4 *cov3D_inv,
+    const float *viewmatrix, const float *projmatrix_inv, const float3 *means3D,
+    const float3 *scales, const float *depths, const float4 *conic_opacity,
+    float *final_T, uint32_t *n_contrib,
+    // float* center_depth,
+    // float4* center_alphas,
+    const float *bg_color, const glm::vec3 *cam_pos, const float2 *means2D,
+    float *out_transmittance, bool *out_inside,
+    DebugVisualizationData &debugVisualization,
+    const SplattingSettings splatting_settings) {
+  evaluateTransmittanceCUDA<false, false> << <grid, block >> > (
+      gaussian_ranges, point_ranges, tile_tile_mapping, gaussian_list,
+      point_list, gaussian_depths, W, H, focal_x, focal_y, points2D, 
+      view2gaussian, cov3Ds, viewmatrix, means3D, scales, depths, conic_opacity,
+      out_transmittance, out_inside);
 }
 
 void FORWARD::integrate(
@@ -1726,7 +2145,7 @@ void FORWARD::integrate(
 }
 
 template<int C>
-__global__ void preprocessPointsCUDA(int PN, int D, int M,
+__global__ void preprocessPointsForEvalTransmittanceCUDA(int PN, int D, int M,
 	const float* points3D,
 	const float* viewmatrix,
 	const float* projmatrix,
@@ -1751,11 +2170,57 @@ __global__ void preprocessPointsCUDA(int PN, int D, int M,
 	tiles_touched[idx] = 0;
 	depths[idx] = -1.f;
 
-#ifdef OPT_CULL_POINTS
-	if (alpha_integrated[idx] < 0.4999f) {
+	// Perform near culling, quit if outside.
+	float3 p_view;
+	if (!in_frustum_GOF(idx, points3D, viewmatrix, projmatrix, prefiltered, p_view))
+	{
 		return;
 	}
-#endif
+
+	float2 point_image = {focal_x * p_view.x / (p_view.z + 0.0000001f) + W/2., focal_y * p_view.y / (p_view.z + 0.0000001f) + H/2.};
+
+	// If the point is outside the image, quit.
+	if (point_image.x < 0 || point_image.x >= W || point_image.y < 0 || point_image.y >= H)
+	{
+		return;
+	}
+	//printf("Point is inside image\n");
+	// Store some useful helper data for the next steps.
+	depths[idx] = p_view.z;
+	points2D[idx] = point_image;
+	tiles_touched[idx] = 1;
+}
+
+
+template<int C>
+__global__ void preprocessPointsCUDA(int PN, int D, int M,
+	const float* points3D,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const glm::vec3* cam_pos,
+	const int W, int H,
+	const float tan_fovx, float tan_fovy,
+	const float focal_x, float focal_y,
+	float2* points2D,
+	float* opacity_field,
+	float* depths,
+	const dim3 grid,
+	uint32_t* tiles_touched,
+	const float* alpha_integrated,
+	bool prefiltered, bool cull)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= PN)
+		return;
+
+	// Initialize radius and touched tiles to 0. If this isn't changed,
+	// this Gaussian will not be processed further.
+	tiles_touched[idx] = 0;
+	depths[idx] = -1.f;
+
+	if (cull && alpha_integrated[idx] < 0.4999f) {
+		return;
+	}
 
 	// Perform near culling, quit if outside.
 	float3 p_view;
@@ -1778,7 +2243,7 @@ __global__ void preprocessPointsCUDA(int PN, int D, int M,
 	tiles_touched[idx] = 1;
 }
 
-void FORWARD::PreprocessPoints(int PN, int D, int M,
+void FORWARD::PreprocessPointsForTransmittanceEval(int PN, int D, int M,
 		const float* points3D,
 		const float* viewmatrix,
 		const float* projmatrix,
@@ -1795,7 +2260,7 @@ void FORWARD::PreprocessPoints(int PN, int D, int M,
 		bool prefiltered)
 {
 
-	preprocessPointsCUDA<NUM_CHANNELS> << <(PN + 255) / 256, 256 >> > (
+	preprocessPointsForEvalTransmittanceCUDA<NUM_CHANNELS> << <(PN + 255) / 256, 256 >> > (
 		PN, D, M,
 		points3D,
 		viewmatrix, 
@@ -1818,4 +2283,94 @@ void FORWARD::PreprocessPoints(int PN, int D, int M,
 	//}
 }
 
+
+void FORWARD::PreprocessPoints(int PN, int D, int M,
+		const float* points3D,
+		const float* viewmatrix,
+		const float* projmatrix,
+		const glm::vec3* cam_pos,
+		const int W, int H,
+		const float focal_x, float focal_y,
+		const float tan_fovx, float tan_fovy,
+		float2* points2D,
+		float* opacity_field,
+		float* depths,
+		const dim3 grid,
+		uint32_t* tiles_touched,
+		float* alpha,
+		bool prefiltered, bool cull)
+{
+
+	preprocessPointsCUDA<NUM_CHANNELS> << <(PN + 255) / 256, 256 >> > (
+		PN, D, M,
+		points3D,
+		viewmatrix, 
+		projmatrix,
+		cam_pos,
+		W, H,
+		tan_fovx, tan_fovy,
+		focal_x, focal_y,
+		points2D,
+		opacity_field,
+		depths,
+		grid,
+		tiles_touched,
+		alpha,
+		prefiltered, cull
+		);
+	//for(int i = 0; i < 100; i++)
+	//{
+	//	printf("2D Point: %f %f\n", points2D[i].x, points2D[i].y);
+	//}
+}
+
+void FORWARD::computeTransmittance(
+		const dim3 grid, dim3 block,
+		const uint2* gaussian_ranges,
+		const uint2* point_ranges,
+		const uint2* tile_tile_mapping,
+		const uint32_t* gaussian_list,
+		const uint32_t* point_list,
+		const uint64_t* gaussian_depths,
+		int W, int H, int PN,
+		float focal_x, float focal_y,
+		const float2* points2D,
+		const float * features,
+		const float* view2gaussian,
+		const float* cov3Ds,
+		const float4* cov3D_inv,
+		const float* viewmatrix,
+		const float* projmatrix_inv,
+		const float3* means3D,
+		const float3* scales,
+		const float* depths,
+		const float4* conic_opacity,
+		float* final_T,
+		uint32_t* n_contrib,
+		const float *bg_color,
+		const glm::vec3* cam_pos,
+		const float2* means2D,
+		float* out_transmittance,
+		float* out_color_integrated,
+		DebugVisualizationData& debugVisualization,
+		const SplattingSettings splatting_settings)
+{
+#define TRANSMITTANCE_CALL(ALPHA_EARLY_STOP, MIN_Z_BOUND) computeTransmittanceCUDA<NUM_CHANNELS, true, false> << <grid, block >> > ( \
+		gaussian_ranges,point_ranges,tile_tile_mapping,gaussian_list,point_list,gaussian_depths,W, H,focal_x, focal_y,\
+		points2D, view2gaussian,cov3Ds,viewmatrix,means3D,scales,depths,conic_opacity,final_T,n_contrib, out_transmittance, splatting_settings.meshing_settings.transmittance_threshold);
+
+
+
+#define TRANSMITTANCE_Z_BOUND(ALPHA_EARLY_STOP) if (splatting_settings.sort_settings.sort_order == GlobalSortOrder::MIN_VIEWSPACE_Z) TRANSMITTANCE_CALL(ALPHA_EARLY_STOP, true) else TRANSMITTANCE_CALL(ALPHA_EARLY_STOP, false)
+
+	if (splatting_settings.meshing_settings.alpha_early_stop) {
+		TRANSMITTANCE_Z_BOUND(true);
+	}
+	else {
+		TRANSMITTANCE_Z_BOUND(false);
+	}
+
+#undef TRANSMITTANCE_Z_BOUND
+#undef TRANSMITTANCE_CALL
+}
 

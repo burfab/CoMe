@@ -11,6 +11,8 @@ import numpy as np
 import pycolmap
 import open3d as o3d
 
+from utils import camera_filtering
+
 def filter_small_blobs(mask: np.ndarray, area_threshold_ratio: float = 0.05) -> np.ndarray:
     """
     Removes connected components (blobs) that are smaller than a percentage of the total image area.
@@ -256,6 +258,9 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
     
     print("Processing datasets with symmetric crop and zoom-to-resolution pipeline...")
     
+    camera_pose_filtering_data = {}
+    
+    seen_cameras = set()
     for src_path in tqdm.tqdm(list(iter_files(images_in))):
         if src_path.name.endswith(".json"): continue
         stem = src_path.stem
@@ -348,6 +353,9 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
         img_out_path.parent.mkdir(parents=True, exist_ok=True)
         cv2.imwrite(str(img_out_path), img_zoomed)
         
+        img_for_camera_filtering = img_zoomed
+        img_mask_for_camera_filtering = None
+        
         if mask_undist is not None:
             mask_scaled = cv2.resize(crop_and_pad_image(mask_undist, minx, maxx, miny, maxy), (inter_w, inter_h), interpolation=cv2.INTER_NEAREST)
             mask_zoomed = crop_and_pad_image(mask_scaled, 
@@ -356,6 +364,8 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
             mask_out_path = masks_out / rel_stem
             mask_out_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(mask_out_path), mask_zoomed)
+            
+            img_mask_for_camera_filtering = mask_zoomed > 0
             
         if seg_undist is not None:
             seg_scaled = cv2.resize(crop_and_pad_image(seg_undist, minx, maxx, miny, maxy), (inter_w, inter_h), interpolation=cv2.INTER_NEAREST)
@@ -366,6 +376,12 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
             seg_out_path.parent.mkdir(parents=True, exist_ok=True)
             cv2.imwrite(str(seg_out_path), seg_zoomed)
             
+            if img_mask_for_camera_filtering is None:
+                img_mask_for_camera_filtering = seg_zoomed > 0
+                
+            
+            
+            
         # 4. Scale focal lengths uniformly to adjust for the geometric zoom factor
         K_zoom = K_new.copy()
         K_zoom[0, 0] *= scale_uniform  # fx
@@ -373,14 +389,26 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
         K_zoom[0, 2] = W_new / 2.0     # cx (perfectly centered)
         K_zoom[1, 2] = H_new / 2.0     # cy (perfectly centered)
         
+        
+        
         cam_id = f"cam_{img_colmap.image_id}"
         R_wc = img_colmap.cam_from_world().rotation.matrix()
         t_wc = np.asarray(img_colmap.cam_from_world().translation, dtype=np.float64)
+        
+        
+        
         
         try:
             ID = int(stem) - 1
         except ValueError:
             ID = img_colmap.image_id
+            
+            
+        camera_pose_filtering_data[ID] = {
+            "image_score": camera_filtering.compute_sharpness(img_for_camera_filtering, img_mask_for_camera_filtering),
+            "R_w2c": R_wc,
+            "t_w2c": t_wc
+        }
             
         frames.append({
             "image": rel_stem.name,
@@ -390,15 +418,24 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
             "id": int(ID),
             "R": R_wc.tolist(),
             "T": t_wc.tolist(),
-            "camera_id": cam_id
+            "camera_id": cam_id,
+            "redundant": False
         })
         
-        cameras_json.append({
-            "camera_id": cam_id,
-            "K": K_zoom.tolist(),
-            "width": int(W_new),
-            "height": int(H_new),
-        })
+        if cam_id not in seen_cameras:
+            cameras_json.append({
+                "camera_id": cam_id,
+                "K": K_zoom.tolist(),
+                "width": int(W_new),
+                "height": int(H_new),
+            })
+            seen_cameras.add(cam_id)
+        
+        
+    print("Filtering based on camera pose and image score")
+    filtered_list = camera_filtering.filter_and_visualize_poses_adaptive(camera_pose_filtering_data, pos_threshold=None, K=4.5, angle_threshold_deg=5) 
+    
+    for i in range(len(frames)): frames[i]["redundant"] = frames[i]["id"] not in filtered_list
         
     return frames, cameras_json
 
@@ -456,6 +493,10 @@ def main():
     frames, cameras_json = process_dataset(
         input_dir, output_dir, recon, cv_cameras, has_segmentation, args.padding, args.mul_of
     )
+    
+    
+    
+    
 
     write_cameras_json(output_dir / "cameras.json", frames, cameras_json)
     write_points3D_ply(output_dir / "points3D.ply", recon)

@@ -29,6 +29,7 @@ from utils import segmentation_utils
 from utils import deform_utils
 from utils import densify_utils
 import utils.normal_field 
+import utils.multiview
 from scene.gaussian_model import build_scaling_rotation
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
 from decoupled_fused_ssim import fused_ssim
@@ -202,7 +203,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     
     
-    
+    multi_view_state = utils.multiview.initialize_multiview_regularization(scene, pipe, 0.0, mesh)
     
     for iteration in range(first_iter, opt.iterations + 1):        
         if batch is None or batch.complete():
@@ -281,12 +282,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     render_pkg = render(c, gaussians, pipe, bg, splat_args=splat_args, gt_color=None, deformation=deform_utils.Deformation(), extract_final_T=True)
                     mask = 1-render_pkg["final_T"].squeeze(0)
                     masks_selfgenerated[c.uid] = mask.detach().cpu() #torch.nn.functional.sigmoid((mask.detach()- 0.9) * 20).cpu()  
-                    D = render_pkg["render"][6].detach().cpu()
-                    N = render_pkg["render"][3:6].detach().cpu()
-                    C = render_pkg["render"][:3].detach().cpu()
-                    C2 = c.original_image.detach().cpu()
-                    K = intrinsics_from_view(c).cpu()
-                    torch.save((D,N,C, C2, c.world_view_transform.cpu().detach(),K),f"/tmp/test/{c.uid}.pth")
+                    if os.path.exists("/tmp/test") and os.path.isdir("/tmp/test"):
+                        D = render_pkg["render"][6].detach().cpu()
+                        N = render_pkg["render"][3:6].detach().cpu()
+                        C = render_pkg["render"][:3].detach().cpu()
+                        C2 = c.original_image.detach().cpu()
+                        K = intrinsics_from_view(c).cpu()
+                        torch.save((D,N,C, C2, c.world_view_transform.cpu().detach(),K),f"/tmp/test/{c.uid}.pth")
                     cv2.imshow("MASK",(masks_selfgenerated[c.uid].numpy()*255).astype(np.uint8))
                     cv2.waitKey(1)
                 cv2.destroyAllWindows()
@@ -320,7 +322,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         if (iteration - 1) == debug_from:
             pipe.debug = True
 
-        if iteration > (mesh.depth_normal_from_iter and mesh.lambda_depth_normal > 0.0) or normal_field_kick_on:
+        splat_args.render_geometry = False
+        if (iteration > mesh.depth_normal_from_iter and mesh.lambda_depth_normal > 0.0) or normal_field_kick_on:
             splat_args.render_geometry = True
             
         if iteration > mesh.distortion_from_iter and mesh.lambda_opacity_field > 0.0:
@@ -339,6 +342,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         render_pkg = render(viewpoint_cam, gaussians, pipe, bg, splat_args=splat_args, gt_color=gt_image.detach(), deformation=deformation)
         rendering, viewspace_point_tensor, visibility_filter, radii, cov2D = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["cov2D"]
         
+        
+        multiview_render_fn = partial(render, splat_args=splat_args, gt_color=None, deformation=deformation)
+        multiview_loss = utils.multiview.compute_multiview_regularization(iteration, scene, render_pkg, viewpoint_cam, viewpoint_cam.idx, gaussians, multiview_render_fn, pipe, bg, mesh, multi_view_state, 0.0)
 
         opacity = rendering[7]
         image = rendering[:3, :, :]
@@ -432,7 +438,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             depth[depth.isnan()] = 0.0
         
         
-        depth_normal, _ = depth_to_normal(viewpoint_cam, depth[None, ...], cam_space=False)
+        depth_normal, _ = depth_to_normal(viewpoint_cam, depth[None,...],cam_space=False, mask= depth>0)
         depth_normal = depth_normal.permute(2, 0, 1)
 
         render_normal = rendering[3:6, :, :]
@@ -522,7 +528,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     occupation_loss  + \
                     (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
                     (temp_lambdas["surface_L_lambda"] if iteration >= mesh.distortion_from_iter else 0) * (surface_L*mask).mean() + \
-                    lambda_depth_smoothness * depth_smoothness_loss
+                    lambda_depth_smoothness * depth_smoothness_loss + \
+                    multiview_loss["multiview_loss"] * mesh.multi_view_lambda
                     
                     
             if normal_field_kick_on:
