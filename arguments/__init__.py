@@ -193,8 +193,8 @@ class OptimizationParams(ParamGroup):
         self.position_lr_final = 0.0000016
         self.position_lr_delay_mult = 0.01
         self.position_lr_max_steps = 30_000
-        self.feature_lr = 0.0025 * 3
-        self.confidence_lr = 0.00025 * 3
+        self.feature_lr = 0.0025
+        self.confidence_lr = 0.00025
         self.learned_normals_lr = 0.05/2.0
         self.segmentation_lr = 1e-3 
         self.segmentation_network_lr = 1e-4
@@ -345,6 +345,10 @@ class MeshingParams(ParamGroup):
 
         self.multi_view_ncc_weight= 0.6
         self.multi_view_geo_weight= 0.02 
+        
+        
+        self.use_normal_field = False
+        
         
         super().__init__(parser, "Meshing Parameters")
 

@@ -27,10 +27,31 @@ class LPIPS(nn.Module):
         self.lin = LinLayers(self.net.n_channels_list)
         self.lin.load_state_dict(get_state_dict(net_type, version))
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor):
+    def forward(self, x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor = None):
         feat_x, feat_y = self.net(x), self.net(y)
 
         diff = [(fx - fy) ** 2 for fx, fy in zip(feat_x, feat_y)]
-        res = [l(d).mean((2, 3), True) for d, l in zip(diff, self.lin)]
+
+        if mask is not None:
+            mask = mask.float()
+
+        res = []
+        for d, l in zip(diff, self.lin):
+            v = l(d)  # [B,1,H,W]
+
+            if mask is not None:
+                # resize mask to feature resolution
+                m = torch.nn.functional.interpolate(
+                    mask,
+                    size=v.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+                v = (v * m).sum((2, 3), True) / (m.sum((2, 3), True) + 1e-8)
+            else:
+                v = v.mean((2, 3), True)
+
+            res.append(v)
 
         return torch.sum(torch.cat(res, 0), 0, True)

@@ -32,7 +32,7 @@ def create_window(window_size, channel):
     window = Variable(_2D_window.expand(channel, 1, window_size, window_size).contiguous())
     return window
 
-def ssim(img1, img2, window_size=11, size_average=True):
+def ssim(img1, img2, window_size=11, size_average=True, mask=None):
     channel = img1.size(-3)
     window = create_window(window_size, channel)
 
@@ -40,7 +40,18 @@ def ssim(img1, img2, window_size=11, size_average=True):
         window = window.cuda(img1.get_device())
     window = window.type_as(img1)
 
-    return _ssim(img1, img2, window, window_size, channel, size_average)
+    ssim_map = _ssim(img1, img2, window, window_size, channel, size_average=False)
+    if mask is not None:
+        mask = mask.expand_as(ssim_map)
+        ssim_map = ssim_map * mask
+
+    if size_average:
+        if mask is not None:
+            return ssim_map.sum() / (mask.sum() + 1e-8)
+        else:
+            return ssim_map.mean()
+    else:
+        return ssim_map
 
 def _ssim(img1, img2, window, window_size, channel, size_average=True):
     mu1 = F.conv2d(img1, window, padding=window_size // 2, groups=channel)

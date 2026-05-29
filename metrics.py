@@ -21,18 +21,30 @@ from tqdm import tqdm
 from utils.image_utils import psnr
 from argparse import ArgumentParser
 from utils.flip import LDRFLIPLoss
+import cv2
+import numpy as np
 
-def readImages(renders_dir, gt_dir):
+def readImages(renders_dir, gt_dir, masks_dir=None):
     renders = []
     gts = []
     image_names = []
+    masks = []
     for fname in os.listdir(renders_dir):
         render = Image.open(renders_dir / fname)
         gt = Image.open(gt_dir / fname)
+        mask = None
+        if not masks_dir is None:
+            mask = cv2.imread(masks_dir / fname, cv2.IMREAD_UNCHANGED)
+            if mask.dtype == np.uint8: mask = mask / 255
+                
+            if mask.ndim == 3: mask = mask.squeeze(-1)
+            assert mask.ndim == 2
+        
         renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
         gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
+        masks.append(None if mask is None else torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).cuda())
         image_names.append(fname)
-    return renders, gts, image_names
+    return renders, gts, masks, image_names
 
 def evaluate(model_paths):
 
@@ -52,7 +64,7 @@ def evaluate(model_paths):
             full_dict_polytopeonly[scene_dir] = {}
             per_view_dict_polytopeonly[scene_dir] = {}
 
-            test_dir = Path(scene_dir) / "test"
+            test_dir = Path(scene_dir) / args.dataset
             pointcloud_dir = Path(scene_dir) / "point_cloud"
 
             for method in os.listdir(test_dir):
@@ -66,7 +78,14 @@ def evaluate(model_paths):
                 method_dir = test_dir / method
                 gt_dir = method_dir / "gt"
                 renders_dir = method_dir / "renders"
-                renders, gts, image_names = readImages(renders_dir, gt_dir)
+                mask_dir = method_dir / "masks_rendered"
+                
+                if not os.path.exists(gt_dir) or not os.path.exists(renders_dir) or (not os.path.exists(mask_dir) and args.use_masks):
+                    print("\tNot computing metrics as no renders found")
+                    continue
+                renders, gts, masks, image_names = readImages(renders_dir, gt_dir, mask_dir)
+                if len(renders) == 0:
+                    print("\tNo images found")
 
                 ssims = []
                 psnrs = []
@@ -74,10 +93,19 @@ def evaluate(model_paths):
                 flips = []
 
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-                    ssims.append(ssim(renders[idx], gts[idx]))
-                    psnrs.append(psnr(renders[idx], gts[idx]))
-                    lpipss.append(lpips.criterion(renders[idx], gts[idx]))
-                    flips.append(flip(renders[idx], gts[idx]).mean().item())
+                    gt = gts[idx]
+                    im = renders[idx]
+                    mask = masks[idx]
+                    if args.use_masks:
+                        if not args.float_masks:
+                            mask = (mask > args.mask_th).float()
+                        gt = gt * mask
+                        im = im * mask
+                        
+                    ssims.append(ssim(im,gt, mask=mask))
+                    psnrs.append(psnr(im, gt, mask=mask))
+                    lpipss.append(lpips.criterion(im, gt, mask=mask).squeeze())
+                    flips.append(flip(im, gt, mask=mask).mean().item())
                     
                 # load number of gaussians
                 # with open(os.path.join(pointcloud_dir, f"iteration_{method.split('_')[-1]}", "num_gaussians.json"), 'r') as fp:
@@ -102,12 +130,13 @@ def evaluate(model_paths):
                                                             "FLIPS": {name: fl for fl, name in zip(torch.tensor(flips).tolist(), image_names)}}
                                                         )
 
-            with open(scene_dir + "/results_full.json", 'w') as fp:
+            with open(scene_dir + f"/{args.dataset}_results_full.json", 'w') as fp:
                 json.dump(full_dict[scene_dir], fp, indent=True)
-            with open(scene_dir + "/per_view.json", 'w') as fp:
+            with open(scene_dir + f"/{args.dataset}_per_view.json", 'w') as fp:
                 json.dump(per_view_dict[scene_dir], fp, indent=True)
-        except:
+        except Exception as e:
             print("Unable to compute metrics for model", scene_dir)
+            print("\tReason: ", e)
 
 if __name__ == "__main__":
     device = torch.device("cuda:0")
@@ -116,5 +145,9 @@ if __name__ == "__main__":
     # Set up command line argument parser
     parser = ArgumentParser(description="Training script parameters")
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
+    parser.add_argument('--dataset', '-d', type=str, default="test")
+    parser.add_argument('--use_masks', action="store_true")
+    parser.add_argument('--mask_th', type=float, default=0.1)
+    parser.add_argument('--float_masks', action="store_true")
     args = parser.parse_args()
     evaluate(args.model_paths)

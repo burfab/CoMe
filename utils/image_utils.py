@@ -11,9 +11,17 @@
 
 import torch
 
-def mse(img1, img2):
-    return (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
+def mse(img1, img2, mask=None):
+    diff2 = (img1 - img2) ** 2
 
-def psnr(img1, img2):
-    mse = (((img1 - img2)) ** 2).view(img1.shape[0], -1).mean(1, keepdim=True)
-    return 20 * torch.log10(1.0 / torch.sqrt(mse))
+    if mask is not None:
+        mask = mask.expand_as(diff2)
+        return (diff2 * mask).sum(dim=(1,2,3), keepdim=True) / \
+               (mask.sum(dim=(1,2,3), keepdim=True) + 1e-8)
+
+    return diff2.mean(dim=(1,2,3), keepdim=True)
+
+
+def psnr(img1, img2, mask=None):
+    err = mse(img1, img2, mask)
+    return -10 * torch.log10(err+1e-8)

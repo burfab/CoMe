@@ -100,7 +100,7 @@ class AppearanceEmbedding(nn.Module):
         self.ssim_loss = partial(ssim, size_average=False)
         self.lambda_ssim = lambda_ssim
         self.lambda_l2 = lambda_l2
-        self._init_kwargs = {"num_views": num_views, "lambda_ssim": lambda_ssim}
+        self._init_kwargs = {"num_views": num_views, "lambda_ssim": lambda_ssim, "lambda_l2": lambda_l2}
 
     def forward(self, image, gt_image, view_idx):
         return (1 - self.lambda_ssim) * self.l1_loss(image, gt_image) + self.lambda_ssim * (1 - self.ssim_loss(image, gt_image))
@@ -153,7 +153,7 @@ class VastGaussianAppearanceEmbedding(AppearanceEmbedding):
     def get_apperance_embedding(self, idx):
         return self._appearance_embeddings[idx]
 
-    def appearance_mapping(self, image, view_idx):
+    def appearance_mapping(self, image, view_idx, mask=None):
         appearance_embedding = self.get_apperance_embedding(idx=view_idx)
         # center crop the image
         origH, origW = image.shape[1:]

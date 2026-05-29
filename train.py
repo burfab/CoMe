@@ -37,7 +37,7 @@ import numpy as np
 from scene.appearance_network import AppearanceEmbedding, VastGaussianAppearanceEmbedding, SSIMDecoupledAppearanceEmbedding
 from functools import partial
 import copy
-from scene.densifier import AbsGradDensifier, MCMCDensifier, MSv2AbsGradDensifier, CustomDensifier
+from scene.densifier import AbsGradDensifier, MCMCDensifier, MSv2AbsGradDensifier, CustomDensifier, NormalDensifier
 import warnings
 
 RED = '\033[31m'
@@ -129,6 +129,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
 
     # TODO: same strategy as for the appearance embedding
     
+    normal_field_config = {}
+    normal_densifier = NormalDensifier(gaussians, opt, mesh, dataset, pipe, scene.cameras_extent, normal_field_config)
     if True:
         densifier = CustomDensifier(gaussians, opt, mesh, dataset, pipe, scene.cameras_extent)
     elif mesh.use_msv2_simplification:
@@ -172,11 +174,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     masks_selfgenerated = {}
     
     temp_lambdas = {
-        "occupation_lambda": 10,
+        "occupation_lambda": 0.01,
+        "occupation_var_lambda": 0.00,
         "variational_depth_normal_fusion_lambda": 0.000,
         "depth_smoothness": 0* 0.001 * (1/scene.cameras_extent),
         "surface_L_lambda": 0,
-        "learned_normal_error": 0.05 * 0.6 #thats what they have even though they set it to 0.05 ,but they also have some ratio thats 0.6
+        "learned_normal_error": 0*mesh.lambda_depth_normal * 0.6, #thats what they have even though they set it to 0.05 ,but they also have some ratio thats 0.6
+        "detach_depth_normal": False
         }
     batch = None
     
@@ -185,9 +189,6 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     gaussians.compute_3D_filter(cameras=trainCameras, CUDA=not pipe.compute_filter3D_python)
     
-    normal_field_state = utils.normal_field.initialize_normal_field(
-        scene=scene,
-    ) 
     
     
     
@@ -280,7 +281,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     splat_args.render_geometry = True
                     splat_args.blend_extra_features = 0
                     render_pkg = render(c, gaussians, pipe, bg, splat_args=splat_args, gt_color=None, deformation=deform_utils.Deformation(), extract_final_T=True)
-                    mask = 1-render_pkg["final_T"].squeeze(0)
+                    mask = 1.0-render_pkg["final_T"].squeeze(0)
                     masks_selfgenerated[c.uid] = mask.detach().cpu() #torch.nn.functional.sigmoid((mask.detach()- 0.9) * 20).cpu()  
                     if os.path.exists("/tmp/test") and os.path.isdir("/tmp/test"):
                         D = render_pkg["render"][6].detach().cpu()
@@ -419,6 +420,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             
         occupation = rendering[13:14]
         occupation2 = rendering[14:15]
+        occupation_var = occupation2 - occupation*occupation
         
         learned_normals = None
         if splat_args.render_learned_normals:
@@ -494,22 +496,11 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         #freq_loss = densify_utils.frequency_loss_simple(image, structure_tensor_cache[viewpoint_cam.image_name])
         
         occupation_loss = temp_lambdas["occupation_lambda"] * ((occupation * (1-mask))**2).mean() #if iteration >= mesh.distortion_from_iter else 0
+        occupation_var_loss = temp_lambdas["occupation_var_lambda"] * ((occupation_var * (mask))).mean() #if iteration >= mesh.distortion_from_iter else 0
         
         
         normal_consistency_loss = DepthNormalConsistencyLoss((viewpoint_cam.focal_x, viewpoint_cam.focal_y, viewpoint_cam.image_width/2, viewpoint_cam.image_height/2))
         loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal, mask)
-        
-        # Final loss
-        #TODO: Try Variational Depth-Normal Fusion
-        
-        rgb_to_gray = torch.tensor([0.299, 0.587, 0.114], dtype=torch.float32, device=gt_image.device)[:,None,None]
-        surface_L = (((occupation2 - (gt_image * rgb_to_gray).sum(0,keepdim=True))**2)*2 + ((occupation2 - (image * rgb_to_gray).sum(0,keepdim=True))**2))
-        
-        
-        
-        
-        
-        
         
         if iteration < opt.position_lr_max_steps:
             loss =  rgb_loss_mean + \
@@ -526,8 +517,8 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     seg_loss_obj + \
                     seg_loss_obj_3d + \
                     occupation_loss  + \
+                    occupation_var_loss + \
                     (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
-                    (temp_lambdas["surface_L_lambda"] if iteration >= mesh.distortion_from_iter else 0) * (surface_L*mask).mean() + \
                     lambda_depth_smoothness * depth_smoothness_loss + \
                     multiview_loss["multiview_loss"] * mesh.multi_view_lambda
                     
@@ -535,7 +526,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             if normal_field_kick_on:
                 normal3 = c2w[:3, :3] @ learned_normals.reshape(3, -1)
                 render_learned_normal_world = normal3.reshape(3, *learned_normals.shape[1:])
-                learned_normal_error = (1 - (render_learned_normal_world * depth_normal).sum(dim=0)) * (~(mask_no_normal1).squeeze(0) * mask)
+                learned_normal_error = (1 - (render_learned_normal_world * (depth_normal if not temp_lambdas["detach_depth_normal"] else depth_normal.detach())).sum(dim=0)) * (~(mask_no_normal1).squeeze(0) * mask)
                 loss = loss + learned_normal_error.mean() * temp_lambdas["learned_normal_error"]
                     
                     #freq_loss * opt.lambda_freq
@@ -602,11 +593,12 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 
 
             # Densification (AbsGrad or MCMC)
+            gaussians_have_changed = False
             if batch_complete_or_last_iter:
                 temp_splat_args = copy.deepcopy(splat_args)
                 temp_splat_args.consider_max_weight = True
                 render_simp = partial(render, pipe=pipe, bg_color=background, splat_args=temp_splat_args)
-                densifier.densify(
+                gaussians_have_changed = densifier.densify(
                     iteration=iteration,
                     visibility_filter=visibility_filter,
                     radii=radii,
@@ -615,11 +607,25 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     trainCameras=trainCameras,
                     render_simp=render_simp
                 )
+                
+                ##CODE INSERT
+                
+                # ---Normal Field Densification---
+                if mesh.use_normal_field and normal_densifier is not None:
+                    gaussians_have_changed = gaussians_have_changed or normal_densifier.densify(iteration, scene.getTrainCameras().copy(), bg, 
+                                                                                                None, None, normal_field_kick_on, normal_field_config)
+                            
+                            
+
+                if gaussians_have_changed: 
+                    gaussians.compute_3D_filter(scene.getTrainCameras().copy(), CUDA=not pipe.compute_filter3D_python)
+                    if normal_densifier is not None and mesh.use_normal_field: normal_densifier.reset_normal_field_state_at_next_iteration()
+                    
+                #END CODE INSERT
 
                 # Optimizer step
                 if iteration < opt.iterations:
-                    if iteration < opt.position_lr_max_steps:
-                        gaussians.optimizer.step()
+                    gaussians.optimizer.step()
                     
                     if iteration >= opt.segmentation_network_first_step:
                         segmentation_network_optim.step()

@@ -255,8 +255,6 @@ def readCamerasJson(cameras_file, images_folder, read_redundant=False):
             cam_infos.append(cam_info)
         else:
             redundant_cam_infos.append(cam_info)
-        
-        cam_infos.append(cam_info)
 
     sys.stdout.write('\n')
     return cam_infos, redundant_cam_infos

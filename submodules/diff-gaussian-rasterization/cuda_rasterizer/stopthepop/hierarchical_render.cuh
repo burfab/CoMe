@@ -1388,10 +1388,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
                 for (int ch = 0; ch < CHANNELS; ch++)
                   blend_data.C[CHANNELS + ch] += normal_normalized[ch] * weight;
 
-                const float geom_intensity =
-                    expf(-0.5f * (CC - (BB * BB) / (4.0f * AA)));
+                const float geom_intensity = expf(-0.5f * (AA*t * t + BB*t + CC));
                 blend_data.occupation += geom_intensity;
-                // blend_data.occupation2+=(geom_intensity*geom_intensity);
+                blend_data.occupation2+=(geom_intensity*geom_intensity);
 
                 const float g_opacity = ABC_.w;
 
@@ -1435,9 +1434,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
 
                     alpha_point = min(0.99f, ABC_.w * exp(p));
                   }
-                  blend_data.occupation2 +=
-                      blend_data.T_opa * alpha_point *
-                      ((rgb[0] * 0.299 + rgb[1] * 0.587 + rgb[2] * 0.114));
                   blend_data.opacity += alpha_point * blend_data.T_opa;
                   blend_data.T_opa *= (1 - alpha_point);
                 }
@@ -1957,12 +1953,10 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			// - final T_opa
 			float T_opa_rest = final_T[pix_id + 3 * H * W];
 			float opa_rest = out_color[ALPHA_OFFSET * H * W + pix_id];
-			float gray_rest = out_color[OCCUPATION2_OFFSET * H * W + pix_id];
 
 			// final opacity = blend_data.opacity + T_opa_k * opa_rest
 			float opacity = blend_data.opacity + blend_data.T_opa * opa_rest;
 			out_color[ALPHA_OFFSET * H * W + pix_id] = opacity;
-			out_color[OCCUPATION2_OFFSET * H * W + pix_id] = (gray_rest * blend_data.T_opa + blend_data.gray)/(1.f-(blend_data.T_opa * T_opa_rest) + 1e-8f);
 			
 			// final T_opa = T_opa_k * T_opa_rest
 			final_T[pix_id + 3 * H * W] = blend_data.T_opa * T_opa_rest;
@@ -2184,13 +2178,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				bd.dL_doccupation =
 					dL_dpixels[OCCUPATION_OFFSET * H * W + pix_id] /
 					fmaxf((float)bd.blend_contributor, 1.f);
-					/*
 				bd.dL_doccupation2 =
 					dL_dpixels[OCCUPATION2_OFFSET * H * W + pix_id] /
 					fmaxf((float)bd.blend_contributor, 1.f);
-					*/
-				bd.dL_doccupation2 =
-					dL_dpixels[OCCUPATION2_OFFSET * H * W + pix_id] * (bd.T_opa_final+1e-8f);
 			}else {
 				bd.dL_doccupation = 0;
 				bd.dL_doccupation2 = 0;
@@ -2269,24 +2259,19 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			{
 
 			// 1. Recompute geom_intensity (or load it if saved from the forward pass)
-			float peak_exponent = -0.5f * (CC - (BB * BB) / (4.0f * AA));
+			float peak_exponent = -0.5f * (AA * t * t + BB * t + CC);
 			float geom_intensity = expf(peak_exponent);
 
 			// 2. dL / d(geom_intensity)
-			//float dL_dgeom = blend_data.dL_doccupation + blend_data.dL_doccupation2 * 2.0f * geom_intensity;
-			float dL_dgeom = blend_data.dL_doccupation;
+			float dL_dgeom = blend_data.dL_doccupation + blend_data.dL_doccupation2 * 2.0f * geom_intensity;
 
 			// 3. dL / d(peak_exponent) -> because d(exp(x))/dx = exp(x)
 			float dL_dexp = dL_dgeom * geom_intensity;
 
-			// 4. Precompute shared terms for performance
-			float inv_AA = 1.0f / AA;
-			float BB_inv_AA = BB * inv_AA;
-
 			// 5. Accumulate gradients into CC, BB, and AA
 			dL_dC += dL_dexp * -0.5f;
-			dL_dB += dL_dexp * (0.25f * BB_inv_AA);
-			dL_dA += dL_dexp * (-0.125f * BB_inv_AA * BB_inv_AA);
+			dL_dB += dL_dexp * (-0.5f * t);
+			dL_dA += dL_dexp * (-0.5f * t * t);
 			}
 
 
@@ -2522,7 +2507,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				float dL_dalpha_point = dalpha_point * blend_data.dL_dopacity;
 				
 				//might cause instability as simple would be to make central gaussian represent gray color and then setting to opaque
-				dL_dalpha_point += blend_data.T_opa * (0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2]) * blend_data.dL_doccupation2;
 				dL_do += dL_dalpha_point * expp; 
 
 
@@ -2548,12 +2532,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 				alpha_point = alpha;
 				// just add the gradient to alpha, the computation will take care of the rest
 				dL_dalpha += (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity)) * blend_data.dL_dopacity;
-				dL_dalpha += blend_data.T_opa * (0.299f * rgb[0] + 0.587f * rgb[1] + 0.114 * rgb[2]) * blend_data.dL_doccupation2;
 			}
-
-			dL_dcolors_gaussian[0] += blend_data.T_opa * alpha_point * 0.299f * blend_data.dL_doccupation2;
-			dL_dcolors_gaussian[1] += blend_data.T_opa * alpha_point * 0.587f * blend_data.dL_doccupation2;
-			dL_dcolors_gaussian[2] += blend_data.T_opa * alpha_point * 0.114f * blend_data.dL_doccupation2;
 
 			// first, accumulate the opacity
 			blend_data.opacity += alpha_point * blend_data.T_opa;

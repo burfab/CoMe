@@ -20,5 +20,5 @@ class LPIPSEval:
     Arguments:
         x, y (torch.Tensor): the input tensors to compare.
     """
-    def eval(self, x: torch.Tensor, y: torch.Tensor):
-        return self.criterion(x, y)
+    def eval(self, x: torch.Tensor, y: torch.Tensor,mask:torch.Tensor=None):
+        return self.criterion(x, y, mask=mask)
