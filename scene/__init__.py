@@ -113,7 +113,9 @@ class Scene:
             print(f"Error saving appearance embedding: {e}")
 
     def getTrainCameras(self, scale=1.0):
+        if scale not in self.train_cameras: return []
         return self.train_cameras[scale]
 
     def getTestCameras(self, scale=1.0):
+        if scale not in self.test_cameras: return []
         return self.test_cameras[scale]

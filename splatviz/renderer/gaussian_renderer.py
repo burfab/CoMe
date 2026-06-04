@@ -94,6 +94,8 @@ class GaussianRenderer(Renderer):
 
             if not other_args.get("render_confidence", False):
                 other_args["render_confidence"] = debug_data.type == DebugVisualizationType.CONFIDENCE if debug_data is not None else False
+            if not "custom_message" in other_args:
+                other_args["custom_message"] = ""
 
             image = gui_visualize(
                 render_cam=render_cam,

@@ -274,7 +274,7 @@ def render_simple(viewpoint_camera, pc : GaussianModel, bg_color : torch.Tensor,
         extra_features = pc.get_segmentation 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
-    rendered_image, radii, max_weights, accum_alpha = rasterizer(
+    rendered_image, radii, max_weights, cov2D,accum_alpha = rasterizer(
         means3D = means3D,
         means2D = means2D,
         shs = shs,

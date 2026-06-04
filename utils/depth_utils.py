@@ -30,6 +30,62 @@ def depths_to_points(view, depthmap, cam_space=False):
 
 
 threshold = 2
+
+def depth_to_normal_scharr(view, depth, cam_space=False, mask=None):
+    """
+    view: view camera
+    depth: depthmap (H, W) or (1, H, W)
+    """
+    # Unpack points to shape (H, W, 3)
+    points = depths_to_points(view, depth, cam_space).reshape(*depth.shape[1:], 3)
+    output = torch.zeros_like(points)
+
+    # 1. Slice the 3x3 neighborhood positions
+    P_top_left  = points[:-2, :-2]
+    P_top_mid   = points[:-2, 1:-1]
+    P_top_right = points[:-2, 2:]
+
+    P_mid_left  = points[1:-1, :-2]
+    P_mid_mid   = points[1:-1, 1:-1]
+    P_mid_right = points[1:-1, 2:]
+
+    P_bot_left  = points[2:, :-2]
+    P_bot_mid   = points[2:, 1:-1]
+    P_bot_right = points[2:, 2:]
+
+    # 2. Compute gradients using Scharr weights (3 for corners, 10 for elements aligned with center)
+    # Vertical gradient (matches your original 'dx' direction)
+    grad_v = (
+        3.0 * (P_bot_left - P_top_left) + 
+        10.0 * (P_bot_mid - P_top_mid) + 
+        3.0 * (P_bot_right - P_top_right)
+    )
+
+    # Horizontal gradient (matches your original 'dy' direction)
+    grad_h = (
+        3.0 * (P_top_right - P_top_left) + 
+        10.0 * (P_mid_right - P_mid_left) + 
+        3.0 * (P_bot_right - P_bot_left)
+    )
+
+    # 3. Compute cross product and normalize
+    # (Kept your original cross order to preserve handedness/direction)
+    normal_map = torch.nn.functional.normalize(torch.cross(grad_v, grad_h, dim=-1), dim=-1)
+
+    # 4. Handle masking
+    if mask is not None:
+        # Ensure all 9 pixels in the 3x3 window are valid
+        valid_mask = (
+            mask[:-2, :-2] & mask[:-2, 1:-1] & mask[:-2, 2:] &
+            mask[1:-1, :-2] & mask[1:-1, 1:-1] & mask[1:-1, 2:] &
+            mask[2:, :-2] & mask[2:, 1:-1] & mask[2:, 2:]
+        )
+        output[1:-1, 1:-1, :][valid_mask, :] = normal_map[valid_mask, :]
+    else:
+        output[1:-1, 1:-1, :] = normal_map
+        
+    return output, points
+
 def depth_to_normal(view, depth, cam_space=False, mask = None):
     """
         view: view camera

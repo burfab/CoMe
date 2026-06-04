@@ -135,6 +135,51 @@ def gui_visualize(
         else:
             image = segmentation_utils.features_to_rgb_random_orth_proj(segmentation)
         return image
+    elif other_args["custom_message"].lower().startswith("curvature"):
+        cmap = matplotlib.colormaps.get_cmap('magma')
+        depth_normal, _ = depth_to_normal(render_cam, depth,False, depth.squeeze()>0)
+        depth_normal = depth_normal.permute(2, 0, 1)
+        render_normal = torch.nn.functional.normalize(depth_normal, p=2, dim=0)
+        #replace code below with curvature computation
+        #and display
+        
+        # --- Curvature computation ---
+        # Pad normals to handle borders cleanly
+        n = render_normal # (3, H, W)
+
+        # Central differences of the normal field
+        dn_dx = (n[:, :, 2:] - n[:, :, :-2]) / 2.0   # (3, H, W-2)
+        dn_dy = (n[:, 2:, :] - n[:, :-2, :]) / 2.0   # (3, H-2, W)
+
+        # Crop to the valid (interior) region to align shapes
+        dn_dx = dn_dx[:, 1:-1, :]   # (3, H-2, W-2)
+        dn_dy = dn_dy[:, :, 1:-1]   # (3, H-2, W-2)
+
+        # Mean curvature ≈ -0.5 * divergence(n̂)
+        # div(n) = dNx/dx + dNy/dy
+        mean_curvature = -0.5 * (dn_dx[0] + dn_dy[1])  # (H-2, W-2)
+
+        # Gaussian curvature via the shape operator cross terms
+        # κ_G ≈ (dNx/dx)(dNy/dy) - (dNx/dy)(dNy/dx)
+        gauss_curvature = dn_dx[0] * dn_dy[1] - dn_dx[1] * dn_dy[0]  # (H-2, W-2)
+
+        # Choose which curvature to visualize (mean curvature here)
+        if other_args["custom_message"].lower().endswith("mean"): curvature = mean_curvature
+        else: curvature = gauss_curvature
+
+        # Pad back to original spatial size
+        curvature = torch.nn.functional.pad(
+            curvature.unsqueeze(0).unsqueeze(0),
+            (1, 1, 1, 1), mode='replicate'
+        ).squeeze()
+
+        # Normalize to [0, 1] for colormap display
+        c_min, c_max = curvature.min(), curvature.max()
+        curvature_norm = (curvature - c_min) / (c_max - c_min + 1e-8)
+
+        return torch.tensor(
+            cmap(curvature_norm.cpu().detach().numpy()), device="cuda"
+        ).float().permute(-1, 0, 1)[:3]
     elif other_args["custom_message"].lower() == "occupation":
         image = occupation.squeeze()
         image = image / image.max()
@@ -180,7 +225,7 @@ def gui_visualize(
     elif render_depth_normal_loss:
         cmap = matplotlib.colormaps.get_cmap('magma')
         # TODO: update
-        depth_normal, _ = depth_to_normal(render_cam, depth,False, depth>0)
+        depth_normal, _ = depth_to_normal(render_cam, depth,False, depth.squeeze()>0)
         depth_normal = depth_normal.permute(2, 0, 1)
         
         render_normal = torch.nn.functional.normalize(normal, p=2, dim=0)
@@ -208,7 +253,7 @@ def gui_visualize(
         return (-normals_to_render + 1) / 2
     elif render_depth_normal:               
         # depth to normal
-        depth_normal, _ = depth_to_normal(render_cam, depth)
+        depth_normal, _ = depth_to_normal(render_cam, depth,False, depth.squeeze() > 0)
         
         # to view space
         view_space_normal = True

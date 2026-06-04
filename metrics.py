@@ -13,6 +13,7 @@ from pathlib import Path
 import os
 from PIL import Image
 import torch
+import torch.nn.functional as F
 import torchvision.transforms.functional as tf
 from utils.loss_utils import ssim
 from lpipsPyTorch import LPIPSEval
@@ -45,6 +46,65 @@ def readImages(renders_dir, gt_dir, masks_dir=None):
         masks.append(None if mask is None else torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).cuda())
         image_names.append(fname)
     return renders, gts, masks, image_names
+
+
+def dilate(binary_image, kernel_size=3):
+    """
+    binary_image: (H, W) tensor with values {0,1} or bool
+    returns: dilated image of shape (H, W)
+    """
+    pad = kernel_size // 2
+
+    if binary_image.ndim == 2:
+        x = binary_image.float()[None, None]  # (1,1,H,W)
+    if binary_image.ndim == 3:
+        x = binary_image.float()[None]  # (1,1,H,W)
+    else: x = binary_image.float()
+
+    # max pooling = dilation
+    y = F.max_pool2d(
+        x,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=pad
+    )
+
+    if binary_image.ndim == 3: y = y[0]
+    if binary_image.ndim == 2: y = y[0]
+    return y.to(binary_image.dtype)
+
+
+def erode(binary_image, kernel_size=3):
+    """
+    binary_image: (H, W) tensor with values {0,1} or bool
+    returns: eroded image of shape (H, W)
+    """
+    pad = kernel_size // 2
+
+    if binary_image.ndim == 2:
+        x = binary_image.float()[None, None]  # (1,1,H,W)
+    if binary_image.ndim == 3:
+        x = binary_image.float()[None]  # (1,1,H,W)
+    else: x = binary_image.float()
+
+    # erosion = min pooling
+    # min(x) = -max(-x)
+    y = -F.max_pool2d(
+        -x,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=pad
+    )
+    
+    if binary_image.ndim == 3: y = y[0]
+    if binary_image.ndim == 2: y = y[0]
+    return y.to(binary_image.dtype)
+
+def closing(binary_image, kernel_size):
+    return erode(dilate(binary_image,kernel_size), kernel_size)
+def opening(binary_image, kernel_size):
+    return dilate(erode(binary_image,kernel_size), kernel_size)
+
 
 def evaluate(model_paths):
 
@@ -95,10 +155,13 @@ def evaluate(model_paths):
                 for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
                     gt = gts[idx]
                     im = renders[idx]
-                    mask = masks[idx]
+                    mask = masks[idx] > args.mask_th
                     if args.use_masks:
-                        if not args.float_masks:
-                            mask = (mask > args.mask_th).float()
+                        if args.close_mask_kernel > 0:
+                            mask = closing(mask, args.close_mask_kernel)
+                        if args.erode_mask_kernel > 0:
+                            mask = erode(mask, args.erode_mask_kernel)
+                        
                         gt = gt * mask
                         im = im * mask
                         
@@ -147,7 +210,8 @@ if __name__ == "__main__":
     parser.add_argument('--model_paths', '-m', required=True, nargs="+", type=str, default=[])
     parser.add_argument('--dataset', '-d', type=str, default="test")
     parser.add_argument('--use_masks', action="store_true")
+    parser.add_argument('--erode_mask_kernel', type=int, default=3)
+    parser.add_argument('--close_mask_kernel', type=int, default=3)
     parser.add_argument('--mask_th', type=float, default=0.1)
-    parser.add_argument('--float_masks', action="store_true")
     args = parser.parse_args()
     evaluate(args.model_paths)

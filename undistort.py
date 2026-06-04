@@ -237,7 +237,7 @@ def crop_and_pad_maps(map1, map2, minx: int, maxx: int, miny: int, maxy: int, w_
 
 
 def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstruction, 
-                    cv_cameras: dict, has_segmentation: bool, padding: int, mul_of: int):
+                    cv_cameras: dict, has_segmentation: bool, padding: int, mul_of: int, filter_redundant:bool):
     images_in = input_dir / "images"
     masks_in = input_dir / "masks"
     segmentation_in = input_dir / "segmentation"
@@ -433,9 +433,9 @@ def process_dataset(input_dir: Path, output_dir: Path, recon: pycolmap.Reconstru
         
         
     print("Filtering based on camera pose and image score")
-    filtered_list = camera_filtering.filter_and_visualize_poses_adaptive(camera_pose_filtering_data, pos_threshold=None, K=4.5, angle_threshold_deg=5) 
-    
-    for i in range(len(frames)): frames[i]["redundant"] = frames[i]["id"] not in filtered_list
+    if filter_redundant:
+        filtered_list = camera_filtering.filter_and_visualize_poses_adaptive(camera_pose_filtering_data, pos_threshold=None, K=4.5, angle_threshold_deg=5) 
+        for i in range(len(frames)): frames[i]["redundant"] = frames[i]["id"] not in filtered_list
         
     return frames, cameras_json
 
@@ -475,6 +475,7 @@ def main():
     parser.add_argument("-s", "--scale", type=float, default=1.0)
     parser.add_argument("--padding", type=int, default=10, help="Padding pixel boundary size")
     parser.add_argument("--mul_of", type=int, default=8, help="Output grid size factor requirement")
+    parser.add_argument("--filter_redundant", action="store_true")
     args = parser.parse_args()
 
     input_dir = args.input_dir
@@ -491,7 +492,7 @@ def main():
     shutil.copytree(model_dir, output_dir / "sparse" / "0", dirs_exist_ok=True)
 
     frames, cameras_json = process_dataset(
-        input_dir, output_dir, recon, cv_cameras, has_segmentation, args.padding, args.mul_of
+        input_dir, output_dir, recon, cv_cameras, has_segmentation, args.padding, args.mul_of, args.filter_redundant
     )
     
     

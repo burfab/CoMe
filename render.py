@@ -84,7 +84,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
         if image_name is not None:
             
-            cameras_path = os.path.join(dataset.model_path, "cameras.json")
+            cameras_path = os.path.join(dataset.model_path, "cameras2.json")
             with open(cameras_path, "r") as f:
                 cameras_json = json.load(f)
             image_names = image_name if isinstance(image_name, list) else [image_name]

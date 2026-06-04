@@ -187,6 +187,7 @@ class SplattingSettings():
 
 class OptimizationParams(ParamGroup):
     def __init__(self, parser):
+        self.binary_search_depth = False
         self.iterations = 30_000
         self.position_lr_init = 0.00016 
         self.position_lr_reset_interval = 2000000
@@ -236,7 +237,7 @@ class OptimizationParams(ParamGroup):
         self.lambda_tone=0.
         self.lambda_freq = 0.01 # Frequency-based loss weight
         self.st_levels = 4
-        self.st_mode = "v1" # "v1" or "v2"
+        self.st_mode = "v2" # "v1" or "v2"
         
         self.freq_grad_threshold = 0.00002
         self.importance_score_threshold = 0.5
@@ -254,7 +255,6 @@ class OptimizationParams(ParamGroup):
         
         # initialization parameters
         self.sample_far_plane = False
-        self.far_plane_dist = 10.0
         self.far_plane_res = 32
         self.densification_window_width = 200  # Number of iterations to run densification per window
         self.freq_opacity_threshold = 0.05
@@ -311,6 +311,7 @@ class MeshingParams(ParamGroup):
         self.opacity_decay = 0.0
         # TODO: make this similar to what we have for appearance
         self.use_msv2_simplification = False
+        self.use_structure_tensor_densification = False
         # normal regularization bigger as we no longer take the sqrt
         self.lambda_smoothness = 0.02
         # MCMC

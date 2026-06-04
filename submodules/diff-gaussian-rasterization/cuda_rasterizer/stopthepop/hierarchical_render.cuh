@@ -34,16 +34,21 @@ struct TransmittanceVacancyGSGS {
 
     __device__ float T(float t) const {
         const float dt      = t - t_peak;
-        const float G       = fminf(G_peak * __expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
+		float power = -0.5f * AA * dt * dt;
+		if(power > 0.f) power = 0.f;
+        const float G       = fminf(G_peak * expf(power), MAX_G);  // one expf
         return (t > t_peak) ? v2_Gpeak * 1.f/sqrtf(1.f-G) : sqrtf(1.f-G);
     }
 
 	//Idea: Don't take deriviative of T but of T^2
+	//dT^2/dT = 2*T
     __device__ float dT_dGaussian(float t,
                                   float &dAA, float &dG_peak_out,
                                   float &dt_peak_out) const {
         const float dt          = t - t_peak;
-        const float exp_term    = expf(-0.5f * AA * dt * dt);
+		float power = -0.5f * AA * dt * dt;
+		if(power > 0.f) power = 0.f;
+        const float exp_term    = expf(power);
         const float G           = fminf(G_peak * exp_term, MAX_G);
 
         float Ti, dTi_dG;
@@ -61,8 +66,11 @@ struct TransmittanceVacancyGSGS {
         // dG/dt = G*(-AA*dt),  dG/dt_peak = G*(AA*dt) = -dG/dt
         const float dG_ddt = G * (-AA * dt);
 		const float ddt_dtpeak = -1.f;
-        dAA         = dTi_dG * G * (-0.5f * dt * dt);
-        dt_peak_out = dG_ddt * dTi_dG * ddt_dtpeak;
+
+		const float one_over_dT2_dT = 1.f/(2.f * Ti + 1e-8f);
+        dAA         = dTi_dG * G * (-0.5f * dt * dt) * one_over_dT2_dT;
+        dt_peak_out = dG_ddt * dTi_dG * ddt_dtpeak * one_over_dT2_dT;
+		dG_peak_out = dG_peak_out * one_over_dT2_dT;
 
         return Ti;
     }
@@ -70,17 +78,21 @@ struct TransmittanceVacancyGSGS {
 	//Idea: Don't take deriviative of T but of T^2
     __device__ float dT_dt(float t, float &dt_out) const {
         const float dt      = t - t_peak;
-        const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
+		float power = -0.5f * AA * dt * dt;
+		if(power > 0.f) power = 0.f;
+        const float G       = fminf(G_peak * expf(power),MAX_G);
         const float dG_dt   = G * (-AA * dt);
         float Ti;
         if (t > t_peak) {
-            Ti     = v2_Gpeak*v2_Gpeak * 1.f/(1.f-G);
+            Ti     = v2_Gpeak * 1.f/sqrtf(1.f-G);
 			float dTi_dG = v2_Gpeak * v2_Gpeak / ((1.f - G) * (1.f - G));
             dt_out = dTi_dG * dG_dt;
         } else {
-            Ti     = 1.f-G;
+            Ti     = sqrtf(1.f-G);
             dt_out = -dG_dt;
         }
+		const float one_over_dT2_dT = 1.f/(2.f * Ti + 1e-8f);
+		dt_out = dt_out * one_over_dT2_dT;
         return Ti;
     }
 };
@@ -106,7 +118,9 @@ struct TransmittanceVacancyBlobsToSpokes {
 
     __device__ float T(float t) const {
         const float dt      = t - t_peak;
-        const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt), MAX_G);  // one expf
+		float power = -0.5f * AA * dt * dt;
+		if(power > 0.f) power = 0.f;
+        const float G       = fminf(G_peak * expf(power), MAX_G);  // one expf
         return (t > t_peak) ? 1.f-G_peak : 1.f-G;
     }
 
@@ -115,7 +129,9 @@ struct TransmittanceVacancyBlobsToSpokes {
                                   float &dAA, float &dG_peak_out,
                                   float &dt_peak_out) const {
         const float dt          = t - t_peak;
-        const float exp_term    = expf(-0.5f * AA * dt * dt);
+		float power = -0.5f * AA * dt * dt;
+		if(power > 0.f) power = 0.f;
+        const float exp_term    = expf(power);
         const float G           = fminf(G_peak * exp_term, MAX_G);
 
 		const float Ti = 1.f-G;
@@ -139,7 +155,9 @@ struct TransmittanceVacancyBlobsToSpokes {
 	}
     __device__ float dT_dt(float t, float &dt_out) const {
         const float dt      = t - t_peak;
-        const float G       = fminf(G_peak * expf(-0.5f * AA * dt * dt),MAX_G);
+		float power = -0.5f * AA * dt * dt;
+		if(power > 0.f) power = 0.f;
+        const float G       = fminf(G_peak * expf(power),MAX_G);
         const float dG_dt   = G * (-AA * fabsf(dt));
 		//gradient is computed as if dt < 0, but scaled later
 		const float Ti = 1.f-G;
@@ -332,6 +350,163 @@ __device__ void batcherSort(CG& cg, KT* keys, VT* vals)
 		}
 	}
 }
+
+
+template <int ITERATIONS, bool CULL_ALPHA,typename PF, typename BF, typename FF>
+__device__ void GaussiansRayEvaluation(
+    const uint2* __restrict__ ranges,
+    const uint32_t* __restrict__ point_list,
+    int W, int H,
+    float focal_x, float focal_y,
+    const float* view2gaussian,
+    const float2* __restrict__ points_xy_image,
+    const float4* __restrict__ cov3Ds_inv,
+    const float* __restrict__ projmatrix_inv,
+    const float3* __restrict__ cam_pos,
+    const float4* __restrict__ conic_opacity,
+    CudaRasterizer::DebugVisualization debugType,
+    PF && prep_function,
+    BF && blend_function,
+    FF && fin_function)
+{
+    // block size must be: 16,4,4
+    auto block = cg::this_thread_block();
+    auto warp  = cg::tiled_partition<WARP_SIZE>(block);
+
+    // --- shared memory ---
+    // One row per gaussian in the warp-wide batch.
+    // Loaded once before the j-loop; inner loop only reads smem.
+    __shared__ float  smem_V2G[WARP_SIZE][VIEW2GAUSSIAN_OFFSET];
+    __shared__ float4 smem_con_o[WARP_SIZE];
+    __shared__ uint2  range;
+
+    // --- pixel setup (identical to previous version) ---
+    const uint2 tile_min    = { block.group_index().x * BLOCK_X,
+                                 block.group_index().y * BLOCK_Y };
+    const uint2 tail_corner = { tile_min.x + 4 * block.thread_index().y,
+                                 tile_min.y + 4 * block.thread_index().z };
+
+    const glm::mat4 inverse_vp = loadMatrix4x4(projmatrix_inv);
+    const float3 campos = *cam_pos;
+
+    const int midid  = (block.thread_index().x % 16) / 4;
+    const int midy   = midid / 2;
+    const int midx   = midid % 2;
+    const int midrank = block.thread_index().x % 4;
+    const int heady  = midrank / 2;
+    const int headx  = midrank % 2;
+
+    const uint2 pixpos = { tail_corner.x + midx * 2 + headx,
+                            tail_corner.y + midy * 2 + heady };
+
+    const int32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
+    if (warp.thread_rank() == 0)
+        range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
+    warp.sync();
+
+    const float2 pixf = { pixpos.x + 0.5f, pixpos.y + 0.5f };
+    const float2 ray  = {
+        (pixf.x - W / 2.0f) / focal_x,
+        (pixf.y - H / 2.0f) / focal_y
+    };
+
+	const float3 r{ray.x, ray.y, 1.0f};
+
+    const bool active_outer = pixpos.x < W && pixpos.y < H;
+    auto blend_data = prep_function(active_outer, pixpos, r);
+
+    for (int iter = 0; iter < ITERATIONS; iter++)
+    {
+        blend_data.contributor = 0;
+        bool active = active_outer;
+
+        for (int progress = range.x; progress < range.y; progress += WARP_SIZE)
+        {
+            if (!warp.any(active))
+                break;
+
+            // Every thread resolves its own gaussian id for this batch.
+            int load_id = -1;
+            const int tid = progress + warp.thread_rank();
+            if (tid < range.y)
+                load_id = point_list[tid];
+
+            // --- batch load into smem ---
+            // All warps in the block share the same tile and therefore the
+            // same point_list slice, so only the first warp does the actual
+            // global loads. Every thread sees the result after block.sync().
+            if (block.thread_rank() < WARP_SIZE)
+            {
+                if (load_id != -1)
+                {
+                    #pragma unroll
+                    for (int k = 0; k < VIEW2GAUSSIAN_OFFSET; k++)
+                        smem_V2G[warp.thread_rank()][k] =
+                            view2gaussian[load_id * VIEW2GAUSSIAN_OFFSET + k];
+                    smem_con_o[warp.thread_rank()] = conic_opacity[load_id];
+                }
+                else
+                {
+                    #pragma unroll
+                    for (int k = 0; k < VIEW2GAUSSIAN_OFFSET; k++)
+                        smem_V2G[warp.thread_rank()][k] = 0.0f;
+                    smem_con_o[warp.thread_rank()] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+                }
+            }
+            // Fence: smem writes visible, and previous iteration's smem reads done.
+            block.sync();
+
+            // --- inner loop: purely smem reads, no global memory ---
+            for (int j = 0; j < WARP_SIZE; j++)
+            {
+                // coll_id is the same across all warps for a given j.
+                const int coll_id = warp.shfl(load_id, j);
+                if (coll_id == -1)
+                    continue;
+
+                const float* V2G   = smem_V2G[j];      // broadcast smem read
+                const float4 con_o = smem_con_o[j];    // broadcast smem read
+				
+                float3 Ld = { V2G[0] * ray.x + V2G[1] * ray.y + V2G[2],
+                              V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
+                              V2G[2] * ray.x + V2G[4] * ray.y + V2G[5] };
+                float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z,
+                               2.0f * (V2G[6] * ray.x + V2G[7] * ray.y + V2G[8]),
+                               V2G[9],
+                               con_o.w };
+                const float  depth  = -ABC.y / (2.0f * ABC.x);
+                const float3 normal = { Ld.x, Ld.y, Ld.z };
+
+                if (!active || depth < NEAR_PLANE)
+                    continue;
+
+
+                float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
+                if (power > 0.0f) power = 0.0f;
+                const float G     = expf(power);
+                const float alpha = min(0.99f, con_o.w * G);
+
+                if (alpha < 1.0f / 255.0f)
+                    continue;
+                
+				blend_data.contributor++;
+
+                if (!blend_function(pixpos, blend_data, coll_id, G, alpha, depth,
+                                    V2G, ray, debugType, normal, ABC))
+                    active = false;
+            }
+
+            block.sync();
+        }
+
+        if (pixpos.x < W && pixpos.y < H)
+        {
+            const float3 o = { cam_pos->x, cam_pos->y, cam_pos->z };
+            fin_function(pixpos, blend_data, debugType, range.y - range.x, o);
+        }
+    }
+}
+
 
 
 
@@ -1388,9 +1563,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
                 for (int ch = 0; ch < CHANNELS; ch++)
                   blend_data.C[CHANNELS + ch] += normal_normalized[ch] * weight;
 
-                const float geom_intensity = expf(-0.5f * (AA*t * t + BB*t + CC));
-                blend_data.occupation += geom_intensity;
-                blend_data.occupation2+=(geom_intensity*geom_intensity);
+				  float power = -0.5f * (AA*t * t + BB*t + CC);
+				  if(power > 0.f) power = 0.f;
+                const float geom_intensity = expf(power);
+                blend_data.occupation += geom_intensity * weight;
+                blend_data.occupation2+=(geom_intensity*geom_intensity) * weight;
 
                 const float g_opacity = ABC_.w;
 
@@ -1544,10 +1721,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
               out_color[NORMAL_VARIANCE_OFFSET * H * W + pix_id] =
                   normal_variance;
               out_color[OCCUPATION_OFFSET * H * W + pix_id] =
-                  blend_data.occupation /
-                  fmaxf((float)blend_data.blend_contributor, 1.f);
-              out_color[OCCUPATION2_OFFSET * H * W + pix_id] =
-                  blend_data.occupation2;
+                  blend_data.occupation / max((1 - blend_data.T), 1e-3f);// / fmaxf((float)blend_data.blend_contributor, 1.f);
+              out_color[OCCUPATION2_OFFSET * H * W + pix_id] = 
+			  blend_data.occupation2 / max((1 - blend_data.T), 1e-3f); // / fmaxf((float)blend_data.blend_contributor, 1.f);
             } else {
               outputDebugVis(debugType, out_color, pix_id,
                              blend_data.blend_contributor, blend_data.T,
@@ -1585,9 +1761,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_rend
         }
 
 
-
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
-__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward(
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward2(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -1692,8 +1867,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 
 
 				TransmittanceVacancy transmittance_helper(ABC_.x, G_peak, t_peak);
-
-				const float vacancy2_peak = (1.f-G_peak);
 				#pragma unroll
 				for(int i = 0; i < SPLIT+1;i++){
 					//maybe faster as the loop can be unrolled and no divergence should be possible as last op should be compiled without if/else
@@ -1764,6 +1937,185 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
               ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
               points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
               conic_opacity, debugType, prep_function, store_function,
+              blend_function, fin_function);
+}
+
+
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list,
+	int W, int H,
+	float focal_x, float focal_y, 
+	const float far_plane,
+	const bool include_alpha,
+	const float* view2gaussian,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ cov3Ds_inv,
+	const float* __restrict__ projmatrix_inv,
+	const float3* __restrict__ cam_pos,
+	const float* __restrict__ features,
+	const float* __restrict__ confidences,
+	const float4* __restrict__ conic_opacity,
+	float* __restrict__ final_T,
+	uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ bg_color,
+	float* __restrict__ max_weights,
+	float* __restrict__ cov2Ds,
+	CudaRasterizer::DebugVisualization debugType,
+	float* __restrict__ out_color,
+	float* __restrict__ gt_color)
+{
+
+			constexpr uint BINARY_SEARCH_ITERATIONS = 5;
+			constexpr uint SPLIT = 8;
+			constexpr float SAMPLE_RANGE = 0.4f;
+			constexpr float ONE_OVER_SPLIT = 1.f/((float)SPLIT);
+
+          struct BlendData {
+			uint32_t iter{0};
+            float T;
+            float depth_min;
+            float depth_max;
+			float T_p[SPLIT+1];
+            float depth_init;
+            float interval;
+            float3 ray_dir;
+            uint32_t contributor = 0;
+            uint32_t max_contributor{0};
+            uint32_t blend_contributor{0};
+            uint32_t forward_max_contributor{0};
+			bool in_range;
+          };
+
+          auto prep_function = [&](bool inside, const uint2 &pixpos,
+                                   const float3 ray_dir) {
+            BlendData bd;
+            uint32_t pix_id = pixpos.y * W + pixpos.x;
+            bd.ray_dir = ray_dir;
+            bd.T = 1.0f;
+			bd.in_range = inside ? final_T[pix_id] <= 0.45f : false;
+
+
+            for (int p = 0; p < SPLIT + 1; ++p) {
+              bd.T_p[p] = 1.0f;
+            }
+            bd.forward_max_contributor = 0;
+			float depth_init = inside ? out_color[DEPTH_OFFSET * H * W + pix_id] : 0.f;
+			bd.depth_init = depth_init;
+			bd.depth_min = fmaxf(depth_init - SAMPLE_RANGE, 0.f);
+			bd.depth_max = inside ? fmaxf(depth_init + SAMPLE_RANGE, 0.f) : 0.f;
+			bd.interval = (bd.depth_max - bd.depth_min)*ONE_OVER_SPLIT;
+			
+            return bd;
+          };
+          auto blend_function =
+              [&](const uint2 &pixpos, BlendData &blend_data, int id,
+                  float G,float alpha, float t_peak, const float *view2gaussian_j,
+                  float2 ray, CudaRasterizer::DebugVisualization debugType,
+                  float3 normal_, float4 ABC_) {
+					const int START_ID = blend_data.iter == 0 ? 0 : 1;
+					const int END_ID = blend_data.iter == 0 ? SPLIT+1 : SPLIT;
+                [[maybe_unused]] const float AA = ABC_.x;
+                [[maybe_unused]] const float BB = ABC_.y;
+                [[maybe_unused]] const float CC = ABC_.z;
+                [[maybe_unused]] const float op = ABC_.w;
+
+
+				//try early return:
+				//sigma
+
+				if(!blend_data.in_range) return false;
+				
+				//const float G_sigma = rsqrtf(AA);
+				//if(t_peak < blend_data.depth_min - G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return true;
+				//if(t_peak > blend_data.depth_max + G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return false;
+
+//MYCODE: working
+/* 
+				const float q_peak = AA*t_peak*t_peak + BB*t_peak + CC;
+				const float power_peak = -0.5*(q_peak);
+				const float G_peak = op * expf(fminf(power_peak,0.f));
+*/
+				//vacany at peak is squared
+				//const float vacancy2_peak = (1.f-G_peak);
+				//alpha is G_peak thus use it
+
+
+
+				TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t_peak);
+				#pragma unroll
+				for(int i = 0; i < SPLIT+1;i++){
+					//maybe faster as the loop can be unrolled and no divergence should be possible as last op should be compiled without if/else
+					const bool zero_op = i < START_ID || !(i < END_ID);
+					const float t = blend_data.depth_min + i * blend_data.interval;
+					const float T_i = transmittance_helper.T(t);
+					blend_data.T_p[i] *= (zero_op ? 1.f:T_i);
+				}
+
+				if(blend_data.iter > 0 && blend_data.contributor >= blend_data.forward_max_contributor) return false;
+
+                return true;
+              };
+          auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
+                                  CudaRasterizer::DebugVisualization debugType,
+                                  int range, float3 o) {
+
+            uint32_t pix_id = W * pixpos.y + pixpos.x;
+			if(blend_data.iter == 0){
+                blend_data.in_range = (blend_data.T_p[0] >= 0.5f) && (blend_data.T_p[SPLIT] <= 0.5f) && blend_data.in_range;
+				blend_data.forward_max_contributor = blend_data.contributor;
+			}
+            int start_id = 0;
+#pragma unroll
+            for (int p = 1; p < SPLIT; p++) {
+                start_id = blend_data.T_p[p] >= 0.5f ? p : start_id;
+            }
+            blend_data.depth_max  = blend_data.depth_min + (start_id + 1) * blend_data.interval;
+            blend_data.depth_min  = blend_data.depth_min + (start_id + 0) * blend_data.interval;
+			blend_data.interval = (blend_data.depth_max-blend_data.depth_min)*ONE_OVER_SPLIT;
+            blend_data.T_p[0]     = blend_data.T_p[start_id];
+            blend_data.T_p[SPLIT] = blend_data.T_p[start_id + 1];
+			if(++blend_data.iter >= BINARY_SEARCH_ITERATIONS){
+				//saturatef just brings the input inside [0,1]
+				const float w_max = __saturatef((blend_data.T_p[0] - 0.5f) / (blend_data.T_p[0] - blend_data.T_p[SPLIT]));
+				const float w_min = 1.f - w_max;
+				const float final_depth = blend_data.in_range ? w_max * blend_data.depth_max + w_min * blend_data.depth_min : 0.f;
+				if constexpr (!ENABLE_DEBUG_VIZ) {
+					out_color[DEPTH_OFFSET * H * W + pix_id] = final_depth;
+					//out_color[ALPHA_OFFSET * H * W + pix_id] = blend_data.T_p[0];
+				}
+			}else{
+				blend_data.blend_contributor = 0;
+				blend_data.contributor = 0;
+				for (int p = 1; p < SPLIT; ++p) {
+					blend_data.T_p[p] = 1.0f;
+				}
+			}
+
+#if (DEBUG_HIERARCHICAL & 0x200) != 0
+            if (pixpos.x == debug_target_pixel.x &&
+                pixpos.y == debug_target_pixel.y) {
+              printf("+++++++++++++++++++++++++++++++++++++++++++\n");
+            }
+#endif
+#ifdef DEBUG_OPACITY_FIELD
+            if (pixpos.x < 10 && pixpos.y < 10) {
+              float d = blend_data.C[CHANNELS * 2];
+              float3 depth = {o.x + d * blend_data.ray_dir.x,
+                              o.y + d * blend_data.ray_dir.y,
+                              o.z + d * blend_data.ray_dir.z};
+              printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n",
+                     pixpos.y, pixpos.x, blend_data.C[CHANNELS * 2], depth.x,
+                     depth.y, depth.z);
+            }
+#endif
+          };
+
+          GaussiansRayEvaluation<BINARY_SEARCH_ITERATIONS>(
+              ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+              points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
+              conic_opacity, debugType, prep_function, 
               blend_function, fin_function);
 }
 
@@ -2177,10 +2529,12 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			if(inside){
 				bd.dL_doccupation =
 					dL_dpixels[OCCUPATION_OFFSET * H * W + pix_id] /
-					fmaxf((float)bd.blend_contributor, 1.f);
+					max(1 - bd.T_final, 1e-3f);
+					//fmaxf((float)bd.blend_contributor, 1.f);
 				bd.dL_doccupation2 =
 					dL_dpixels[OCCUPATION2_OFFSET * H * W + pix_id] /
-					fmaxf((float)bd.blend_contributor, 1.f);
+					max(1 - bd.T_final, 1e-3f);
+					//fmaxf((float)bd.blend_contributor, 1.f);
 			}else {
 				bd.dL_doccupation = 0;
 				bd.dL_doccupation2 = 0;
@@ -2260,6 +2614,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 
 			// 1. Recompute geom_intensity (or load it if saved from the forward pass)
 			float peak_exponent = -0.5f * (AA * t * t + BB * t + CC);
+			if(peak_exponent > 0.f) peak_exponent=0.f;
 			float geom_intensity = expf(peak_exponent);
 
 			// 2. dL / d(geom_intensity)
@@ -2269,9 +2624,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_back
 			float dL_dexp = dL_dgeom * geom_intensity;
 
 			// 5. Accumulate gradients into CC, BB, and AA
-			dL_dC += dL_dexp * -0.5f;
-			dL_dB += dL_dexp * (-0.5f * t);
-			dL_dA += dL_dexp * (-0.5f * t * t);
+			dL_dC += blend_data.T * alpha * dL_dexp * -0.5f;
+			dL_dB += blend_data.T * alpha * dL_dexp * (-0.5f * t);
+			dL_dA += blend_data.T * alpha * dL_dexp * (-0.5f * t * t);
 			}
 
 

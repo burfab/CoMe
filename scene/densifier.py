@@ -401,7 +401,9 @@ class CustomDensifier(Densifier):
                 # 2. Create Gradient Mask 
                 # [CRITICAL] We MUST use this to prevent 7M points. 
                 # Only split if the geometry is struggling (high error).
-                is_grad_high = torch.norm(grads, dim=-1) >= 1e-5
+                
+                conf_split = torch.clamp(torch.exp(self.gaussians._confidence).squeeze(-1), min=1e-6, max=1.0).detach()
+                is_grad_high = torch.norm(grads, dim=-1) >= (1e-5/conf_split)
 
                 # 3. [NEW] Multiview Consistency Criterion
                 # Compute ratios of high/low eta counts
@@ -424,10 +426,12 @@ class CustomDensifier(Densifier):
                 prune_mask = (low_ratio > opt.prune_ratio_threshold) & valid_mask
 
                 # [NEW] Expand undersized Gaussians
+                """
                 self.gaussians.expand_undersized_gs(
                     tau_expand=opt.tau_expand,
                     max_eta_3ch=avg_high_eta_3ch
                 )
+                """
 
                 # Pass the AVG high eta to the splitting function for analytic guidance
                 self.gaussians.densify_and_prune_structgs(
@@ -465,6 +469,7 @@ class CustomDensifier(Densifier):
                 self.gaussians.decay_opacity(mesh.opacity_decay)
                 
             if iteration in self.prune_iterations:
+                assert iteration % opt.opacity_reset_interval > 200, "WUFFF, thats close"
                 prune_mask = (self.gaussians.get_opacity < mesh.prune_threshold).squeeze()
                 self.gaussians.prune_points(prune_mask)
                 gaussians_changed = True
