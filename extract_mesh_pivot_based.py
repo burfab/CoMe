@@ -610,13 +610,15 @@ def marching_tetrahedra_with_binary_search(
         mesh.verts = verts
 
     # Compute vertex colors
-    print("[INFO] Computing vertex colors...")
-    verts_colors = evaluate_mesh_colors_all_vertices(
-        views=views, 
-        mesh=mesh,
-        masks=None,
-        use_scalable_renderer=True,
-    ).view(-1, 3)
+    if args.texture_mesh:
+        print("[INFO] Computing vertex colors...")
+        verts_colors = evaluate_mesh_colors_all_vertices(
+            views=views, 
+            mesh=mesh,
+            masks=None,
+            use_scalable_renderer=True,
+        ).view(-1, 3)
+    else: verts_colors = None
     
     # Create mesh
     mesh = trimesh.Trimesh(

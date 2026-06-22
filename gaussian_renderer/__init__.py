@@ -594,6 +594,7 @@ def evaluate_sdf(
     pc: GaussianModel,
     pipe,
     kernel_size: float,
+    splat_args: ExtendedSettings,
     scaling_modifier=1.0,
 ):
     """
@@ -618,6 +619,7 @@ def evaluate_sdf(
         #sg_degree=pc.active_sg_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        settings=splat_args,
         debug=pipe.debug,
         #require_depth=True,
     )
@@ -660,6 +662,7 @@ def evaluate_color(
     pipe,
     kernel_size: float,
     background,
+    splat_args: ExtendedSettings,
     scaling_modifier=1.0,
 ):
     """
@@ -684,6 +687,7 @@ def evaluate_color(
         #sg_degree=pc.active_sg_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        settings=splat_args,
         debug=pipe.debug,
         #require_depth=True,
     )
@@ -739,6 +743,7 @@ def sample_depth(
     pc: GaussianModel,
     pipe: torch.Tensor,
     kernel_size: float,
+    splat_args: ExtendedSettings,
     scaling_modifier=1.0,
 ):
 
@@ -760,6 +765,7 @@ def sample_depth(
         #sg_degree=pc.active_sg_degree,
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
+        settings=splat_args,
         debug=pipe.debug,
         #require_depth=True,
     )

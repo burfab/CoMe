@@ -327,6 +327,7 @@ class MeshingParams(ParamGroup):
         self.normal_field_from_iter = 15000
         
         #Multiview
+        self.use_fast_multiview = True
         self.multi_view_lambda = 0.05
         self.multi_view_first_iter = 7000
 

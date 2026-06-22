@@ -445,7 +445,7 @@ EvaluateTransmittanceToPointsCUDA(
 
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   torch::Tensor out_transmittance = torch::full({PN}, 0.0, float_opts);
-  torch::Tensor out_inside = torch::full({PN, 3}, 0.0, bool_opts);
+  torch::Tensor out_inside = torch::full({PN}, 0.0, bool_opts);
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);

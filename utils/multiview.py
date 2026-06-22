@@ -18,7 +18,7 @@ def initialize_multiview_regularization(
     scene: Scene,
     pipe: PipelineParams,
     kernel_size: float,
-    opt_config: Dict[str, Any],
+    opt_config
 ) -> Dict[str, Any]:  
     # Get nearest cameras
     nearest_cameras = compute_nearest_cameras(
@@ -30,7 +30,7 @@ def initialize_multiview_regularization(
     )
     
     # Initialize patchmatch object
-    if False:#opt_config.use_fast_multiview:
+    if opt_config.use_fast_multiview:
         print(f"[INFO] Using fast multiview regularization.")
         patchmatch = PatchMatchFast(
             patch_size=opt_config.multi_view_patch_size,
@@ -132,7 +132,7 @@ def compute_multiview_regularization(
         patchmatch = multiview_state["patchmatch"]
         
         # Compute multiview losses
-        if False: #opt_config.use_fast_multiview:
+        if opt_config.use_fast_multiview:
             ncc_loss, geo_loss = patchmatch(
                 gaussians=gaussians, 
                 render_pkg=render_pkg_dict, 

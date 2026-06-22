@@ -112,7 +112,7 @@ def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
     
     print("gt_filen: " +gt_filen)
     gt_pcd = o3d.io.read_point_cloud(gt_filen)
-
+    import torch
     gt_trans = np.loadtxt(alignment)
     print("traj_path: " + traj_path)
     traj_to_register = []
@@ -120,6 +120,26 @@ def run_evaluation(dataset_dir, traj_path, ply_path, out_dir, view_crop):
         ld = np.load(traj_path)
         for i in range(len(ld)):
             traj_to_register.append(CameraPose(meta=None, mat=ld[i]))
+    elif traj_path.endswith('cameras.json'): # My format
+        import json
+        with open(traj_path, encoding='UTF-8') as f:
+            meta = json.load(f)
+        poses_dict = {}
+        for i, frame in enumerate(meta['frames']):
+            new_i = int(frame["image"][:frame["image"].rfind(".")]) -1
+            transform_matrix = np.vstack([np.hstack([np.array(frame["R"]), np.array(frame["T"])[...,None]]),np.array([0,0,0,1])])
+            transform_matrix = np.linalg.inv(transform_matrix)
+            poses_dict[new_i] = transform_matrix
+        poses = []
+        for i in range(len(poses_dict)):
+            poses.append(poses_dict[i])
+        poses = torch.from_numpy(np.array(poses).astype(np.float32))
+        #poses, _ = auto_orient_and_center_poses(poses, method='up', center_poses=True)
+        #scale_factor = 1.0 / float(torch.max(torch.abs(poses[:, :3, 3])))
+        #poses[:, :3, 3] *= scale_factor
+        poses = poses.numpy()
+        for i in range(len(poses)):
+            traj_to_register.append(CameraPose(meta=None, mat=poses[i]))
     elif traj_path.endswith('.json'): # instant-npg or sdfstudio format
         import json
         with open(traj_path, encoding='UTF-8') as f:
@@ -261,7 +281,7 @@ if __name__ == "__main__":
         args.traj_path = args.dataset_dir + f'/{os.path.basename(args.dataset_dir)}_traj_path.log'
         print(args.traj_path)
 
-    args.view_crop = False #  (args.view_crop > 0)
+    args.view_crop = (args.view_crop > 0)
     if args.out_dir.strip() == "":
         args.out_dir = os.path.join(os.path.dirname(args.ply_path),
                                     "evaluation")

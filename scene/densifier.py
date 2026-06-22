@@ -34,6 +34,8 @@ class AbsGradDensifier(Densifier):
         mesh = self.mp
         dataset = self.dataset
         
+        gaussians_have_changed=False
+        computed_filter3d=False
         if iteration < opt.densify_until_iter:
             # Keep track of max radii in image-space for pruning
             self.gaussians.max_radii2D[visibility_filter] = torch.max(self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -46,16 +48,21 @@ class AbsGradDensifier(Densifier):
                                             abs_grad_for_densification=mesh.abs_grad_for_densification,
                                             clone_with_sampling=mesh.clone_with_sampling)
                 # we need to compute the 3D filter here for reasons (see reset_opacity())
-                self.gaussians.compute_3D_filter(trainCameras, CUDA=not self.pipe.compute_filter3D_python)
+                gaussians_have_changed=True
+                
+            if gaussians_have_changed:
+                self.gaussians.compute_3D_filter(trainCameras.copy(), self.pipe.compute_filter3D_python)
+                computed_filter3d = True
                 
             if mesh.opacity_decay == 0 and iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                 self.gaussians.reset_opacity()
+                gaussians_have_changed=False
         
             if mesh.opacity_decay != 0 and iteration % 50 == 0 and iteration > opt.densify_from_iter:
                 self.gaussians.decay_opacity(mesh.opacity_decay)
+                gaussians_have_changed=False
                 
-        if iteration % 100 == 0 and iteration > opt.densify_until_iter and iteration < opt.iterations - 100:
-            self.gaussians.compute_3D_filter(trainCameras, CUDA=not self.pipe.compute_filter3D_python)
+        return gaussians_have_changed, computed_filter3d
                 
     def postfix(self, xyz_lr : float, **kwargs):
         pass
@@ -70,14 +77,18 @@ class MCMCDensifier(Densifier):
         
         trainCameras = kwargs.get("trainCameras")
         
+        gaussians_have_changed=False
+        computed_filter3d = False
         if iteration < opt.densify_until_iter and iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
             dead_mask = (self.gaussians.get_opacity <= 0.005).squeeze(-1)
             self.gaussians.relocate_gs(dead_mask=dead_mask)
             self.gaussians.add_new_gs(cap_max=mesh.cap_max)
             
+            gaussians_have_changed=True
+            
+            
         # Mip-Splatting
-        if iteration > opt.densify_from_iter and iteration % 100 == 0 and iteration < opt.iterations - 100:
-            self.gaussians.compute_3D_filter(cameras=trainCameras, CUDA=not self.pipe.compute_filter3D_python)
+        return gaussians_have_changed, computed_filter3d
     
     def op_sigmoid(self, x, k=100, x0=0.995):
         return 1 / (1 + torch.exp(-k * (x - x0)))
@@ -106,7 +117,8 @@ class MSv2AbsGradDensifier(Densifier):
         opt = self.opt
         mesh = self.mp
         dataset = self.dataset
-        
+        gaussians_have_changed = False
+        computed_filter3d = False
         if iteration < opt.densify_until_iter:
             # Keep track of max radii in image-space for pruning
             self.gaussians.max_radii2D[visibility_filter] = torch.max(self.gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -119,7 +131,11 @@ class MSv2AbsGradDensifier(Densifier):
                                             abs_grad_for_densification=mesh.abs_grad_for_densification,
                                             clone_with_sampling=mesh.clone_with_sampling)
                 # we need to compute the 3D filter here for reasons (see reset_opacity())
-                self.gaussians.compute_3D_filter(trainCameras, CUDA=not self.pipe.compute_filter3D_python)
+                gaussians_have_changed=True
+                
+            if gaussians_have_changed:
+                self.gaussians.compute_3D_filter(trainCameras.copy(), self.pipe.compute_filter3D_python)
+                computed_filter3d = True
                 
             if mesh.opacity_decay == 0 and iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                 self.gaussians.reset_opacity()
@@ -130,12 +146,13 @@ class MSv2AbsGradDensifier(Densifier):
             if iteration == 15000:
                 self.gaussians.culling_with_interesction_preserving(trainCameras, render_simp)
                 torch.cuda.empty_cache()
+                gaussians_have_changed=True
             elif iteration == 20000:
                 self.gaussians.culling_with_interesction_sampling(trainCameras, render_simp)
                 torch.cuda.empty_cache()
+                gaussians_have_changed=True
                     
-        if iteration % 100 == 0 and iteration > opt.densify_until_iter and iteration < opt.iterations - 100:
-            self.gaussians.compute_3D_filter(trainCameras, CUDA=not self.pipe.compute_filter3D_python)
+        return gaussians_have_changed, computed_filter3d
     
     def postfix(self, xyz_lr : float, **kwargs):
         pass
@@ -351,7 +368,7 @@ class NormalDensifier(Densifier):
             print(f"        > Number of Gaussians after pruning: {self.gaussians._xyz.shape[0]}.")
 
 
-        return gaussians_have_changed
+        return gaussians_have_changed, False
         
     
 class CustomDensifier(Densifier):   
@@ -363,6 +380,7 @@ class CustomDensifier(Densifier):
     
     def densify(self, iteration: int, **kwargs):
         gaussians_changed = False
+        computed_filter3d = False
         visibility_filter = kwargs.get("visibility_filter")
         radii = kwargs.get("radii")
         viewspace_point_tensor = kwargs.get("viewspace_point_tensor")
@@ -461,6 +479,17 @@ class CustomDensifier(Densifier):
                 self.gaussians.eta_mid_sum_3ch.zero_()
                 self.gaussians.eta_low_count.zero_()
                 gaussians_changed = True
+            
+            if iteration in self.prune_iterations:
+                assert iteration % opt.opacity_reset_interval > 200, "WUFFF, thats close"
+                prune_mask = (self.gaussians.get_opacity < mesh.prune_threshold).squeeze()
+                self.gaussians.prune_points(prune_mask)
+                gaussians_changed = True
+                pass
+            
+            if gaussians_changed:
+                self.gaussians.compute_3D_filter(trainCameras.copy(), self.pipe.compute_filter3D_python)
+                computed_filter3d = True
                 
             if mesh.opacity_decay == 0 and iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                 self.gaussians.reset_opacity()
@@ -468,12 +497,6 @@ class CustomDensifier(Densifier):
             if mesh.opacity_decay != 0 and iteration % 50 == 0 and iteration > opt.densify_from_iter:
                 self.gaussians.decay_opacity(mesh.opacity_decay)
                 
-            if iteration in self.prune_iterations:
-                assert iteration % opt.opacity_reset_interval > 200, "WUFFF, thats close"
-                prune_mask = (self.gaussians.get_opacity < mesh.prune_threshold).squeeze()
-                self.gaussians.prune_points(prune_mask)
-                gaussians_changed = True
-                pass
                 
         else:
             if iteration == 15000:
@@ -485,7 +508,7 @@ class CustomDensifier(Densifier):
                 gaussians_changed = True
                 torch.cuda.empty_cache()
                     
-        return gaussians_changed
+        return gaussians_changed, computed_filter3d
             
             
     def postfix(self, xyz_lr : float, **kwargs):

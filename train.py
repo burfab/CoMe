@@ -31,6 +31,8 @@ from utils import deform_utils
 from utils import densify_utils
 import utils.normal_field 
 import utils.multiview
+import pytorch3d.structures
+import pytorch3d.ops
 from scene.gaussian_model import build_scaling_rotation
 from diff_gaussian_rasterization import ExtendedSettings, DebugVisualization, DebugVisualizationType
 from decoupled_fused_ssim import fused_ssim
@@ -106,6 +108,138 @@ def get_expon_lr_func(
         return (delay_rate * log_lerp)
 
     return helper
+
+
+        
+
+#n in 3xH,W, mask in 1xHxW
+def curvature_prior(normal_map, mask):
+    """
+    Computes the Anisotropic TV-L1 norm on a surface normal map.
+    
+    Args:
+        normal_map: Tensor of shape (3, H, W)
+        mask: Optional boolean Tensor of shape (H, W)
+    """
+    # Vertical differences (along H-axis / dim 1)
+    diff_v = torch.abs(normal_map[:, 1:, :] - normal_map[:, :-1, :])
+    
+    # Horizontal differences (along W-axis / dim 2)
+    diff_h = torch.abs(normal_map[:, :, 1:] - normal_map[:, :, :-1])
+    
+    if mask is not None:
+        # Create masks for valid adjacent pairs
+        mask_v = mask[1:, :] & mask[:-1, :]
+        mask_h = mask[:, 1:] & mask[:, :-1]
+        
+        # Masking a (3, H, W) tensor with an (H, W) boolean mask 
+        # yields a (3, N) tensor, which we then sum up
+        loss_v = (diff_v * mask_v[None,...]).mean()
+        loss_h = (diff_h * mask_h[None,...]).mean()
+        
+        # Total valid items = (number of valid pairs) * 3 channels
+        tv_loss = (loss_v + loss_h)
+    else:
+        # Default mean reduction across the entire tensor
+        tv_loss = diff_v.mean() + diff_h.mean()
+        
+    return tv_loss
+
+
+class LossPart:
+    def __init__(self, key, lamda, first_iter=0, last_iter=None, cond=lambda iter: True, loss_key:int=0):
+        self._key = key
+        self._value = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
+        self._lamda = lamda
+        self._first_iter = first_iter
+        self._last_iter = last_iter
+        self._cond = cond
+        self._loss_key = loss_key
+        
+    def __repr__(self):
+        return (
+            f"'{self._loss_key}){self._key}': " + \
+            f"{self._value.item():5.5f}, "
+            f"lambda={self._lamda:5.5f}, "
+            f"first_iter={self._first_iter}, "
+            f"last_iter={self._last_iter}"
+            f")"
+        ) 
+        
+    def lamda_is_zero(self): return self._lamda == 0
+    def get_value_raw(self): return self._value
+    def get_key(self): return self._key
+    def get_value(self): return self._value * self._lamda
+    def set_value(self, val): self._value = val
+    def get_loss_key(self): return self._loss_key
+    def reset_value(self): self._value = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
+    def set_lamda(self, lamda): self._lamda = lamda
+    def is_active(self, iteration):
+        cond_iter = (iteration >= self._first_iter and (True if self._last_iter is None else iteration <= self._last_iter))
+        cond_lamda = self._lamda != 0.0
+        return cond_iter and cond_lamda and self._cond(iteration)
+            
+class LossCollection:
+    def __init__(self, opt, mesh, temp_lambdas):
+        self.losses = {}
+        self.rgb = LossPart("rgb", 1.0, first_iter=0, last_iter=None)
+        self.seg_obj = LossPart("seg_obj", 1.0, first_iter=opt.contrastive_interval, last_iter=None, cond=lambda iter: (iter % opt.contrastive_interval == 0) and False)
+        self.seg_obj3d = LossPart("seg_obj3d", 1.0, first_iter=opt.spatial_similarity_interval, last_iter=None, cond=lambda iter: (iter % opt.spatial_similarity_interval == 0) and False)
+        self.seg_network = LossPart("seg_network", 1.0, first_iter=0, last_iter=None, cond=lambda iter: (iter % opt.spatial_similarity_interval == 0) or (iter % opt.contrastive_interval == 0) and False, loss_key=1)
+        self.curvature = LossPart("curvature", temp_lambdas["curvature_lambda"], first_iter=mesh.distortion_from_iter, last_iter=None)
+        self.depth_normal = LossPart("depth_normal", mesh.lambda_depth_normal, first_iter=mesh.depth_normal_from_iter, last_iter=None)
+        self.smoothness_normal = LossPart("smoothness_normal", mesh.lambda_smoothness, first_iter=mesh.depth_normal_from_iter, last_iter=None)
+        self.opacity = LossPart("opacity", mesh.lambda_opacity_field, first_iter=mesh.distortion_from_iter, last_iter=None)
+        self.extent = LossPart("extent", mesh.lambda_extent, first_iter=mesh.distortion_from_iter, last_iter=None)
+        self.distortion = LossPart("distortion", mesh.lambda_distortion, first_iter=mesh.distortion_from_iter, last_iter=None)
+        self.learned_normal = LossPart("learned_normal", temp_lambdas["learned_normal_error"], first_iter=mesh.normal_field_from_iter, last_iter=None, cond=lambda iter: True and mesh.use_normal_field)
+        self.variance = LossPart("variance", mesh.lambda_variance, mesh.variance_from_iter, None)
+        self.normal_variance = LossPart("normal_variance", mesh.lambda_normal_variance, mesh.normal_variance_from_iter, None)
+        self.occupation = LossPart("occupation", temp_lambdas["occupation_lambda"], 0, None)
+        self.occupation2 = LossPart("occupation2", temp_lambdas["occupation2_lambda"], mesh.depth_normal_from_iter, None, cond=lambda iter: opt.binary_search_depth)
+        self.occupation_variance = LossPart("occupation_variance", temp_lambdas["occupation_var_lambda"], mesh.variance_from_iter, None)
+        self.variance = LossPart("variance", mesh.lambda_variance, mesh.variance_from_iter, None)
+        self.opacity_reg = LossPart("opacity_reg", mesh.opacity_reg, 0, None)
+        self.scale_reg = LossPart("scale_reg", mesh.scale_reg, 0, None)
+        self.min_scale_reg = LossPart("min_scale_reg", mesh.min_scale_reg, 0, None)
+        self.points_3d_reg = LossPart("points_3d_reg", temp_lambdas["points_3d_reg"], mesh.depth_normal_from_iter, None)
+        
+        self._register_members()
+
+    def _register_members(self):
+        self.losses = {}
+
+        for name, value in vars(self).items():
+            if isinstance(value, LossPart):
+                key = value.get_key()
+
+                if key in self.losses:
+                    raise ValueError(f"Duplicate loss key: {key}")
+                self.losses[key] = value
+    
+    def register_loss_parts(self,parts: LossPart): 
+        for p in parts:
+            assert p.get_key() not in self.losses
+            self.losses[p.get_key()] = p
+    def register_loss_part(self,part: LossPart): 
+        self.register_loss_parts([part])
+    def unregister_loss_part(self,key): 
+        assert key in self.losses
+        self.losses.pop(key)
+    def reset_values(self):
+        for key in self.losses:
+            self.losses[key].reset_value()
+    def compute(self, iteration, loss_key=0):
+        val = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
+        for key in self.losses:
+            part = self.losses[key]
+            assert part.get_key() == key, "Key not matching"
+            if part.get_loss_key() != loss_key: continue
+            if part.is_active(iteration):
+                val=val+part.get_value()
+        return val
+
+
 
 def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, splat_args: ExtendedSettings):
     import time
@@ -203,7 +337,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             return self.batch_size == self.max_batch_size
         def on_frame(self, loss, rgb_loss, radii, visibility_filter):
             self.batch_loss += loss.item()
-            self.batch_rgb_loss += rgb_loss.item()
+            self.batch_rgb_loss += rgb_loss.get_value().item()
             self.last_radii = radii
             self.last_visibility_filter = visibility_filter
             self.batch_size+=1
@@ -213,13 +347,15 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     temp_lambdas = {
         "occupation_lambda": 0.1 * 0,
+        "occupation2_lambda": 0.00,
         "occupation_var_lambda": 0.00,
         "variational_depth_normal_fusion_lambda": 0.000,
         "depth_smoothness": 0.0 * (1/scene.cameras_extent),
         "surface_L_lambda": 0,
         "learned_normal_error": (1.0 if mesh.use_normal_field else 0) * mesh.lambda_depth_normal * 0.6, #thats what they have even though they set it to 0.05 ,but they also have some ratio thats 0.6
         "detach_depth_normal": False,
-        "curvature_lambda": 0.1 * 0
+        "curvature_lambda": 0.1 * 0,
+        "points_3d_reg": 0.0
         }
     batch = None
     
@@ -233,19 +369,16 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
     
     viewpoint_stack = None
     ema_loss_for_log = 0.0
-    ema_normal_field_alignment_loss_for_log = 0.0
-    ema_front_pivots_visibility_loss_for_log = 0.0
-    ema_back_pivots_occlusion_loss_for_log = 0.0
-    ema_gaussian_flattening_loss_for_log = 0.0
-    ema_sdf_and_normal_field_consistency_loss_for_log = 0.0 
     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
     first_iter += 1
-    
     
     
     multi_view_state = utils.multiview.initialize_multiview_regularization(scene, pipe, 0.0, mesh)
     
     for iteration in range(first_iter, opt.iterations + 1):        
+        loss_collection = LossCollection(opt, mesh, temp_lambdas)
+        loss_collection.reset_values()
+        
         if batch is None or batch.complete():
             batch = BatchStats(opt.batch_size,gaussians.get_xyz.device)
         
@@ -306,43 +439,15 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             except Exception as e:
                 print(e)
                 network_gui.conn = None
-                
-        if iteration == mesh.normal_field_from_iter: gaussians.reset_learned_normal_features()
-        
-        #n in 3xH,W, mask in 1xHxW
-        def curvature_prior(normal_map, mask):
-            """
-            Computes the Anisotropic TV-L1 norm on a surface normal map.
-            
-            Args:
-                normal_map: Tensor of shape (3, H, W)
-                mask: Optional boolean Tensor of shape (H, W)
-            """
-            # Vertical differences (along H-axis / dim 1)
-            diff_v = torch.abs(normal_map[:, 1:, :] - normal_map[:, :-1, :])
-            
-            # Horizontal differences (along W-axis / dim 2)
-            diff_h = torch.abs(normal_map[:, :, 1:] - normal_map[:, :, :-1])
-            
-            if mask is not None:
-                # Create masks for valid adjacent pairs
-                mask_v = mask[1:, :] & mask[:-1, :]
-                mask_h = mask[:, 1:] & mask[:, :-1]
-                
-                # Masking a (3, H, W) tensor with an (H, W) boolean mask 
-                # yields a (3, N) tensor, which we then sum up
-                loss_v = (diff_v * mask_v[None,...]).mean()
-                loss_h = (diff_h * mask_h[None,...]).mean()
-                
-                # Total valid items = (number of valid pairs) * 3 channels
-                tv_loss = (loss_v + loss_h)
-            else:
-                # Default mean reduction across the entire tensor
-                tv_loss = diff_v.mean() + diff_h.mean()
-                
-            return tv_loss
                     
         bg = torch.rand((3), device="cuda") if opt.random_background else background
+        normal_field_kick_on = (iteration >= mesh.normal_field_from_iter) and mesh.use_normal_field
+        if iteration == mesh.normal_field_from_iter: gaussians.reset_learned_normal_features()
+        if iteration == opt.reset_confidence_iteration: gaussians.reset_confidence()
+        if normal_field_kick_on: splat_args.render_learned_normals = True
+        if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
+        
+                    
         if iteration % opt.self_generated_masks_interval == 0 and iteration > 0 or (iteration == first_iter and first_iter >= opt.self_generated_masks_interval):
             with torch.no_grad():
                 all_cameras = scene.getTrainCameras().copy()
@@ -365,11 +470,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                     cv2.imshow("MASK",(masks_selfgenerated[c.uid].numpy()*255).astype(np.uint8))
                     cv2.waitKey(1)
             cv2.destroyAllWindows()
-        if iteration == opt.reset_confidence_iteration: gaussians.reset_confidence()
-        normal_field_kick_on = (iteration >= mesh.normal_field_from_iter) 
-        if iteration > opt.densify_until_iter: appearance_embedding.lambda_l2 = 0
-        
-        if normal_field_kick_on: splat_args.render_learned_normals = True
+            
                 
 
         iter_start.record()
@@ -378,6 +479,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
 
         # Every 1000 its we increase the levels of SH up to a maximum degree
         if iteration % 1000 == 0:
+            assert opt.iterations >= 15_000
             gaussians.oneupSHdegree()
 
         # Pick a random Camera
@@ -394,18 +496,19 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         # Render
         if (iteration - 1) == debug_from:
             pipe.debug = True
-
-        splat_args.render_geometry = False
-        if (iteration > mesh.depth_normal_from_iter and mesh.lambda_depth_normal > 0.0) or normal_field_kick_on:
-            splat_args.render_geometry = opt.binary_search_depth
             
-        if iteration > mesh.distortion_from_iter and mesh.lambda_opacity_field > 0.0:
+        
+        splat_args.render_geometry = False
+        if (iteration >= mesh.depth_normal_from_iter and mesh.lambda_depth_normal > 0.0) or normal_field_kick_on:
+            splat_args.render_geometry = opt.binary_search_depth
+        if iteration >= mesh.distortion_from_iter and mesh.lambda_opacity_field > 0.0 and not splat_args.render_geometry:
             splat_args.render_opacity = True
 
         gt_image = viewpoint_cam.original_image.cuda()
-        # not sure we need detach here
         
-        render_segmentation = (iteration % opt.contrastive_interval == 0 or iteration % opt.spatial_similarity_interval == 0) and False
+        #disabled for now 
+        render_segmentation = (loss_collection.seg_obj.is_active(iteration) or loss_collection.seg_obj3d.is_active(iteration) or loss_collection.seg_network.is_active(iteration)) and False
+        assert not render_segmentation, "CUDA KERNEL NEEDS TO BE ADAPTED AGAIN"
         splat_args.blend_extra_features = (gaussians.segmentation_dimension if render_segmentation else 0 + (3 if splat_args.render_learned_normals else 0))
         
         if iteration >= opt.deform_first_step:
@@ -416,10 +519,9 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         rendering, viewspace_point_tensor, visibility_filter, radii, cov2D = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["cov2D"]
         
         
-        multiview_render_fn = partial(render, splat_args=splat_args, gt_color=None, deformation=deformation)
-        multiview_loss = utils.multiview.compute_multiview_regularization(iteration, scene, render_pkg, viewpoint_cam, viewpoint_cam.idx, gaussians, multiview_render_fn, pipe, bg, mesh, multi_view_state, 0.0)
+        #multiview_render_fn = partial(render, splat_args=splat_args, gt_color=None, deformation=deformation)
+        #losses["multiview"] = utils.multiview.compute_multiview_regularization(iteration, scene, render_pkg, viewpoint_cam, viewpoint_cam.idx, gaussians, multiview_render_fn, pipe, bg, mesh, multi_view_state, 0.0)
 
-        opacity = rendering[7]
         image = rendering[:3, :, :]
         gt_segmentation = viewpoint_cam.seg_mask.cuda().squeeze(0).long()
         
@@ -427,15 +529,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
         mask = mask #* (mask > 0.5)
         
         # custom variance losses
-        variance = rendering[11, :, :]
-        normal_variance = rendering[12, :, :]
-      
         confidence_pp_rgb_loss_mean = None
         confidence_scaled_rgb_loss_mean = None
         confidence_log_term_mean = None
         confidence_neg_alpha_log_term_mean = None
         
         gt_image = gt_image * mask + bg[:, None, None] * (1-mask)
+        
         
         # TODO: don't mean the SSIM
         if mesh.color_confidence and iteration >= mesh.color_confidence_from_iter:  
@@ -452,7 +552,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             # Gradient w.r.t. confidence: rgb_loss_og - alpha/confidence
             # At confidence=1e-3: alpha/confidence = 0.2/1e-3 = 200 (reasonable)
             # At confidence=1e-6: alpha/confidence = 0.2/1e-6 = 200,000 (problematic)
-            rgb_loss = (pp_rgb_loss * confidence - alpha * torch.log(confidence) * mask)
+            loss_collection.rgb.set_value((pp_rgb_loss * confidence - alpha * torch.log(confidence) * mask).mean())
 
             # Confidence-specific terms for TensorBoard diagnostics.
             confidence_pp_rgb_loss_mean = pp_rgb_loss.mean()
@@ -461,12 +561,10 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             confidence_neg_alpha_log_term_mean = (-alpha * torch.log(confidence)).mean()
             # TODO: confidence into a CUDA kernel for speed
         else:
-            rgb_loss = appearance_embedding(image, gt_image, viewpoint_cam.idx, mask)
+            loss_collection.rgb.set_value(appearance_embedding(image, gt_image, viewpoint_cam.idx, mask).mean())
         
-        seg_loss_obj = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
-        seg_loss_obj_3d = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
-        seg_network_loss = torch.tensor(0,dtype=torch.float).cuda().requires_grad_(True)
-        #Segmentation Loss
+        
+        ### SEGMENTATION_LOSS
         if render_segmentation:
             #gt_segmask = segmentation_utils.set_bg_to_one_and_class_borders_to_zero(gt_segmentation)
             gt_segmask = gt_segmentation
@@ -476,146 +574,147 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
             if iteration >= opt.segmentation_network_first_step:
                 #y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(torch.clamp_min(feature_map.detach().unsqueeze(0),1e-6).log(), True)
                 y_seg_network,seg_network_reg = segmentation_network.forward_with_reg_loss(gaussians.segmentation_inverse_activation(feature_map).unsqueeze(0), True)
-                seg_network_loss = segmentation_utils.structured_hinge_segmentation(gt_image.unsqueeze(0).detach(), y_seg_network, gt_segmask.unsqueeze(0))*1e-3 + seg_network_reg * 1e-4
+                loss_collection.seg_network.set_value(segmentation_utils.structured_hinge_segmentation(gt_image.unsqueeze(0).detach(), y_seg_network, gt_segmask.unsqueeze(0))*1e-3 + seg_network_reg * 1e-4)
             # Clustering Loss
             if iteration % opt.contrastive_interval == 0 and False:
                 feature_map = (gaussians.segmentation_inverse_activation(feature_map)).permute(1, 2, 0)
                 gt_segmasks = gt_segmask.long()
                 id_unique_list, n_i_list = segmentation_utils.get_unique_id_list(gt_segmasks, opt.min_pixnum, segmentation_classes_set)
-                seg_loss_obj = segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_network.get_prototypes(),lambda_val=opt.contrastive_lambda)
+                loss_collection.seg_obj.set_value(segmentation_utils.contrastive_2d_loss(gt_segmasks, feature_map, id_unique_list, n_i_list, segmentation_network.get_prototypes(),lambda_val=opt.contrastive_lambda))
 
             # Spatial-similarity Loss
             if iteration % opt.spatial_similarity_interval == 0 and False:
                 features3d = gaussians.get_segmentation
-                seg_loss_obj_3d = segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) 
+                loss_collection.seg_obj3d.set_value(segmentation_utils.spatial_loss(gaussians.get_xyz.squeeze().detach().clone(), features3d, k_pull=opt.k_pull, k_push=opt.k_push, lambda_pull=opt.lambda_pull, lambda_push=opt.lambda_push, max_points=opt.reg_max_points, sample_size=opt.reg_sample_size) )
                 
+        ### END_SEGMENTATION_LOSS
             
+        c2w = (viewpoint_cam.world_view_transform)
+        render_normal = rendering[3:6]
+        depth = rendering[6]
+        opacity = rendering[7]
+        distortion_map = rendering[8, :, :]
+        extent = rendering[9]
+        variance = rendering[11]
+        normal_variance = rendering[12]
         occupation = rendering[13:14]
         occupation2 = rendering[14:15]
         occupation_var = occupation2 - occupation*occupation
-        
         learned_normals = None
         if splat_args.render_learned_normals:
-            learned_normals = rendering[15:18]
             #Don't normalize them!
-        
-        
-            
-        # depth distortion regularization
-        distortion_map = rendering[8, :, :]
-        distortion_loss = distortion_map.mean()
+            learned_normals = rendering[15:18]
         
         # depth normal consistency
-        depth = rendering[6, :, :]
         if depth.isnan().sum() > 0:
             print("DEPTH IS NAN!!!!!")
             depth[depth.isnan()] = 0.0
+            
         
         
-        depth_normal, _ = depth_to_normal_scharr(viewpoint_cam, depth[None,...],cam_space=False, mask= depth>0)
-        depth_normal = depth_normal.permute(2, 0, 1)
-
-        render_normal = rendering[3:6, :, :]
-        render_normal = torch.nn.functional.normalize(render_normal, p=2, dim=0)
+        #for tensor board we keep extra variables apart from is_active
+        compute_curvature_loss = loss_collection.curvature.is_active(iteration)
+        compute_learned_normal_loss = loss_collection.learned_normal.is_active(iteration)
+        compute_depth_normal_loss = loss_collection.depth_normal.is_active(iteration)
+        compute_smoothness_loss = loss_collection.smoothness_normal.is_active(iteration)
+        compute_distortion_loss = loss_collection.distortion.is_active(iteration)
+        compute_extent_loss = loss_collection.extent.is_active(iteration)
+        compute_opacity_loss = loss_collection.opacity.is_active(iteration)
+        compute_variance_loss = loss_collection.variance.is_active(iteration)
+        compute_normal_variance_loss = loss_collection.normal_variance.is_active(iteration)
+        compute_occupation_loss = loss_collection.occupation.is_active(iteration)
+        compute_occupation2_loss = loss_collection.occupation2.is_active(iteration)
+        compute_occupation_variance_loss = loss_collection.occupation_variance.is_active(iteration)
+        compute_opacity_reg = loss_collection.opacity_reg.is_active(iteration)
+        compute_scale_reg = loss_collection.scale_reg.is_active(iteration)
+        compute_min_scale_reg = loss_collection.min_scale_reg.is_active(iteration)
+        compute_points_3d_reg = loss_collection.points_3d_reg.is_active(iteration)
         
-        mask_no_normal1 = (depth_normal == torch.zeros_like(depth_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
-        mask_no_normal2 = (render_normal == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
-        mask_no_normal3 = None if learned_normals is None else (learned_normals == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
-        mask_no_normal = mask_no_normal1 | mask_no_normal2
+        depth_normal_needed = compute_learned_normal_loss or compute_depth_normal_loss or compute_curvature_loss
+        render_normal_world_needed = compute_depth_normal_loss
+        render_normal_needed = compute_smoothness_loss
+        nabla_I_needed = compute_smoothness_loss
         
-        c2w = (viewpoint_cam.world_view_transform)
-        normal2 = c2w[:3, :3] @ render_normal.reshape(3, -1)
-        render_normal_world = normal2.reshape(3, *render_normal.shape[1:])
+        if depth_normal_needed:
+            depth_normal, _ = depth_to_normal(viewpoint_cam, depth[None,...],cam_space=False, mask= depth>0)
+            depth_normal = depth_normal.permute(2, 0, 1)
+            mask_no_normal_depth = (depth_normal == torch.zeros_like(depth_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
+        else: 
+            depth_normal = None
+            mask_no_normal_depth = None
+            
+        if compute_points_3d_reg:
+            points_3d = depths_to_points(viewpoint_cam, depth[None, ...], cam_space=False)
+            pcls = pytorch3d.structures.Pointclouds(points_3d[points_3d[:,2]>0].unsqueeze(0))
+            pcls_gaussian = pytorch3d.structures.Pointclouds(gaussians.get_xyz.unsqueeze(0))
+            points_3d_reg = pytorch3d.ops.ball_query(pcls.points_packed().unsqueeze(0), pcls_gaussian.points_packed().unsqueeze(0), K=5, radius=0.1,skip_points_outside_cube=True, return_nn=False).dists.mean()
+            loss_collection.points_3d_reg.set_value(points_3d_reg)
         
-        nabla_I = central_diff(gt_image.permute(1,2,0)).cuda()
+        if render_normal_needed or render_normal_world_needed:
+            render_normal = torch.nn.functional.normalize(render_normal, p=2, dim=0)
+            mask_no_normal_render = (render_normal == torch.zeros_like(render_normal[:,0:1,0:1])).all(0,keepdim=True).detach()
+            render_normal_world = c2w[:3, :3] @ render_normal.reshape(3, -1)
+            render_normal_world = render_normal_world.reshape(3, *render_normal.shape[1:])
+            if not render_normal_needed: render_normal = None
+        else:
+            render_normal = None
+            render_normal_world = None
+            mask_no_normal_render = None
+            
+        nabla_I = None if not nabla_I_needed else central_diff(gt_image.permute(1,2,0)).cuda()
         
-        normal_error = (1 - (render_normal_world * depth_normal).sum(dim=0))
-        epsilon_depth_normal_error = 0.000  # Tune this (e.g., 0.001 to 0.005)
-        normal_error_hinge = torch.clamp(normal_error - epsilon_depth_normal_error, min=0.0)
-        depth_normal_loss = (normal_error_hinge * (~mask_no_normal.squeeze(0) * mask)).mean()
         
-        lambda_distortion = mesh.lambda_distortion if iteration >= mesh.distortion_from_iter else 0.0
-        lambda_depth_normal = mesh.lambda_depth_normal if iteration >= mesh.depth_normal_from_iter else 0.0
+        if compute_depth_normal_loss:
+            normal_error = (1 - (render_normal_world * depth_normal).sum(dim=0))
+            epsilon_depth_normal_error = 0.000  # Tune this (e.g., 0.001 to 0.005)
+            if epsilon_depth_normal_error != 0:
+                normal_error = torch.clamp(normal_error - epsilon_depth_normal_error, min=0.0)
+            loss_collection.depth_normal.set_value((normal_error * (~(mask_no_normal_depth | mask_no_normal_render).squeeze(0) * mask)).mean())
+            
+            
+        if compute_learned_normal_loss:
+            learned_normals_world = c2w[:3, :3] @ learned_normals.reshape(3, -1)
+            learned_normals_world = learned_normals_world.reshape(3, *learned_normals.shape[1:])
+            loss_collection.learned_normal.set_value(
+                ((1 - (learned_normals_world * (depth_normal if not temp_lambdas["detach_depth_normal"] else depth_normal.detach())).sum(dim=0)) * (~(mask_no_normal_depth).squeeze(0) * mask)).mean()
+            )
         
-        MIN_DEPTH_FOR_SMOOTHNESS = 1e-2
-        depth_smoothness_loss = central_diff(1.0/(depth.unsqueeze(0).permute(1,2,0)+1e-8), ignore_inval=1.0/MIN_DEPTH_FOR_SMOOTHNESS, op=torch.ge,return_squared_norm=True, scale_x=viewpoint_cam.focal_x, scale_y=viewpoint_cam.focal_y)
-        depth_smoothness_loss = ((depth_smoothness_loss*mask)*(depth>MIN_DEPTH_FOR_SMOOTHNESS)).mean()
-        lambda_depth_smoothness = temp_lambdas["depth_smoothness"] if iteration >= mesh.depth_normal_from_iter else 0.0
         
-        curvature_loss = (temp_lambdas["curvature_lambda"] if iteration >= mesh.depth_normal_from_iter else 0.0) * ((curvature_prior(depth_normal, ~mask_no_normal1[0]))*mask).mean()
+        if compute_curvature_loss: loss_collection.curvature.set_value(((curvature_prior(depth_normal, ~mask_no_normal_depth[0]))*mask).mean())
             
         # Normal regularization (smoothness)
-        normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), return_squared_norm=True) * torch.exp(-nabla_I)
-        #normal_loss = central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0])) * torch.exp(-nabla_I)
-        normal_loss = (normal_loss*(mask * ~mask_no_normal2)).mean()
-        lambda_normal = mesh.lambda_smoothness if iteration >= mesh.depth_normal_from_iter else 0.0
+        if compute_smoothness_loss:
+            loss_collection.smoothness_normal.set_value(((central_diff(render_normal.permute(1,2,0), ignore_inval = torch.zeros_like(render_normal[:,0,0]), return_squared_norm=True) * torch.exp(-nabla_I)) *(mask * ~mask_no_normal_render)).mean())
 
-        lambda_opacity_field = mesh.lambda_opacity_field if iteration >= mesh.distortion_from_iter else 0.0
-        opa_loss = ((opacity - 0.5)*mask)**2
-
-        #Ll1opacity_smoothness = central_diff(rendering[7][..., None]) * torch.exp(-nabla_I)
-        opa_loss = opa_loss.mean()
+        if compute_opacity_loss: loss_collection.opacity.set_value((((opacity - 0.5)*mask)**2).mean())
+        if compute_extent_loss: loss_collection.extent.set_value((extent*mask).mean())
+        if compute_distortion_loss: loss_collection.distortion.set_value((distortion_map*mask).mean())
         
-        lambda_extent = mesh.lambda_extent if iteration >= mesh.distortion_from_iter else 0.0
-        extent_loss = rendering[9]
-        extent_loss = (extent_loss*mask).mean()
+        if compute_variance_loss: loss_collection.variance.set_value((variance*mask).mean())
+        if compute_normal_variance_loss: loss_collection.normal_variance.set_value((normal_variance*mask).mean())
         
-        rgb_loss_mean = rgb_loss.mean()
-        
-        lambda_variance = mesh.lambda_variance if iteration >= mesh.variance_from_iter else 0.0
-        lambda_normal_variance = mesh.lambda_normal_variance if iteration >= mesh.normal_variance_from_iter else 0.0
-        variance_loss = (variance*mask).mean()
-        normal_variance_loss = (normal_variance*mask).mean()
         
         #freq_loss = densify_utils.frequency_loss_simple(image, structure_tensor_cache[viewpoint_cam.image_name])
         
-        occupation_loss = temp_lambdas["occupation_lambda"] * ((occupation * (1-mask))**2).mean() #if iteration >= mesh.distortion_from_iter else 0
-        occupation_var_loss = temp_lambdas["occupation_var_lambda"] * ((occupation_var * (mask))).mean() #if iteration >= mesh.distortion_from_iter else 0
+        if compute_occupation_loss: loss_collection.occupation.set_value(((occupation * (1-mask))**2).mean())
+        if compute_occupation2_loss: loss_collection.occupation2.set_value((((occupation2.detach()-depth)**2 * (mask))).mean())
+        if compute_occupation_variance_loss: loss_collection.occupation_variance.set_value(((occupation_var * (mask))**2).mean())
+        
+        if compute_opacity_reg: loss_collection.opacity_reg.set_value(gaussians.get_opacity.abs().mean())
+        if compute_scale_reg: loss_collection.scale_reg.set_value((gaussians.get_scaling * gaussians.get_scaling).mean())
+        if compute_min_scale_reg: loss_collection.min_scale_reg.set_value(torch.min(gaussians.get_scaling, dim=-1).values.mean())
         
         
-        normal_consistency_loss = DepthNormalConsistencyLoss((viewpoint_cam.focal_x, viewpoint_cam.focal_y, viewpoint_cam.image_width/2, viewpoint_cam.image_height/2))
-        loss_variational_depth_normal_fusion = normal_consistency_loss(depth, render_normal, mask)
+        loss = loss_collection.compute(iteration,loss_key=0)
+        seg_network_loss = loss_collection.compute(iteration, loss_key=1)
         
-        if iteration < opt.position_lr_max_steps:
-            loss =  rgb_loss_mean + \
-                    depth_normal_loss    * lambda_depth_normal + \
-                    distortion_loss      * lambda_distortion +  \
-                    normal_loss          * lambda_normal + \
-                    opa_loss             * lambda_opacity_field + \
-                    extent_loss          * lambda_extent + \
-                    variance_loss        * lambda_variance + \
-                    normal_variance_loss * lambda_normal_variance + \
-                    (mesh.opacity_reg * (gaussians.get_opacity.abs()).mean() if mesh.opacity_reg > 0 else 0.0) + \
-                    (mesh.scale_reg * (gaussians.get_scaling * gaussians.get_scaling).mean() if mesh.scale_reg > 0 else 0.0) + \
-                    (mesh.min_scale_reg * torch.min(gaussians.get_scaling, dim=-1).values.mean() if mesh.min_scale_reg > 0 else 0.0) + \
-                    seg_loss_obj + \
-                    seg_loss_obj_3d + \
-                    occupation_loss  + \
-                    occupation_var_loss + \
-                    (temp_lambdas["variational_depth_normal_fusion_lambda"] if iteration >= mesh.distortion_from_iter else 0) * loss_variational_depth_normal_fusion + \
-                    lambda_depth_smoothness * depth_smoothness_loss + \
-                    multiview_loss["multiview_loss"] * mesh.multi_view_lambda + \
-                        curvature_loss 
-                    
-                    
-            if normal_field_kick_on:
-                normal3 = c2w[:3, :3] @ learned_normals.reshape(3, -1)
-                render_learned_normal_world = normal3.reshape(3, *learned_normals.shape[1:])
-                learned_normal_error = (1 - (render_learned_normal_world * (depth_normal if not temp_lambdas["detach_depth_normal"] else depth_normal.detach())).sum(dim=0)) * (~(mask_no_normal1).squeeze(0) * mask)
-                loss = loss + learned_normal_error.mean() * temp_lambdas["learned_normal_error"]
-                    
-                    #freq_loss * opt.lambda_freq
-        else:
-            loss = rgb_loss_mean
-                
         loss.backward(retain_graph=True)
-        seg_network_loss.backward()
+        seg_network_loss.backward(retain_graph=True)
         
         
         
         # [NEW] Online Accumulation (per camera in batch)
-        
-        batch.on_frame(loss, rgb_loss_mean, radii, visibility_filter)
+        batch.on_frame(loss, loss_collection.rgb, radii, visibility_filter)
         with torch.no_grad():
             if iteration < opt.densify_until_iter and iteration % 10 == 0:
                 densify_utils.update_freq_stats_online(viewpoint_cam, gaussians, cov2D, visibility_filter, structure_tensor_cache, viewspace_point_tensor=viewspace_point_tensor, grad_threshold= opt.freq_grad_threshold, transmittance_threshold=opt.freq_transmittance_threshold, opacity_threshold=opt.freq_opacity_threshold, eta_compute_mode=opt.eta_compute_mode) 
@@ -640,27 +739,13 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 training_report(
                     tb_writer=tb_writer,
                     iteration=iteration,
-                    rgb_loss=rgb_loss_mean,
+                    loss_collection=loss_collection,
                     total_loss=loss,
                     elapsed_ms=iter_start.elapsed_time(iter_end),
-                    depth_normal_loss=depth_normal_loss,
-                    lambda_depth_normal=lambda_depth_normal,
-                    distortion_loss=distortion_loss,
-                    lambda_distortion=lambda_distortion,
-                    normal_loss=normal_loss,
-                    lambda_normal=lambda_normal,
-                    opacity_loss=opa_loss,
-                    lambda_opacity_field=lambda_opacity_field,
-                    extent_loss=extent_loss,
-                    lambda_extent=lambda_extent,
-                    variance_loss=variance_loss,
-                    lambda_variance=lambda_variance,
                     confidence_pp_rgb_loss_mean=confidence_pp_rgb_loss_mean,
                     confidence_scaled_rgb_loss_mean=confidence_scaled_rgb_loss_mean,
                     confidence_log_term_mean=confidence_log_term_mean,
                     confidence_neg_alpha_log_term_mean=confidence_neg_alpha_log_term_mean,
-                    seg_loss_obj_3d=None if iteration % opt.spatial_similarity_interval != 0 else seg_loss_obj_3d,
-                    seg_loss_obj= None if iteration % opt.contrastive_interval != 0 else seg_loss_obj
                 )
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
@@ -673,7 +758,7 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 temp_splat_args = copy.deepcopy(splat_args)
                 temp_splat_args.consider_max_weight = True
                 render_simp = partial(render, pipe=pipe, bg_color=background, splat_args=temp_splat_args)
-                gaussians_have_changed = densifier.densify(
+                gaussians_have_changed, computed_filter3d = densifier.densify(
                     iteration=iteration,
                     visibility_filter=visibility_filter,
                     radii=radii,
@@ -687,12 +772,16 @@ def training(dataset, opt, pipe : PipelineParams, mesh : MeshingParams, testing_
                 
                 # ---Normal Field Densification---
                 if mesh.use_normal_field and normal_densifier is not None:
-                    gaussians_have_changed = gaussians_have_changed or normal_densifier.densify(iteration, scene.getTrainCameras().copy(), bg, 
-                                                                                                None, None, normal_field_kick_on, normal_field_config)
+                    gaussians_have_changed_normal_densifier, computed_filter3d_normal_densifier = normal_densifier.densify(iteration, scene.getTrainCameras().copy(), bg, 
+                                                                                                            None, None, normal_field_kick_on, normal_field_config)
+                    assert not computed_filter3d_normal_densifier, "Should do it as it doesn't know what the other densifier did"
+                    assert not gaussians_have_changed_normal_densifier and gaussians_have_changed, "Hmm, how about the 3d filter"
+                    gaussians_have_changed = gaussians_have_changed or gaussians_have_changed_normal_densifier
+                    
                             
                             
 
-                if gaussians_have_changed: 
+                if gaussians_have_changed and not computed_filter3d: 
                     gaussians.compute_3D_filter(scene.getTrainCameras().copy(), CUDA=not pipe.compute_filter3D_python)
                     if normal_densifier is not None and mesh.use_normal_field: normal_densifier.reset_normal_field_state_at_next_iteration()
                 elif opt.densify_until_iter < iteration and iteration % 100 == 0:
@@ -777,76 +866,21 @@ def prepare_output_and_logger(args, settings: ExtendedSettings, opt, pipe, mesh)
 def training_report(
     tb_writer,
     iteration,
-    rgb_loss,
+    loss_collection: LossCollection,
     total_loss,
     elapsed_ms,
-    depth_normal_loss,
-    lambda_depth_normal,
-    distortion_loss,
-    lambda_distortion,
-    normal_loss,
-    lambda_normal,
-    opacity_loss,
-    lambda_opacity_field,
-    extent_loss,
-    lambda_extent,
-    lambda_variance,
-    variance_loss,
     confidence_pp_rgb_loss_mean=None,
     confidence_scaled_rgb_loss_mean=None,
     confidence_log_term_mean=None,
     confidence_neg_alpha_log_term_mean=None,
-    seg_loss_obj = None,
-    seg_loss_obj_3d = None,
 ):
     if tb_writer:
-        tb_writer.add_scalar("train_loss/rgb_loss", rgb_loss.item(), iteration)
+        for key in loss_collection.losses:
+            part = loss_collection.losses[key]
+            tb_writer.add_scalar(f"loss_parts/{key}", part.get_value_raw().item(), iteration)
+            tb_writer.add_scalar(f"loss_parts_weighted/{key}", part.get_value().item(), iteration)
         tb_writer.add_scalar("train_loss/total_loss", total_loss.item(), iteration)
         tb_writer.add_scalar("timing/iter_time_ms", elapsed_ms, iteration)
-
-        tb_writer.add_scalar("regularization/depth_normal", depth_normal_loss.item(), iteration)
-        tb_writer.add_scalar("regularization/distortion", distortion_loss.item(), iteration)
-        tb_writer.add_scalar("regularization/normal_smoothness", normal_loss.item(), iteration)
-        tb_writer.add_scalar("regularization/opacity_field", opacity_loss.item(), iteration)
-        tb_writer.add_scalar("regularization/extent", extent_loss.item(), iteration)
-        tb_writer.add_scalar("regularization/variance", variance_loss.item(), iteration)
-        
-        if lambda_depth_normal > 0.0:
-            tb_writer.add_scalar(
-                "weighted_regularization/depth_normal",
-                (depth_normal_loss * lambda_depth_normal).item(),
-                iteration,
-            )
-        if lambda_distortion > 0.0:
-            tb_writer.add_scalar(
-                "weighted_regularization/distortion",
-                (distortion_loss * lambda_distortion).item(),
-                iteration,
-            )
-        if lambda_normal > 0.0:
-            tb_writer.add_scalar(
-                "weighted_regularization/normal_smoothness",
-                (normal_loss * lambda_normal).item(),
-                iteration,
-            )
-        if lambda_opacity_field > 0.0:
-            tb_writer.add_scalar(
-                "weighted_regularization/opacity_field",
-                (opacity_loss * lambda_opacity_field).item(),
-                iteration,
-            )
-        if lambda_extent > 0.0:
-            tb_writer.add_scalar(
-                "weighted_regularization/extent",
-                (extent_loss * lambda_extent).item(),
-                iteration,
-            )
-        if lambda_variance > 0.0:
-            tb_writer.add_scalar(
-                "weighted_regularization/variance",
-                (variance_loss * lambda_variance).item(),
-                iteration,
-            )
 
         if confidence_pp_rgb_loss_mean is not None:
             tb_writer.add_scalar(
@@ -870,19 +904,6 @@ def training_report(
             tb_writer.add_scalar(
                 "confidence_terms/neg_alpha_log_confidence_mean",
                 confidence_neg_alpha_log_term_mean.item(),
-                iteration,
-            )
-            
-        if seg_loss_obj is not None:
-            tb_writer.add_scalar(
-                "segmentation_terms/loss_obj",
-                seg_loss_obj.item(),
-                iteration,
-            )
-        if seg_loss_obj_3d is not None:
-            tb_writer.add_scalar(
-                "segmentation_terms/loss_obj_3d",
-                seg_loss_obj_3d.item(),
                 iteration,
             )
             

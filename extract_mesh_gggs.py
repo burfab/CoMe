@@ -8,7 +8,7 @@ import torch
 import trimesh
 from tqdm import tqdm
 
-from arguments import ModelParams, PipelineParams, get_combined_args, SplattingSettings, MeshingSettings
+from arguments import ModelParams, PipelineParams, get_combined_args, SplattingSettings, MeshingSettings,BoundingSetting
 from gaussian_renderer import (
     GaussianModel,
     render,
@@ -79,7 +79,7 @@ def evaluation_validation(view, points, inside):
 
 
 @torch.no_grad()
-def evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size):
+def evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size, splat_args):
     final_sdf = []
     any_valid = []
     chunk_size = 10000000
@@ -92,7 +92,7 @@ def evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size):
         )
         for view in tqdm(views, desc="Rendering progress"):
             ret = evaluate_transmittance(
-                point_chunk, view, gaussians, pipeline, kernel_size
+                point_chunk, view, gaussians, pipeline, kernel_size, splat_args=splat_args
             )
             valid_points = evaluation_validation(view, point_chunk, ret["inside"])
             any_valid_chunk = torch.logical_or(any_valid_chunk, valid_points)
@@ -125,9 +125,9 @@ def add_color(
         )
         for view in tqdm(views, desc="Rendering progress"):
             transmittance = evaluate_transmittance(
-                point_chunk, view, gaussians, pipeline, kernel_size
+                point_chunk, view, gaussians, pipeline, kernel_size, splat_args=splat_args
             )["transmittance"]
-            ret = evaluate_sdf(point_chunk, view, gaussians, pipeline, kernel_size)
+            ret = evaluate_sdf(point_chunk, view, gaussians, pipeline, kernel_size, splat_args=splat_args)
             sdf = ret["sdf"]
             valid_points = (
                 evaluation_validation(view, point_chunk, ret["inside"])
@@ -135,7 +135,7 @@ def add_color(
                 & (transmittance > 0.2)
             )
             color = evaluate_color(
-                point_chunk, view, gaussians, pipeline, kernel_size, background
+                point_chunk, view, gaussians, pipeline, kernel_size, background, splat_args=splat_args
             )["color"]
             accumulated_colors_chunk = torch.where(
                 valid_points.unsqueeze(-1),
@@ -165,12 +165,12 @@ def add_color_silhouette(points, views, gaussians, pipeline, kernel_size, backgr
         transmittance_chunk = torch.zeros(n_points, dtype=torch.int32, device="cuda")
         for view in tqdm(views, desc="Rendering progress"):
             ret = evaluate_transmittance(
-                point_chunk, view, gaussians, pipeline, kernel_size
+                point_chunk, view, gaussians, pipeline, kernel_size, splat_args=splat_args
             )
             transmittance = ret["transmittance"]
             valid_points = evaluation_validation(view, point_chunk, ret["inside"])
             color = evaluate_color(
-                point_chunk, view, gaussians, pipeline, kernel_size, background
+                point_chunk, view, gaussians, pipeline, kernel_size, background, splat_args=splat_args
             )["color"]
             update = (transmittance > transmittance_chunk) & valid_points
             colors_chunk = torch.where(update.unsqueeze(-1), color, colors_chunk)
@@ -197,7 +197,7 @@ def marching_tetrahedra_with_binary_search(
     mesh_settings: MeshingSettings
 ):
     # generate tetra points here
-    points, points_scale = gaussians.get_tetra_points()
+    points, points_scale = gaussians.get_tetra_points(views, mesh_settings)
 
     print("construct cell")
     cells = cpp.triangulate(points)
@@ -212,7 +212,7 @@ def marching_tetrahedra_with_binary_search(
     #     # we should filter the cell if it is larger than the gaussians
     #     torch.save(cells, os.path.join(model_path, "cells.pt"))
 
-    sdf, valid = evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size)
+    sdf, valid = evaluate_alpha_cull(points, views, gaussians, pipeline, kernel_size, splat_args)
 
     torch.cuda.empty_cache()
     # the function marching_tetrahedra costs much memory, so we move it to cpu.
@@ -222,11 +222,12 @@ def marching_tetrahedra_with_binary_search(
             cells.cpu().long(),
             sdf[None].cpu(),
             points_scale[None].cpu(),
-            valid[None].cpu(),
+            #valid[None].cpu(),
         )
     else:
+        assert (~valid).sum().cpu().item() == 0
         verts_list, scale_list, faces_list, _ = marching_tetrahedra(
-            points[None], cells.long(), sdf[None], points_scale[None], valid[None]
+            points[None], cells.long(), sdf[None], points_scale[None]#, valid[None]
         )
     end_points, end_sdf = verts_list[0]
     end_scales = scale_list[0]
@@ -240,7 +241,7 @@ def marching_tetrahedra_with_binary_search(
     points = (end_points[:, 0, :] + end_points[:, 1, :]) * 0.5
 
     mesh = trimesh.Trimesh(vertices=points.cpu().numpy(), faces=faces, process=False)
-    mesh.export(os.path.join(model_path, "recon_init.ply"))
+    mesh.export(os.path.join(model_path, f"{args.mesh_name}_init.ply"))
 
     left_points = end_points[:, 0, :]
     right_points = end_points[:, 1, :]
@@ -256,7 +257,7 @@ def marching_tetrahedra_with_binary_search(
         print("binary search in step {}".format(step))
         mid_points = (left_points + right_points) * 0.5
         mid_sdf, _ = evaluate_alpha_cull(
-            mid_points, views, gaussians, pipeline, kernel_size
+            mid_points, views, gaussians, pipeline, kernel_size, splat_args=splat_args
         )
         mid_sdf = mid_sdf.unsqueeze(-1)
         ind_low = ((mid_sdf < 0) & (left_sdf < 0)) | ((mid_sdf > 0) & (left_sdf > 0))
@@ -272,7 +273,7 @@ def marching_tetrahedra_with_binary_search(
     mesh.update_faces(face_mask)
     mesh.remove_unreferenced_vertices()
 
-    mesh.export(os.path.join(model_path, "recon.ply"))
+    mesh.export(os.path.join(model_path, f"{args.mesh_name}.ply"))
 
     o3d_mesh = o3d.geometry.TriangleMesh()
     o3d_mesh.vertices = o3d.utility.Vector3dVector(
@@ -308,7 +309,7 @@ def marching_tetrahedra_with_binary_search(
         )
         mesh.vertex_colors = o3d.utility.Vector3dVector(color.cpu().numpy())
 
-    o3d.io.write_triangle_mesh(os.path.join(model_path, "recon_post.ply"), mesh)
+    o3d.io.write_triangle_mesh(os.path.join(model_path, f"{args.mesh_name}_post.ply"), mesh)
     print("done!")
 
 
@@ -323,9 +324,9 @@ def extract_mesh(
     mesh_settings:MeshingSettings
 ):
     with torch.no_grad():
-        gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
+        gaussians = GaussianModel(dataset.sh_degree)
         scene = Scene(dataset, gaussians, load_iteration=iteration, shuffle=False)
-        kernel_size = dataset.kernel_size
+        kernel_size = 0
         bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
@@ -353,8 +354,16 @@ if __name__ == "__main__":
     parser.add_argument("--iteration", default=-1, type=int)
     parser.add_argument("--num_cluster", default=1, type=int)
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--near", default=0.02, type=float)
+    parser.add_argument("--far", default=1e6, type=float)
+    parser.add_argument("--bounding_mode", type=lambda sortmode: BoundingSetting[sortmode], choices=list(BoundingSetting), default=BoundingSetting.STP)
     parser.add_argument("--move_cpu", action="store_true")
     parser.add_argument("--texture_mesh", action="store_true")
+    parser.add_argument("--opacity_cutoff_tetra", default=0.0039, type=float)
+    parser.add_argument("--disable_near_far_culling", action="store_true", default=False)
+    parser.add_argument("--load_cells", action="store_true", default=False)
+    parser.add_argument("--mesh_name", type=str, default="recon")
+    
     args = get_combined_args(parser)
 
     mesh_settings = MeshingSettings(args.near, args.far, args.texture_mesh, args.bounding_mode, args.mesh_name,

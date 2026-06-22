@@ -182,19 +182,22 @@ def gui_visualize(
         ).float().permute(-1, 0, 1)[:3]
     elif other_args["custom_message"].lower() == "occupation":
         image = occupation.squeeze()
-        image = image / image.max()
+        image = (image-image.min()) / (image.max()-image.min())
         cmap = matplotlib.colormaps.get_cmap('magma')
         image = torch.tensor(cmap(image.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
         return image
     elif other_args["custom_message"].lower() == "occupation2":
         image = occupation2.squeeze()
-        image = image / image.max()
+        #image = (image-image.min()) / (image.max()-image.min())
+        #image = (image-image.min()) / (image.max()-image.min())
+        image = (image) / (image.quantile(0.75) * 2)
         cmap = matplotlib.colormaps.get_cmap('magma')
         image = torch.tensor(cmap(image.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
         return image
     elif other_args["custom_message"].lower() == "occupation_var":
         image = occupation2.squeeze() - occupation.squeeze()**2
-        image = image / image.max()
+        image = (image-image.min()) / (image.max()-image.min())
+        #image = image/image.max()
         cmap = matplotlib.colormaps.get_cmap('magma')
         image = torch.tensor(cmap(image.cpu().detach().numpy()), device="cuda").float().permute(-1,0,1)[:3]
         return image
