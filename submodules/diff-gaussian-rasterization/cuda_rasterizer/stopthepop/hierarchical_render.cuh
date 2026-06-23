@@ -9,6 +9,7 @@
 #include "stopthepop_common.cuh"
 
 #include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
 constexpr float SIGMA_THRESHOLD = 3.00f;
@@ -380,7 +381,7 @@ __device__ void batcherSort(CG& cg, KT* keys, VT* vals)
 }
 
 
-template <int ITERATIONS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename SF, typename BF, typename FF>
+template <int ITERATIONS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename BF, typename FF>
 __device__ void GaussiansRayEvaluation(
     const uint2* __restrict__ ranges,
     const uint32_t* __restrict__ point_list,
@@ -400,13 +401,18 @@ __device__ void GaussiansRayEvaluation(
     // block size must be: 16,4,4
     auto block = cg::this_thread_block();
     auto warp  = cg::tiled_partition<WARP_SIZE>(block);
+    auto halfwarp = cg::tiled_partition<WARP_SIZE/2>(block);
 
     // --- shared memory ---
     // One row per gaussian in the warp-wide batch.
     // Loaded once before the j-loop; inner loop only reads smem.
-    __shared__ float  smem_V2G[WARP_SIZE][VIEW2GAUSSIAN_OFFSET];
-    __shared__ float4 smem_con_o[WARP_SIZE];
+	constexpr size_t CACHE_LEN = WARP_SIZE*6;
+    __shared__ float  smem_V2G[CACHE_LEN][VIEW2GAUSSIAN_OFFSET];
+    __shared__ float4 smem_con_o[CACHE_LEN];
+	__shared__ float2 smem_points_xy[CACHE_LEN];
+    __shared__ int smem_load_id[CACHE_LEN];
     __shared__ uint2  range;
+    __shared__ uint  block_active;
 
     // --- pixel setup (identical to previous version) ---
     const uint2 tile_min    = { block.group_index().x * BLOCK_X,
@@ -417,15 +423,13 @@ __device__ void GaussiansRayEvaluation(
     const glm::mat4 inverse_vp = loadMatrix4x4(projmatrix_inv);
     const float3 campos = *cam_pos;
 
-    const int midid  = (block.thread_index().x % 16) / 4;
-    const int midy   = midid / 2;
-    const int midx   = midid % 2;
-    const int midrank = block.thread_index().x % 4;
-    const int heady  = midrank / 2;
-    const int headx  = midrank % 2;
-
-    const uint2 pixpos = { tail_corner.x + midx * 2 + headx,
-                            tail_corner.y + midy * 2 + heady };
+	const int midid = halfwarp.thread_rank() / 4;
+	const int midrank = halfwarp.thread_rank() % 4;
+	const int midy = midid / 2;
+	const int midx = midid % 2;
+	const int heady = midrank / 2;
+	const int headx = midrank % 2;
+	const uint2 pixpos = { tail_corner.x + midx * 2 + headx, tail_corner.y + midy * 2 + heady };
 
     const int32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
     if (warp.thread_rank() == 0)
@@ -446,84 +450,170 @@ __device__ void GaussiansRayEvaluation(
 	auto fn_loop =[&](auto FIRST_ITER_AS_TYPE,int iter){
         blend_data.contributor = 0;
         bool active = active_outer;
-
-        for (int progress = range.x; progress < range.y; progress += WARP_SIZE)
+        for (int progress = range.x; progress < range.y; progress += CACHE_LEN)
         {
-            if (!warp.any(active))
-                break;
+			if(block.thread_rank() == 0) block_active = 0;
+			block.sync();
+            if(warp.any(active) && warp.thread_rank() == 0) block_active=1;
+			block.sync();
+			if(!block_active) break;
 
-            // Every thread resolves its own gaussian id for this batch.
-            int load_id = -1;
-            const int tid = progress + warp.thread_rank();
-            if (tid < range.y)
-                load_id = point_list[tid];
-
-            // --- batch load into smem ---
-            // All warps in the block share the same tile and therefore the
-            // same point_list slice, so only the first warp does the actual
-            // global loads. Every thread sees the result after block.sync().
-            if (block.thread_rank() < WARP_SIZE)
+			//---------------------LOADING TO CACHE---------------------------
+			//use half warps to load cache, need to load 14 values
+			//first 10 load V2G
+			//next 4 load con_o
+			//rounds needed is CACHE_LEN / #half_warps
+			//V2G index is: (float*)ptr + half_warp.idx for idx in [0,9]
+			//con_o index is: (float*)ptr + half_warp.idx-10 for idx in [10,13]
+			//need load id: this is per half_warp it is block.thread_rank() / 16
             {
-                if (load_id != -1)
-                {
-                    #pragma unroll
-                    for (int k = 0; k < VIEW2GAUSSIAN_OFFSET; k++)
-                        smem_V2G[warp.thread_rank()][k] =
-                            view2gaussian[load_id * VIEW2GAUSSIAN_OFFSET + k];
-                    smem_con_o[warp.thread_rank()] = conic_opacity[load_id];
+				block.sync();
+
+              const auto rounds = (CACHE_LEN + block.num_threads() / 16 - 1) /
+                                 (block.num_threads() / 16);
+              for (int round = 0; round < rounds; round++) {
+                const int cache_idx = round * (block.num_threads() / 16) +
+                                      block.thread_rank() / 16;
+                if (cache_idx >= CACHE_LEN)
+                  continue;
+
+                const bool is_v2g = halfwarp.thread_rank() < 10;
+                const bool is_cono = halfwarp.thread_rank() < 14;
+                const bool is_points_xy = halfwarp.thread_rank() < 16;
+                const int global_idx = progress + cache_idx;
+                int load_id = -1;
+                if (global_idx < range.y)
+                  load_id = point_list[global_idx];
+
+                if (halfwarp.thread_rank() == 0)
+                  smem_load_id[cache_idx] = load_id;
+                if (load_id != -1) {
+                  const float *load_addr = nullptr;
+                  float *store_addr = nullptr;
+                  if (is_v2g) {
+                    load_addr = (float *)view2gaussian +
+                                load_id * VIEW2GAUSSIAN_OFFSET +
+                                halfwarp.thread_rank();
+                    store_addr = &smem_V2G[cache_idx][halfwarp.thread_rank()];
+                  } else if (is_cono) {
+                    constexpr size_t EL_SIZE = sizeof(float4)/sizeof(float);
+                    load_addr = (float *)conic_opacity + load_id * EL_SIZE +
+                                (halfwarp.thread_rank() - 10);
+                    store_addr = ((float *)(smem_con_o + cache_idx)) +
+                                 halfwarp.thread_rank() - 10;
+                  }else if(is_points_xy){
+                    constexpr size_t EL_SIZE = sizeof(float2)/sizeof(float);
+                    load_addr = (float *)points_xy_image + load_id * EL_SIZE +
+                                (halfwarp.thread_rank() - 14);
+                    store_addr = ((float *)(smem_points_xy + cache_idx)) +
+                                 halfwarp.thread_rank() - 14;
+				  }
+                  if (load_addr != nullptr) {
+                    *store_addr = *load_addr;
+                  }
                 }
-                else
-                {
-                    #pragma unroll
-                    for (int k = 0; k < VIEW2GAUSSIAN_OFFSET; k++)
-                        smem_V2G[warp.thread_rank()][k] = 0.0f;
-                    smem_con_o[warp.thread_rank()] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-                }
-            }
-            // Fence: smem writes visible, and previous iteration's smem reads done.
-            block.sync();
-
-            // --- inner loop: purely smem reads, no global memory ---
-            for (int j = 0; j < WARP_SIZE; j++)
-            {
-                // coll_id is the same across all warps for a given j.
-                const int coll_id = warp.shfl(load_id, j);
-                if (coll_id == -1)
-                    continue;
-
-                const float* V2G   = smem_V2G[j];      // broadcast smem read
-                const float4 con_o = smem_con_o[j];    // broadcast smem read
-				if(con_o.w == 0) continue;
-				
-                float3 Ld = { V2G[0] * ray.x + V2G[1] * ray.y + V2G[2],
-                              V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
-                              V2G[2] * ray.x + V2G[4] * ray.y + V2G[5] };
-                float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z,
-                               2.0f * (V2G[6] * ray.x + V2G[7] * ray.y + V2G[8]),
-                               V2G[9],
-                               con_o.w };
-                const float  depth  = -ABC.y / (2.0f * ABC.x);
-                const float3 normal = { Ld.x, Ld.y, Ld.z };
-
-                if (!active || depth < NEAR_PLANE)
-                    continue;
-
-
-                float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
-                if (power > 0.0f) power = 0.0f;
-                const float G     = expf(power);
-                const float alpha = min(0.99f, con_o.w * G);
-
-                if (alpha < 1.0f / 255.0f)
-                    continue;
-                
-				blend_data.contributor++;
-				if (!blend_function(FIRST_ITER_AS_TYPE,
-						pixpos, blend_data, coll_id, G, alpha, depth,
-								V2G, ray, debugType, normal, ABC)) { active = false; }
+              }
+				block.sync();
             }
 
-            block.sync();
+			const auto fn_load_v2g =[](const float* src, float (&dest)[VIEW2GAUSSIAN_OFFSET]){
+				for(int i=0;i<VIEW2GAUSSIAN_OFFSET;i++)
+					dest[i] = src[i];
+			};
+
+			const auto fn_wrap_shfl_down = [](uint lane_id, auto val) -> auto {
+				uint src_lane = (lane_id + 1) % WARP_SIZE;
+				return __shfl_sync(0xFFFFFFFF,val, src_lane, WARP_SIZE);
+			};
+
+			//------------------------BLEND-----------------------------
+			{
+              const auto rounds = (CACHE_LEN + WARP_SIZE-1) / WARP_SIZE;
+				for(int round = 0; round < rounds; round++){
+					if(!warp.any(active)) break;
+					auto cache_idx = round * WARP_SIZE + warp.thread_rank();
+
+					//each thread computes the culling of this gaussian for all pixels in warp
+					//so for block size 16,4,4
+					//we have 2,4,4 = 32, that is 2 4x4 tiles
+
+					float V2G[10]; float4 con_o;
+					int load_id = -1;
+					if(cache_idx < CACHE_LEN) {
+						load_id = smem_load_id[cache_idx];
+						fn_load_v2g(smem_V2G[cache_idx], V2G);
+						con_o.x = smem_con_o[cache_idx].x;
+						con_o.y = smem_con_o[cache_idx].y;
+						con_o.z = smem_con_o[cache_idx].z;
+						con_o.w = smem_con_o[cache_idx].w;
+					}
+
+					uint32_t cull_halfs = load_id == -1 ? 0x3 : 0;
+					if (load_id != -1){
+						if constexpr (CULL_ALPHA){
+							const float2 in_point_xy = smem_points_xy[cache_idx];
+							const int y = block.thread_index().y;
+							const int z = block.thread_index().z;
+
+							for (int half = 0; half < 2; ++half)
+							{
+								const int xid = half == 0 ? (y & ~0x1) : (y | 0x1);
+								const glm::vec2 tail_rect_min = {
+									static_cast<float>(block.group_index().x * BLOCK_X + 4 * xid),
+									static_cast<float>(block.group_index().y * BLOCK_Y + 4 * z) };
+								const glm::vec2 tail_rect_max = { tail_rect_min.x + 3.0f, tail_rect_min.y + 3.0f };
+
+								glm::vec2 max_pos;
+								const float power = max_contrib_power_rect_gaussian_float<3, 3>(
+									con_o, in_point_xy, tail_rect_min, tail_rect_max, max_pos);
+
+								const float alpha = min(0.99f, con_o.w * exp(-power));
+								if (alpha < 1.0f / 255.0f) cull_halfs |= ((uint32_t)0x1 << half);
+							}
+						}
+					}
+					for(int j=0; j < WARP_SIZE;j++){
+						if(!warp.any(active)) break;
+						#pragma unroll
+						for (int l = 0; l < VIEW2GAUSSIAN_OFFSET; l++) V2G[l] = fn_wrap_shfl_down(warp.thread_rank(), V2G[l]);
+						con_o.x = fn_wrap_shfl_down(warp.thread_rank(), con_o.x);
+						con_o.y = fn_wrap_shfl_down(warp.thread_rank(), con_o.y);
+						con_o.z = fn_wrap_shfl_down(warp.thread_rank(), con_o.z);
+						con_o.w = fn_wrap_shfl_down(warp.thread_rank(), con_o.w);
+						load_id = fn_wrap_shfl_down(warp.thread_rank(), load_id);
+						cull_halfs = fn_wrap_shfl_down(warp.thread_rank(), cull_halfs);
+						const bool is_culled = cull_halfs & (block.thread_index().y & 0x1 ? 0x2 : 0x1);
+						if(load_id == -1 || !active || is_culled) continue;
+						//float V2G[10]; fn_load_v2g(smem_V2G[coll_cache_idx], V2G);
+						//const auto con_o = smem_con_o[coll_cache_idx];
+
+						float3 Ld = { V2G[0] * ray.x + V2G[1] * ray.y + V2G[2],
+									V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
+									V2G[2] * ray.x + V2G[4] * ray.y + V2G[5] };
+						float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z,
+									2.0f * (V2G[6] * ray.x + V2G[7] * ray.y + V2G[8]),
+									V2G[9],
+									con_o.w };
+						const float  depth  = -ABC.y / (2.0f * ABC.x);
+						const float3 normal = { Ld.x, Ld.y, Ld.z };
+
+						if (depth < NEAR_PLANE) continue;
+
+						float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
+						if (power > 0.0f) power = 0.0f;
+						const float G     = expf(power);
+						const float alpha = min(0.99f, con_o.w * G);
+
+						if (alpha < 1.0f / 255.0f)
+							continue;
+						
+						blend_data.contributor++;
+						if (!blend_function(FIRST_ITER_AS_TYPE,
+								pixpos, blend_data, load_id, G, alpha, depth,
+										V2G, ray, debugType, normal, ABC)) { active = false; }
+					}
+				}
+			}
         }
 
         if (pixpos.x < W && pixpos.y < H)
@@ -535,11 +625,7 @@ __device__ void GaussiansRayEvaluation(
 
 	if constexpr (ITERATIONS>0) fn_loop(std::true_type{},0);
 	for (int iter = 1; iter < ITERATIONS; iter++) fn_loop(std::false_type{},iter);
-    
 }
-
-
-
 
 // 0x1 -> tail
 // 0x2 -> mid
@@ -1491,414 +1577,373 @@ struct FunctionLocalInformation
     }
 };
 
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW,
+          bool CULL_ALPHA = true, bool EXACT_DEPTH = false,
+          bool ENABLE_DEBUG_VIZ = false, bool CONSIDER_MAX_WEIGHT = false,
+          bool GSGS_TWO_PASS = false>
+__global__ void __launch_bounds__(16 * 16, 4)
+    sortGaussiansRayHierarchicalCUDA_renderForward(
+        const uint2 *__restrict__ ranges,
+        const uint32_t *__restrict__ point_list, int W, int H, float focal_x,
+        float focal_y, const float far_plane, const bool include_alpha,
+        const float *view2gaussian, const float2 *__restrict__ points_xy_image,
+        const float4 *__restrict__ cov3Ds_inv,
+        const float *__restrict__ projmatrix_inv,
+        const float3 *__restrict__ cam_pos, const float *__restrict__ features,
+        const float *__restrict__ confidences,
+        const float4 *__restrict__ conic_opacity, float *__restrict__ final_T,
+        uint32_t *__restrict__ n_contrib, const float *__restrict__ bg_color,
+        float *__restrict__ max_weights, float *__restrict__ cov2Ds,
+        CudaRasterizer::DebugVisualization debugType,
+        float *__restrict__ out_color, float *__restrict__ gt_color) {
+  constexpr uint2 debug_target_pixel = {500, 500};
+  // int num_blends = 0;
 
+  struct BlendData {
+    float T;
+    float T_opa;
+    float C[CHANNELS * 2];
+    uint32_t contributor = 0;
+    float opacity;
+    float depth;
+    float variance;
+    float distortion;
+    float dist1;
+    float dist2;
+    float extent_loss;
+    float confidence{0};
+    float occupation;
+    float occupation2;
+    uint32_t max_contributor{0};
+    uint32_t blend_contributor{0};
+    float3 ray_dir;
+    float gt_color[CHANNELS];
 
-template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false, bool CONSIDER_MAX_WEIGHT = false, bool GSGS_TWO_PASS=false>
-__global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_renderForward(
-	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
-	int W, int H,
-	float focal_x, float focal_y, 
-	const float far_plane,
-	const bool include_alpha,
-	const float* view2gaussian,
-	const float2* __restrict__ points_xy_image,
-	const float4* __restrict__ cov3Ds_inv,
-	const float* __restrict__ projmatrix_inv,
-	const float3* __restrict__ cam_pos,
-	const float* __restrict__ features,
-	const float* __restrict__ confidences,
-	const float4* __restrict__ conic_opacity,
-	float* __restrict__ final_T,
-	uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ bg_color,
-	float* __restrict__ max_weights,
-	float* __restrict__ cov2Ds,
-	CudaRasterizer::DebugVisualization debugType,
-	float* __restrict__ out_color,
-	float* __restrict__ gt_color){
-	constexpr uint2 debug_target_pixel = {500, 500};
-	// int num_blends = 0;
+    float weighted_normal_sum[CHANNELS];
 
-          struct BlendData {
-            float T;
-            float T_opa;
-            float C[CHANNELS * 2];
-            uint32_t contributor = 0;
-            float opacity;
-            float depth;
-            float variance;
-            float distortion;
-            float dist1;
-            float dist2;
-            float extent_loss;
-            float confidence{0};
-            float occupation;
-            float occupation2;
-            uint32_t max_contributor{0};
-            uint32_t blend_contributor{0};
-            float3 ray_dir;
-            float gt_color[CHANNELS];
+    FunctionLocalInformation<1, 0> f_transmittance;
+  };
 
-            float weighted_normal_sum[CHANNELS];
+  auto prep_function = [&](bool inside, const uint2 &pixpos,
+                           const float3 ray_dir) {
+    BlendData bd;
+    bd.ray_dir = ray_dir;
+    bd.T = 1.0f;
+    bd.T_opa = 1.0f;
+    for (int ch = 0; ch < CHANNELS * 2; ++ch) {
+      bd.C[ch] = 0.0f;
+    }
+    bd.distortion = 0.f;
+    bd.depth = 0.f;
+    bd.opacity = 0.f;
+    bd.dist1 = 0.f;
+    bd.dist2 = 0.f;
+    bd.extent_loss = 0.f;
+    bd.variance = 0.f;
+    bd.occupation = 0.f;
+    bd.occupation2 = 0.f;
 
-			FunctionLocalInformation<1,0> f_transmittance;
-          };
+    bd.f_transmittance.x<0>() = 0.f;
+    bd.f_transmittance.f<0, 0>() = 1.f;
 
-          auto prep_function = [&](bool inside, const uint2 &pixpos,
-                                   const float3 ray_dir) {
-            BlendData bd;
-            bd.ray_dir = ray_dir;
-            bd.T = 1.0f;
-            bd.T_opa = 1.0f;
-            for (int ch = 0; ch < CHANNELS * 2; ++ch) {
-              bd.C[ch] = 0.0f;
-            }
-            bd.distortion = 0.f;
-            bd.depth = 0.f;
-            bd.opacity = 0.f;
-            bd.dist1 = 0.f;
-            bd.dist2 = 0.f;
-            bd.extent_loss = 0.f;
-            bd.variance = 0.f;
-            bd.occupation = 0.f;
-            bd.occupation2 = 0.f;
-
-			bd.f_transmittance.x<0>()=0.f;
-			bd.f_transmittance.f<0,0>()=1.f;
-
-            uint32_t pix_id = pixpos.y * W + pixpos.x;
-            for (int ch = 0; ch < CHANNELS; ch++) {
-              if (inside) {
-                bd.gt_color[ch] = gt_color[ch * H * W + pix_id];
-              }
-            }
+    uint32_t pix_id = pixpos.y * W + pixpos.x;
+    for (int ch = 0; ch < CHANNELS; ch++) {
+      if (inside) {
+        bd.gt_color[ch] = gt_color[ch * H * W + pix_id];
+      }
+    }
 
 #if (DEBUG_HIERARCHICAL & 0x200) != 0
-            if (pixpos.x == debug_target_pixel.x &&
-                pixpos.y == debug_target_pixel.y) {
-              printf("+++++++++++++++++++++++++++++++++++++++++++\n");
-            }
+    if (pixpos.x == debug_target_pixel.x && pixpos.y == debug_target_pixel.y) {
+      printf("+++++++++++++++++++++++++++++++++++++++++++\n");
+    }
 #endif
-            return bd;
-          };
-          auto store_function = [](const uint2 &, int coll_id, float G,
-                                   float alpha, float depth) { return alpha; };
-          auto blend_function =
-              [&](auto FIRST_ITER_AS_TYPE,const uint2 &pixpos, BlendData &blend_data, int id,
-                  float alpha, float t, const float *view2gaussian_j,
-                  float2 ray, CudaRasterizer::DebugVisualization debugType,
-                  float3 normal_, float4 ABC_) {
-					auto FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
+    return bd;
+  };
+  auto store_function = [](const uint2 &, int coll_id, float G, float alpha,
+                           float depth) { return alpha; };
+  auto blend_function = [&](auto FIRST_ITER_AS_TYPE, const uint2 &pixpos,
+                            BlendData &blend_data, int id, float alpha, float t,
+                            const float *view2gaussian_j, float2 ray,
+                            CudaRasterizer::DebugVisualization debugType,
+                            float3 normal_, float4 ABC_) {
+    auto FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
 
+    // alpha = 0.999f;
+    const float normal[3] = {normal_.x, normal_.y, normal_.z};
+    [[maybe_unused]] const float AA = ABC_.x;
+    [[maybe_unused]] const float BB = ABC_.y;
+    [[maybe_unused]] const float CC = ABC_.z;
 
+    float test_T = blend_data.T * (1.0f - alpha);
 
+    if (test_T < 0.0001f) {
+      return false;
+    }
+    // Keep track of max transmittance for this Gaussian
+    if (cov2Ds) {
+      atomicMax((int *)&cov2Ds[id * 7 + 6], __float_as_int(blend_data.T));
+    }
 
+    blend_data.blend_contributor++;
+    const float weight = alpha * blend_data.T;
 
-                // alpha = 0.999f;
-                const float normal[3] = {normal_.x, normal_.y, normal_.z};
-                [[maybe_unused]] const float AA = ABC_.x;
-                [[maybe_unused]] const float BB = ABC_.y;
-                [[maybe_unused]] const float CC = ABC_.z;
+    // only do this when enabled to reduce memory pressure
+    if constexpr (CONSIDER_MAX_WEIGHT) {
+      aMaxFloat(&max_weights[id], weight);
+    }
 
-                float test_T = blend_data.T * (1.0f - alpha);
+    // TODO: consider using vectors and better loads?
+    float rgb[CHANNELS];
+    for (int ch = 0; ch < CHANNELS; ch++) {
+      rgb[ch] = features[id * CHANNELS + ch];
+      blend_data.C[ch] += rgb[ch] * weight;
+      // +++++++++Variance Loss ++++++++++
+      blend_data.variance += weight * (blend_data.gt_color[ch] - rgb[ch]) *
+                             (blend_data.gt_color[ch] - rgb[ch]);
+      // +++++++++Variance Loss ++++++++++
+    }
 
-                if (test_T < 0.0001f) {
-                  return false;
-                }
-                // Keep track of max transmittance for this Gaussian
-                if (cov2Ds) {
-                  atomicMax((int *)&cov2Ds[id * 7 + 6],
-                            __float_as_int(blend_data.T));
-                }
+    // confidence
+    blend_data.confidence += confidences[id] * weight;
 
-                blend_data.blend_contributor++;
-                const float weight = alpha * blend_data.T;
+    // NDC mapping is taken from 2DGS paper, please check here
+    // https://arxiv.org/pdf/2403.17888.pdf
 
-                // only do this when enabled to reduce memory pressure
-                if constexpr (CONSIDER_MAX_WEIGHT) {
-                  aMaxFloat(&max_weights[id], weight);
-                }
+    // normalize normal
+    float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] +
+                        normal[2] * normal[2] + 1e-7);
+    const float normal_normalized[3] = {
+        -normal[0] / length, -normal[1] / length, -normal[2] / length};
 
-                // TODO: consider using vectors and better loads?
-                float rgb[CHANNELS];
-                for (int ch = 0; ch < CHANNELS; ch++) {
-                  rgb[ch] = features[id * CHANNELS + ch];
-                  blend_data.C[ch] += rgb[ch] * weight;
-                  // +++++++++Variance Loss ++++++++++
-                  blend_data.variance += weight *
-                                         (blend_data.gt_color[ch] - rgb[ch]) *
-                                         (blend_data.gt_color[ch] - rgb[ch]);
-                  // +++++++++Variance Loss ++++++++++
-                }
+    // normal
+    for (int ch = 0; ch < CHANNELS; ch++)
+      blend_data.C[CHANNELS + ch] += normal_normalized[ch] * weight;
 
-                // confidence
-                blend_data.confidence += confidences[id] * weight;
+    float power = -0.5f * (AA * t * t + BB * t + CC);
+    if (power > 0.f)
+      power = 0.f;
+    const float geom_intensity = expf(power);
+    blend_data.occupation += geom_intensity * weight;
 
-                // NDC mapping is taken from 2DGS paper, please check here
-                // https://arxiv.org/pdf/2403.17888.pdf
+    // depth and alpha
 
-                // normalize normal
-                float length =
-                    sqrt(normal[0] * normal[0] + normal[1] * normal[1] +
-                         normal[2] * normal[2] + 1e-7);
-                const float normal_normalized[3] = {-normal[0] / length,
-                                                    -normal[1] / length,
-                                                    -normal[2] / length};
+    if (blend_data.T > 0.5f) {
+      if constexpr (EXACT_DEPTH) {
+        if (test_T < 0.5f) {
+          float Fp = (-0.5 / (blend_data.T * ABC_.w)) + (1.0f / ABC_.w);
+          float con = CC + 2 * logf(Fp);
+          // why does this need to be abs?
+          // TODO: new formulation with variance along the Gaussian
+          float disc = abs(BB * BB - 4 * AA * (con));
+          float median_t = sqrtf(disc + 1e-9);
 
-
-                // normal
-                for (int ch = 0; ch < CHANNELS; ch++)
-                  blend_data.C[CHANNELS + ch] += normal_normalized[ch] * weight;
-
-				  float power = -0.5f * (AA*t * t + BB*t + CC);
-				  if(power > 0.f) power = 0.f;
-                const float geom_intensity = expf(power);
-                blend_data.occupation += geom_intensity * weight;
-
-                // depth and alpha
-
-				if (blend_data.T > 0.5f) {
-					if constexpr (EXACT_DEPTH) {
-						if (test_T < 0.5f) {
-							float Fp =
-								(-0.5 / (blend_data.T * ABC_.w)) + (1.0f / ABC_.w);
-							float con = CC + 2 * logf(Fp);
-							// why does this need to be abs?
-							// TODO: new formulation with variance along the Gaussian
-							float disc = abs(BB * BB - 4 * AA * (con));
-							float median_t = sqrtf(disc + 1e-9);
-
-							// TODO: can we somehow scrap fminf
-							// -BB, 1/2A are always positive (experiments)
-							// median_t is always positive, due to being the sqrt of a
-							// positive nmber - only this one makes sense
-							median_t = (-BB - median_t) / 2.0f / AA;
-							blend_data.depth = median_t;
-						} else {
-							blend_data.depth = t;
-						}
-					} else {
-						blend_data.depth = t;
-					}
-					blend_data.max_contributor++;
-				} else {
-					// TODO: test if t* < t
-					// if so, we have an issue
-					float alpha_point = alpha;
-					if (t > blend_data.depth) {
-						float min_value =
-							(AA * blend_data.depth * blend_data.depth +
-							BB * blend_data.depth + CC);
-						float p = -0.5f * min_value;
-						if (p > 0.0f) {
-						p = 0.0f;
-						}
-
-						alpha_point = min(0.99f, ABC_.w * exp(p));
-					}
-					blend_data.opacity += alpha_point * blend_data.T_opa;
-					blend_data.T_opa *= (1 - alpha_point);
-				}
-
-
-				if constexpr(GSGS_TWO_PASS){
-				}
-				else{
-
-					// distortion loss is taken from 2DGS paper, please check
-					// https://arxiv.org/pdf/2403.17888.pdf
-					const float max_t = t;
-					const float mapped_max_t =
-						(far_plane * max_t - far_plane * NEAR_PLANE) /
-						((far_plane - NEAR_PLANE) * max_t);
-
-					float A = 1 - blend_data.T;
-					float error = mapped_max_t * mapped_max_t * A +
-								blend_data.dist2 -
-								2 * mapped_max_t * blend_data.dist1;
-					blend_data.distortion += error * weight;
-
-					blend_data.dist1 += mapped_max_t * weight;
-					blend_data.dist2 += mapped_max_t * mapped_max_t * weight;
-
-
-				}
-
-                // const float C = (far_plane * NEAR_PLANE * sqrtf(2 * logf(255
-                // * ABC_.w))) / (far_plane - NEAR_PLANE); float NDCspan = C * 4
-                // * AA * sqrtf(AA) / (BB * BB);
-
-                const float FN =
-                    (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-                float C = (CC - 2 * logf(255 * ABC_.w));
-                float extent = sqrtf(abs(BB * BB - 4 * AA * C) + 1e-9);
-                float NDCspan = FN * (2 * AA * extent) / (BB * BB);
-
-                if (include_alpha) {
-                  blend_data.extent_loss += blend_data.T * alpha * NDCspan;
-                } else {
-                  blend_data.extent_loss += blend_data.T * NDCspan;
-                }
-
-#if (DEBUG_HIERARCHICAL & 0x200) != 0
-                if (pixpos.x == debug_target_pixel.x &&
-                    pixpos.y == debug_target_pixel.y) {
-                  glm::mat3 inv;
-                  inv[0][0] = cov3Ds_inv[3 * id].x;
-                  inv[0][1] = cov3Ds_inv[3 * id].y;
-                  inv[0][2] = cov3Ds_inv[3 * id].z;
-                  inv[1][0] = cov3Ds_inv[3 * id].y;
-                  inv[1][1] = cov3Ds_inv[3 * id + 1].x;
-                  inv[1][2] = cov3Ds_inv[3 * id + 1].y;
-                  inv[2][0] = cov3Ds_inv[3 * id].z;
-                  inv[2][1] = cov3Ds_inv[3 * id + 1].y;
-                  inv[2][2] = cov3Ds_inv[3 * id + 1].z;
-
-                  glm::vec3 ray_dir(blend_data.ray_dir.x, blend_data.ray_dir.y,
-                                    blend_data.ray_dir.z);
-
-                  float sigma = glm::dot(ray_dir, inv * ray_dir);
-                  sigma = 1.0f / sigma;
-
-                  printf("t: %f, alpha: %f, sigma: %f\n", t, alpha, sigma);
-                }
-#endif
-                // if the depth is larger than the current depth we're looking
-                // at, evaluate at the current position if
-                // (blend_data.contributor > blend_data.max_contributor) {
-
-                // }
-                //++++++++++++++++GOF
-
-                blend_data.T = test_T;
-
-                return true;
-              };
-          auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
-                                  CudaRasterizer::DebugVisualization debugType,
-                                  int range, float3 o) {
-            uint32_t pix_id = W * pixpos.y + pixpos.x;
-
-
-			//for binary search
-			final_T[pix_id] = blend_data.T;
-			if constexpr(GSGS_TWO_PASS){
-				const float T = blend_data.T;
-				const float t = blend_data.depth;
-
-				final_T[pix_id + H * W] = T;
-				final_T[pix_id + 2 * H * W] = t;
-
-			}else {
-				// A, D, and D^2
-				final_T[pix_id + H * W] = blend_data.dist1;
-				final_T[pix_id + 2 * H * W] = blend_data.dist2;
-				final_T[pix_id + 3 * H * W] = blend_data.T_opa;
-			}
-
-
-
-
-
-
-
-
-
-            // +++++++++Variance Loss ++++++++++
-            // add variance of blended background color
-            for (int ch = 0; ch < CHANNELS; ch++) {
-				blend_data.variance += blend_data.T * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]);
-            }
-            // +++++++++Variance Loss ++++++++++
-
-            // +++++++++Normal Variance Loss ++++++++++
-            float weighted_normal_sum_length =
-                (blend_data.C[CHANNELS] * blend_data.C[CHANNELS] +
-                 blend_data.C[CHANNELS + 1] * blend_data.C[CHANNELS + 1] +
-                 blend_data.C[CHANNELS + 2] * blend_data.C[CHANNELS + 2] +
-                 1e-7);
-            // T is detached here...
-            float normal_variance =
-                (1.f - blend_data.T) -
-                weighted_normal_sum_length * (1.0f + blend_data.T);
-            // +++++++++Normal Variance Loss ++++++++++
-
-            n_contrib[pix_id] = (blend_data.max_contributor & 0xFFFF) |
-                                ((blend_data.blend_contributor & 0xFFFF) << 16);
-
-            blend_data.confidence /= max((1 - blend_data.T), 1e-3f);
-
-            if constexpr (!ENABLE_DEBUG_VIZ) {
-              for (int ch = 0; ch < CHANNELS; ch++)
-                out_color[ch * H * W + pix_id] =
-                    blend_data.C[ch] + blend_data.T * bg_color[ch];
-              // normal
-              for (int ch = 0; ch < CHANNELS; ch++) {
-                out_color[(CHANNELS + ch) * H * W + pix_id] =
-                    blend_data.C[CHANNELS + ch];
-              }
-              // depth and alpha
-
-			  if constexpr (!GSGS_TWO_PASS){
-				out_color[DEPTH_OFFSET * H * W + pix_id] = blend_data.depth;
-				out_color[ALPHA_OFFSET * H * W + pix_id] = blend_data.opacity;
-				out_color[DISTORTION_OFFSET * H * W + pix_id] = blend_data.distortion;
-			  }else {
-				out_color[DISTORTION_OFFSET * H * W + pix_id] = 0.f;
-			  }
-              out_color[OPACITY_LOSS_OFFSET * H * W + pix_id] = blend_data.extent_loss;
-              out_color[CONFIDENCE_OFFSET * H * W + pix_id] = blend_data.confidence;
-              out_color[VARIANCE_OFFSET * H * W + pix_id] = blend_data.variance;
-              out_color[NORMAL_VARIANCE_OFFSET * H * W + pix_id] = normal_variance;
-              out_color[OCCUPATION_OFFSET * H * W + pix_id] =
-                  blend_data.occupation / max((1 - blend_data.T), 1e-3f);// / fmaxf((float)blend_data.blend_contributor, 1.f);
-				  /*
-				out_color[OCCUPATION2_OFFSET * H * W + pix_id] =
-					blend_data.occupation2 / max((1 - blend_data.T), 1e-3f);// / fmaxf((float)blend_data.blend_contributor, 1.f);
-				  */
-            } else {
-              outputDebugVis(debugType, out_color, pix_id,
-                             blend_data.blend_contributor, blend_data.T,
-                             blend_data.depth, blend_data.opacity,
-                             blend_data.distortion, blend_data.extent_loss,
-                             blend_data.confidence, range,
-                             blend_data.max_contributor, H, W);
-            }
-#if (DEBUG_HIERARCHICAL & 0x200) != 0
-            if (pixpos.x == debug_target_pixel.x &&
-                pixpos.y == debug_target_pixel.y) {
-              printf("+++++++++++++++++++++++++++++++++++++++++++\n");
-            }
-#endif
-#ifdef DEBUG_OPACITY_FIELD
-            if (pixpos.x < 10 && pixpos.y < 10) {
-              float d = blend_data.C[CHANNELS * 2];
-              float3 depth = {o.x + d * blend_data.ray_dir.x,
-                              o.y + d * blend_data.ray_dir.y,
-                              o.z + d * blend_data.ray_dir.z};
-              printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n",
-                     pixpos.y, pixpos.x, blend_data.C[CHANNELS * 2], depth.x,
-                     depth.y, depth.z);
-            }
-#endif
-			return false;
-          };
-
-
-          sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW,
-                                                CULL_ALPHA>(
-              ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
-              points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
-              conic_opacity, debugType, prep_function, store_function,
-              blend_function, 
-			  fin_function);
-
+          // TODO: can we somehow scrap fminf
+          // -BB, 1/2A are always positive (experiments)
+          // median_t is always positive, due to being the sqrt of a
+          // positive nmber - only this one makes sense
+          median_t = (-BB - median_t) / 2.0f / AA;
+          blend_data.depth = median_t;
+        } else {
+          blend_data.depth = t;
+        }
+      } else {
+        blend_data.depth = t;
+      }
+      blend_data.max_contributor++;
+    } else {
+      // TODO: test if t* < t
+      // if so, we have an issue
+      float alpha_point = alpha;
+      if (t > blend_data.depth) {
+        float min_value = (AA * blend_data.depth * blend_data.depth +
+                           BB * blend_data.depth + CC);
+        float p = -0.5f * min_value;
+        if (p > 0.0f) {
+          p = 0.0f;
         }
 
+        alpha_point = min(0.99f, ABC_.w * exp(p));
+      }
+      blend_data.opacity += alpha_point * blend_data.T_opa;
+      blend_data.T_opa *= (1 - alpha_point);
+    }
+
+    if constexpr (GSGS_TWO_PASS) {
+    } else {
+
+      // distortion loss is taken from 2DGS paper, please check
+      // https://arxiv.org/pdf/2403.17888.pdf
+      const float max_t = t;
+      const float mapped_max_t = (far_plane * max_t - far_plane * NEAR_PLANE) /
+                                 ((far_plane - NEAR_PLANE) * max_t);
+
+      float A = 1 - blend_data.T;
+      float error = mapped_max_t * mapped_max_t * A + blend_data.dist2 -
+                    2 * mapped_max_t * blend_data.dist1;
+      blend_data.distortion += error * weight;
+
+      blend_data.dist1 += mapped_max_t * weight;
+      blend_data.dist2 += mapped_max_t * mapped_max_t * weight;
+    }
+
+    // const float C = (far_plane * NEAR_PLANE * sqrtf(2 * logf(255
+    // * ABC_.w))) / (far_plane - NEAR_PLANE); float NDCspan = C * 4
+    // * AA * sqrtf(AA) / (BB * BB);
+
+    const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
+    float C = (CC - 2 * logf(255 * ABC_.w));
+    float extent = sqrtf(abs(BB * BB - 4 * AA * C) + 1e-9);
+    float NDCspan = FN * (2 * AA * extent) / (BB * BB);
+
+    if (include_alpha) {
+      blend_data.extent_loss += blend_data.T * alpha * NDCspan;
+    } else {
+      blend_data.extent_loss += blend_data.T * NDCspan;
+    }
+
+#if (DEBUG_HIERARCHICAL & 0x200) != 0
+    if (pixpos.x == debug_target_pixel.x && pixpos.y == debug_target_pixel.y) {
+      glm::mat3 inv;
+      inv[0][0] = cov3Ds_inv[3 * id].x;
+      inv[0][1] = cov3Ds_inv[3 * id].y;
+      inv[0][2] = cov3Ds_inv[3 * id].z;
+      inv[1][0] = cov3Ds_inv[3 * id].y;
+      inv[1][1] = cov3Ds_inv[3 * id + 1].x;
+      inv[1][2] = cov3Ds_inv[3 * id + 1].y;
+      inv[2][0] = cov3Ds_inv[3 * id].z;
+      inv[2][1] = cov3Ds_inv[3 * id + 1].y;
+      inv[2][2] = cov3Ds_inv[3 * id + 1].z;
+
+      glm::vec3 ray_dir(blend_data.ray_dir.x, blend_data.ray_dir.y,
+                        blend_data.ray_dir.z);
+
+      float sigma = glm::dot(ray_dir, inv * ray_dir);
+      sigma = 1.0f / sigma;
+
+      printf("t: %f, alpha: %f, sigma: %f\n", t, alpha, sigma);
+    }
+#endif
+    // if the depth is larger than the current depth we're looking
+    // at, evaluate at the current position if
+    // (blend_data.contributor > blend_data.max_contributor) {
+
+    // }
+    //++++++++++++++++GOF
+
+    blend_data.T = test_T;
+
+    return true;
+  };
+  auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
+                          CudaRasterizer::DebugVisualization debugType,
+                          int range, float3 o) {
+    uint32_t pix_id = W * pixpos.y + pixpos.x;
+
+    // for binary search
+    final_T[pix_id] = blend_data.T;
+    if constexpr (GSGS_TWO_PASS) {
+      const float T = blend_data.T;
+      const float t = blend_data.depth;
+
+      final_T[pix_id + H * W] = T;
+      final_T[pix_id + 2 * H * W] = t;
+
+    } else {
+      // A, D, and D^2
+      final_T[pix_id + H * W] = blend_data.dist1;
+      final_T[pix_id + 2 * H * W] = blend_data.dist2;
+      final_T[pix_id + 3 * H * W] = blend_data.T_opa;
+    }
+
+    // +++++++++Variance Loss ++++++++++
+    // add variance of blended background color
+    for (int ch = 0; ch < CHANNELS; ch++) {
+      blend_data.variance += blend_data.T *
+                             (blend_data.gt_color[ch] - bg_color[ch]) *
+                             (blend_data.gt_color[ch] - bg_color[ch]);
+    }
+    // +++++++++Variance Loss ++++++++++
+
+    // +++++++++Normal Variance Loss ++++++++++
+    float weighted_normal_sum_length =
+        (blend_data.C[CHANNELS] * blend_data.C[CHANNELS] +
+         blend_data.C[CHANNELS + 1] * blend_data.C[CHANNELS + 1] +
+         blend_data.C[CHANNELS + 2] * blend_data.C[CHANNELS + 2] + 1e-7);
+    // T is detached here...
+    float normal_variance = (1.f - blend_data.T) -
+                            weighted_normal_sum_length * (1.0f + blend_data.T);
+    // +++++++++Normal Variance Loss ++++++++++
+
+    n_contrib[pix_id] = (blend_data.max_contributor & 0xFFFF) |
+                        ((blend_data.blend_contributor & 0xFFFF) << 16);
+
+    blend_data.confidence /= max((1 - blend_data.T), 1e-3f);
+
+    if constexpr (!ENABLE_DEBUG_VIZ) {
+      for (int ch = 0; ch < CHANNELS; ch++)
+        out_color[ch * H * W + pix_id] =
+            blend_data.C[ch] + blend_data.T * bg_color[ch];
+      // normal
+      for (int ch = 0; ch < CHANNELS; ch++) {
+        out_color[(CHANNELS + ch) * H * W + pix_id] =
+            blend_data.C[CHANNELS + ch];
+      }
+      // depth and alpha
+
+      if constexpr (!GSGS_TWO_PASS) {
+        out_color[DEPTH_OFFSET * H * W + pix_id] = blend_data.depth;
+        out_color[ALPHA_OFFSET * H * W + pix_id] = blend_data.opacity;
+        out_color[DISTORTION_OFFSET * H * W + pix_id] = blend_data.distortion;
+      } else {
+        out_color[DISTORTION_OFFSET * H * W + pix_id] = 0.f;
+      }
+      out_color[OPACITY_LOSS_OFFSET * H * W + pix_id] = blend_data.extent_loss;
+      out_color[CONFIDENCE_OFFSET * H * W + pix_id] = blend_data.confidence;
+      out_color[VARIANCE_OFFSET * H * W + pix_id] = blend_data.variance;
+      out_color[NORMAL_VARIANCE_OFFSET * H * W + pix_id] = normal_variance;
+      out_color[OCCUPATION_OFFSET * H * W + pix_id] =
+          blend_data.occupation /
+          max((1 - blend_data.T),
+              1e-3f); // / fmaxf((float)blend_data.blend_contributor, 1.f);
+                      /*
+                    out_color[OCCUPATION2_OFFSET * H * W + pix_id] =
+                            blend_data.occupation2 / max((1 - blend_data.T), 1e-3f);// /
+                    fmaxf((float)blend_data.blend_contributor, 1.f);
+                      */
+    } else {
+      outputDebugVis(debugType, out_color, pix_id, blend_data.blend_contributor,
+                     blend_data.T, blend_data.depth, blend_data.opacity,
+                     blend_data.distortion, blend_data.extent_loss,
+                     blend_data.confidence, range, blend_data.max_contributor,
+                     H, W);
+    }
+#if (DEBUG_HIERARCHICAL & 0x200) != 0
+    if (pixpos.x == debug_target_pixel.x && pixpos.y == debug_target_pixel.y) {
+      printf("+++++++++++++++++++++++++++++++++++++++++++\n");
+    }
+#endif
+#ifdef DEBUG_OPACITY_FIELD
+    if (pixpos.x < 10 && pixpos.y < 10) {
+      float d = blend_data.C[CHANNELS * 2];
+      float3 depth = {o.x + d * blend_data.ray_dir.x,
+                      o.y + d * blend_data.ray_dir.y,
+                      o.z + d * blend_data.ray_dir.z};
+      printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n", pixpos.y,
+             pixpos.x, blend_data.C[CHANNELS * 2], depth.x, depth.y, depth.z);
+    }
+#endif
+    return false;
+  };
+
+  sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+      ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+      points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity,
+      debugType, prep_function, store_function, blend_function, fin_function);
+}
 
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
-__global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_binarySearchForward(
+__global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_binarySearchForward2(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -2115,7 +2160,7 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
 
 
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
-__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward2(
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
@@ -2197,11 +2242,9 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 
             return bd;
           };
-          auto store_function = [](const uint2 &, int coll_id, float G,
-                                   float alpha, float depth) { return alpha; };
           auto blend_function =
               [&](auto FIRST_ITER_AS_TYPE ,const uint2 &pixpos, BlendData &blend_data, int id,
-                  float G_peak, float t_peak, const float *view2gaussian_j,
+                  float _,float G_peak, float t_peak, const float *view2gaussian_j,
                   float2 ray, CudaRasterizer::DebugVisualization debugType,
                   float3 normal_, float4 ABC_) {
 
@@ -2325,7 +2368,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
                                                 CULL_ALPHA>(
               ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
               points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
-              conic_opacity, debugType, prep_function, store_function,
+              conic_opacity, debugType, prep_function, 
               blend_function, 
 			  fin_function);
 }
@@ -2548,205 +2591,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 		fin_function);
 }
 
-template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true, bool RENDER_GEOMETRY=true>
-__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchBackward(
-	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
-	int W, int H,
-	float focal_x, float focal_y, 
-	const float far_plane,
-	const bool detach_alpha_extent,
-	const bool include_alpha,
-	const float* view2gaussian,
-	const float* __restrict__ bg_color,
-	const float2* __restrict__ points_xy_image,
-	const float4* __restrict__ cov3Ds_inv,
-	const float* __restrict__ projmatrix_inv,
-	const float3* __restrict__ cam_pos,
-	const float4* __restrict__ conic_opacity,
-	const float* __restrict__ colors,
-	const float* __restrict__ final_Ts,
-	const uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ pixel_colors,
-	const float* __restrict__ gt_colors,
-	const float* __restrict__ dL_dpixels,
-	float3* __restrict__ dL_dmean2D,
-	float4* __restrict__ dL_dconic2D,
-	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dconfidences,
-	float* dL_dview2gaussian)
-{
-	const float ddelx_dx = 0.5 * W;
-	const float ddely_dy = 0.5 * H;
-	// int num_blends = 0;
-	struct BlendData
-	{
-		//for iter=0: compute eq 16 of paper https://arxiv.org/html/2601.17835v1#S4.SS1
-		//for iter=1: compute eq 17 of paper https://arxiv.org/html/2601.17835v1#S4.SS1 and do standard backward
-		float dT_dtmedian;
-		int iter = 0;
-		float T_final;
-		float dL_dmt_dT_dtm;
-		float dL_dmax_depth;
-		float max_depth = 0.f;
-		
-		uint32_t depth_global_id;
-		uint32_t blend_contributor;
-		uint32_t max_contributor;
-		uint32_t contributor = 0;
-		uint32_t current_contributor = 0;
-		uint32_t first_pass_max_contributor = 0;
-		float2 ray;
-	};
-	auto prep_function = [&](bool inside, const uint2& pixpos, const float3 raydir)
-		{
-			uint32_t pix_id = W * pixpos.y + pixpos.x;
-			BlendData bd;
-			bd.dT_dtmedian = 0.0f;
-			bd.T_final = inside ? final_Ts[pix_id] : 0;
-			bd.ray = {raydir.x, raydir.y};
-			bd.depth_global_id = (uint32_t)-1;
-
-			bd.blend_contributor = inside ? (n_contrib[pix_id] >> 16) & 0xFFFF : 0;
-			bd.max_contributor = inside ? n_contrib[pix_id] & 0xFFFF : 0;
-			bd.max_depth = inside ? pixel_colors[DEPTH_OFFSET * H * W + pix_id] : 0;
-			bd.dL_dmt_dT_dtm = 0.f;
-			bd.dL_dmax_depth = inside ? dL_dpixels[DEPTH_OFFSET * H * W + pix_id] : 0;
-			bd.first_pass_max_contributor = 0;
-			return bd;
-		};
-
-	auto blend_function = [&](auto FIRST_ITER_AS_TYPE,const uint2& pixpos, BlendData& blend_data, int global_id, float G, float alpha_point, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
-		{
-            constexpr bool FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
-			const float4 con_o = conic_opacity[global_id];
-			const float alpha = min(0.99f, con_o.w * G);
-			[[maybe_unused]] const float AA = ABC_.x;
-			[[maybe_unused]] const float BB = ABC_.y;
-			[[maybe_unused]] const float CC = ABC_.z;
-			switch(blend_data.iter){
-				case 0:
-				//fallthrough
-				if constexpr(RENDER_GEOMETRY && GSGS_TWO_PASS) {
-					//eq 16 from paper https://arxiv.org/html/2601.17835v1#S4.SS1
-					//now t_peak is t
-					TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
-					float dT_dtmed;
-					const float T_tmed = transmittance_helper.dT_dt(blend_data.max_depth, dT_dtmed);
-					blend_data.dT_dtmedian += 0.5f/(T_tmed) * dT_dtmed;
-					return true;
-					break;
-				}
-				case 1:
-				{
-					const float2 xy = points_xy_image[global_id];
-					const float2 d = { xy.x - static_cast<float>(pixpos.x), xy.y - static_cast<float>(pixpos.y) };
-
-					float dL_dA = 0.0f; //dL_dmin_value * (BB / AA) * (BB / AA) / 4.f; //0.0f
-					float dL_dB = 0.0f; //dL_dmin_value * -BB / (2 *AA);//0.0f
-					float dL_dC = 0.0f;
-
-
-			//DEPTH
-			float dL_do = 0;
-			float inv_A = 1.f / AA;
-			float dLdepth_dG = 0.f;
-			blend_data.depth_global_id = (uint32_t)-1;
-			TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
-			float dT_dA; float dT_dalpha; float dT_dtpeak;
-			const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dA, dT_dalpha, dT_dtpeak);
-			float dL_dT_dtmed = (0.5/T_tmed) * blend_data.dL_dmt_dT_dtm;
-			dLdepth_dG = con_o.w * dT_dalpha * dL_dT_dtmed;
-
-			dL_do += dL_dT_dtmed * (dT_dalpha * G);
-			dL_dA += dL_dT_dtmed * (-0.5 * t*t * dT_dalpha * alpha + dT_dtpeak * 0.5f * BB * inv_A * inv_A + dT_dA);
-			dL_dB += dL_dT_dtmed * (-0.5 * t * dT_dalpha* alpha  + dT_dtpeak * inv_A * -0.5f);
-			dL_dC += dL_dT_dtmed * (-0.5 * dT_dalpha* alpha );
-			// Helpful reusable temporary variables
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, (dLdepth_dG)* dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, (dLdepth_dG)* dG_ddely * ddely_dy);
-			const float abs_dL_dmean2D = abs(dLdepth_dG * dG_ddelx * ddelx_dx) + abs(dLdepth_dG * dG_ddely * ddely_dy);
-            atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
-
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), dL_do);
-			float dL_dnormal[3] = {0.f};
-			dL_dnormal[0] += dL_dA * ray.x;
-			dL_dnormal[1] += dL_dA * ray.y;
-			dL_dnormal[2] += dL_dA;
-			
-			// write the gradients to global memory directly
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 0]), dL_dnormal[0] * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 1]), dL_dnormal[0] * ray.y + dL_dnormal[1] * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 2]), dL_dnormal[0] + dL_dnormal[2] * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 3]), dL_dnormal[1] * ray.y);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 4]), dL_dnormal[1] + dL_dnormal[2] * ray.y);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 5]), dL_dnormal[2]);
-			
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 6]), dL_dB * 2 * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 7]), dL_dB * 2 * ray.y);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 8]), dL_dB * 2);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 9]), dL_dC);
-
-#ifdef ENABLE_NAN_CHECKS
-            if(isnan(dL_dnormal[0]) || isnan(dL_dnormal[1]) || isnan(dL_dnormal[2]))
-            {
-                printf("Normals(%f, %f, %f)\n", dL_dnormal[0], dL_dnormal[1], dL_dnormal[2]);
-            }
-            if(isnan(dL_dA) || isnan(dL_dB) || isnan(dL_dC) || isnan(blend_data.dL_dmax_depth))
-            {
-                printf("dABC(%f, %f, %f, %f, %f, %f)\n", dL_dA, dL_dB, dL_dC, dL_dt, blend_data.dL_dmax_depth, blend_data.max_depth);
-            }
-            if(isnan(dL_dmean2D[global_id].x) || isnan(dL_dmean2D[global_id].y) || isnan(dL_dmean2D[global_id].z))
-            {
-               printf("(%f, %f, %f)\n",dL_dmean2D[global_id].x, dL_dmean2D[global_id].y, dL_dmean2D[global_id].z);
-            }
-            for(int i = 0; i < 10; i++)
-            {
-               if(isnan(dL_dview2gaussian[global_id * 10 + i]))
-               {
-                   printf("dL_dview2gaussian %d : %f, %f, %f, %f)\n", i, dL_dview2gaussian[global_id * 10 + i]);
-               }
-            }
-#endif
-			return blend_data.contributor != blend_data.first_pass_max_contributor;
-				}
-				break;
-			}
-
-		};
-	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
-		{
-			if(blend_data.iter++ == 0){
-				//reset
-				blend_data.first_pass_max_contributor = blend_data.contributor;
-				blend_data.dL_dmt_dT_dtm = blend_data.dL_dmax_depth / fmaxf(-blend_data.dT_dtmedian, 1e-7f);
-				return true;
-			}
-#ifdef DEBUG_OPACITY_FIELD
-			float diff = blend_data.opacity_final - blend_data.opacity;
-			if (abs(diff) > 1e-5)
-				printf("%u, %u:\t O %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff, blend_data.opacity_final, blend_data.opacity);
-			float diff2 = blend_data.T_opa_final - blend_data.T_opa;
-			if (abs(diff2) > 1e-5)
-				printf("%u, %u:\t T %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff2, blend_data.T_opa_final, blend_data.T_opa);
-#endif
-			return false;
-		};
-
-	GaussiansRayEvaluation<2>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
-		prep_function, 
-              blend_function, 
-		fin_function);
-}
 
 
 
