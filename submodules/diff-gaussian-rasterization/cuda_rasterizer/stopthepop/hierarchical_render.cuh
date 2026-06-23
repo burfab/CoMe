@@ -406,11 +406,6 @@ __device__ void GaussiansRayEvaluation(
     // --- shared memory ---
     // One row per gaussian in the warp-wide batch.
     // Loaded once before the j-loop; inner loop only reads smem.
-	constexpr size_t CACHE_LEN = WARP_SIZE*6;
-    __shared__ float  smem_V2G[CACHE_LEN][VIEW2GAUSSIAN_OFFSET];
-    __shared__ float4 smem_con_o[CACHE_LEN];
-	__shared__ float2 smem_points_xy[CACHE_LEN];
-    __shared__ int smem_load_id[CACHE_LEN];
     __shared__ uint2  range;
     __shared__ uint  block_active;
 
@@ -450,14 +445,9 @@ __device__ void GaussiansRayEvaluation(
 	auto fn_loop =[&](auto FIRST_ITER_AS_TYPE,int iter){
         blend_data.contributor = 0;
         bool active = active_outer;
-        for (int progress = range.x; progress < range.y; progress += CACHE_LEN)
+        for (int progress = range.x; progress < range.y; progress += WARP_SIZE)
         {
-			if(block.thread_rank() == 0) block_active = 0;
-			block.sync();
-            if(warp.any(active) && warp.thread_rank() == 0) block_active=1;
-			block.sync();
-			if(!block_active) break;
-
+			if(!warp.any(active)) break;
 			//---------------------LOADING TO CACHE---------------------------
 			//use half warps to load cache, need to load 14 values
 			//first 10 load V2G
@@ -466,60 +456,21 @@ __device__ void GaussiansRayEvaluation(
 			//V2G index is: (float*)ptr + half_warp.idx for idx in [0,9]
 			//con_o index is: (float*)ptr + half_warp.idx-10 for idx in [10,13]
 			//need load id: this is per half_warp it is block.thread_rank() / 16
-            {
-				block.sync();
-
-              const auto rounds = (CACHE_LEN + block.num_threads() / 16 - 1) /
-                                 (block.num_threads() / 16);
-              for (int round = 0; round < rounds; round++) {
-                const int cache_idx = round * (block.num_threads() / 16) +
-                                      block.thread_rank() / 16;
-                if (cache_idx >= CACHE_LEN)
-                  continue;
-
-                const bool is_v2g = halfwarp.thread_rank() < 10;
-                const bool is_cono = halfwarp.thread_rank() < 14;
-                const bool is_points_xy = halfwarp.thread_rank() < 16;
-                const int global_idx = progress + cache_idx;
-                int load_id = -1;
-                if (global_idx < range.y)
-                  load_id = point_list[global_idx];
-
-                if (halfwarp.thread_rank() == 0)
-                  smem_load_id[cache_idx] = load_id;
-                if (load_id != -1) {
-                  const float *load_addr = nullptr;
-                  float *store_addr = nullptr;
-                  if (is_v2g) {
-                    load_addr = (float *)view2gaussian +
-                                load_id * VIEW2GAUSSIAN_OFFSET +
-                                halfwarp.thread_rank();
-                    store_addr = &smem_V2G[cache_idx][halfwarp.thread_rank()];
-                  } else if (is_cono) {
-                    constexpr size_t EL_SIZE = sizeof(float4)/sizeof(float);
-                    load_addr = (float *)conic_opacity + load_id * EL_SIZE +
-                                (halfwarp.thread_rank() - 10);
-                    store_addr = ((float *)(smem_con_o + cache_idx)) +
-                                 halfwarp.thread_rank() - 10;
-                  }else if(is_points_xy){
-                    constexpr size_t EL_SIZE = sizeof(float2)/sizeof(float);
-                    load_addr = (float *)points_xy_image + load_id * EL_SIZE +
-                                (halfwarp.thread_rank() - 14);
-                    store_addr = ((float *)(smem_points_xy + cache_idx)) +
-                                 halfwarp.thread_rank() - 14;
-				  }
-                  if (load_addr != nullptr) {
-                    *store_addr = *load_addr;
-                  }
-                }
-              }
-				block.sync();
-            }
-
+			const auto fn_load_con_o =[](const float4* src, float4 &dest){
+				dest.x = src->x;
+				dest.y = src->y;
+				dest.z = src->z;
+				dest.w = src->w;
+			};
+			const auto fn_load_points_xy =[](const float2* src, float2 &dest){
+				dest.x = src->x;
+				dest.y = src->y;
+			};
 			const auto fn_load_v2g =[](const float* src, float (&dest)[VIEW2GAUSSIAN_OFFSET]){
 				for(int i=0;i<VIEW2GAUSSIAN_OFFSET;i++)
 					dest[i] = src[i];
 			};
+
 
 			const auto fn_wrap_shfl_down = [](uint lane_id, auto val) -> auto {
 				uint src_lane = (lane_id + 1) % WARP_SIZE;
@@ -528,30 +479,22 @@ __device__ void GaussiansRayEvaluation(
 
 			//------------------------BLEND-----------------------------
 			{
-              const auto rounds = (CACHE_LEN + WARP_SIZE-1) / WARP_SIZE;
-				for(int round = 0; round < rounds; round++){
-					if(!warp.any(active)) break;
-					auto cache_idx = round * WARP_SIZE + warp.thread_rank();
-
-					//each thread computes the culling of this gaussian for all pixels in warp
-					//so for block size 16,4,4
-					//we have 2,4,4 = 32, that is 2 4x4 tiles
-
-					float V2G[10]; float4 con_o;
+					auto global_idx = progress + warp.thread_rank();
 					int load_id = -1;
-					if(cache_idx < CACHE_LEN) {
-						load_id = smem_load_id[cache_idx];
-						fn_load_v2g(smem_V2G[cache_idx], V2G);
-						con_o.x = smem_con_o[cache_idx].x;
-						con_o.y = smem_con_o[cache_idx].y;
-						con_o.z = smem_con_o[cache_idx].z;
-						con_o.w = smem_con_o[cache_idx].w;
+					float V2G[10];
+					float4 con_o;
+					float2 point_xy_im;
+					if(global_idx < range.y) {
+						load_id = point_list[global_idx];
+					}
+					if(load_id != -1){
+						fn_load_con_o(conic_opacity+load_id,con_o);
+						fn_load_points_xy(points_xy_image + load_id, point_xy_im);
 					}
 
 					uint32_t cull_halfs = load_id == -1 ? 0x3 : 0;
 					if (load_id != -1){
 						if constexpr (CULL_ALPHA){
-							const float2 in_point_xy = smem_points_xy[cache_idx];
 							const int y = block.thread_index().y;
 							const int z = block.thread_index().z;
 
@@ -565,14 +508,25 @@ __device__ void GaussiansRayEvaluation(
 
 								glm::vec2 max_pos;
 								const float power = max_contrib_power_rect_gaussian_float<3, 3>(
-									con_o, in_point_xy, tail_rect_min, tail_rect_max, max_pos);
+									con_o, point_xy_im, tail_rect_min, tail_rect_max, max_pos);
 
 								const float alpha = min(0.99f, con_o.w * exp(-power));
 								if (alpha < 1.0f / 255.0f) cull_halfs |= ((uint32_t)0x1 << half);
 							}
 						}
 					}
+					if(!warp.any(cull_halfs != 0x3)) continue;
+
+					if(load_id != -1){
+						fn_load_v2g(view2gaussian+load_id*VIEW2GAUSSIAN_OFFSET,V2G);
+					}
+
+					//each thread computes the culling of this gaussian for all pixels in warp
+					//so for block size 16,4,4
+					//we have 2,4,4 = 32, that is 2 4x4 tiles
+
 					for(int j=0; j < WARP_SIZE;j++){
+						warp.sync();
 						if(!warp.any(active)) break;
 						#pragma unroll
 						for (int l = 0; l < VIEW2GAUSSIAN_OFFSET; l++) V2G[l] = fn_wrap_shfl_down(warp.thread_rank(), V2G[l]);
@@ -612,7 +566,6 @@ __device__ void GaussiansRayEvaluation(
 								pixpos, blend_data, load_id, G, alpha, depth,
 										V2G, ray, debugType, normal, ABC)) { active = false; }
 					}
-				}
 			}
         }
 
