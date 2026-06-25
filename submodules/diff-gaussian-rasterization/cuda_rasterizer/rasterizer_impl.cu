@@ -342,19 +342,40 @@ CudaRasterizer::ImageState CudaRasterizer::ImageState::fromChunk(char*& chunk, s
 	return img;
 }
 
-CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
+CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P, bool use_unsorted_as_bitmask, int num_tiles)
 {
 	BinningState binning;
 	obtain(chunk, binning.point_list, P, 128);
 	obtain(chunk, binning.point_list_unsorted, P, 128);
 	obtain(chunk, binning.point_list_keys, P, 128);
-	obtain(chunk, binning.point_list_keys_unsorted, P, 128);
+	//divide by number of bits
+	
+	uint64_t elements_per_instance = use_unsorted_as_bitmask ? ((uint64_t)BLOCK_X * (uint64_t)BLOCK_Y) / 64 : 1;
+	uint64_t raw_total_elements = (uint64_t)P * elements_per_instance;
+
+	uint64_t tracking_elements = 0;
+
+	if (use_unsorted_as_bitmask) {
+		uint64_t tracking_bytes = sizeof(uint32_t) + (uint64_t)num_tiles * sizeof(uint32_t);
+		tracking_elements = (tracking_bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+		uint64_t safe_max_instances = (uint64_t)P + (31 * (uint64_t)num_tiles);
+		uint64_t pool_elements = safe_max_instances * elements_per_instance;
+		raw_total_elements = tracking_elements + pool_elements;
+	}
+	uint64_t aligned_total_elements = (raw_total_elements + 15) & ~15;
+	obtain(chunk, binning.point_list_keys_unsorted, aligned_total_elements, 128);
+
 	cub::DeviceRadixSort::SortPairs(
 		nullptr, binning.sorting_size,
 		binning.point_list_keys_unsorted, binning.point_list_keys,
 		binning.point_list_unsorted, binning.point_list, P);
 	obtain(chunk, binning.list_sorting_space, binning.sorting_size, 128);
 	return binning;
+}
+
+CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chunk, size_t P)
+{
+	return BinningState::fromChunk(chunk, P, false, 0);
 }
 
 CudaRasterizer::PointBinningState CudaRasterizer::PointBinningState::fromChunk(char*& chunk, size_t PN)
@@ -507,9 +528,9 @@ int CudaRasterizer::Rasterizer::forward(
 	int num_rendered;
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
-	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	size_t binning_chunk_size = required<BinningState>(num_rendered, splatting_settings.render_geometry, tile_grid.x * tile_grid.y);
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
-	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
+	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered, splatting_settings.render_geometry,tile_grid.x * tile_grid.y);
 
 	FORWARD::duplicate(
 		P,
@@ -555,11 +576,29 @@ int CudaRasterizer::Rasterizer::forward(
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
 	const float* view2gaussian = view2gaussian_precomp != nullptr ? view2gaussian_precomp : geomState.view2gaussian;
+
+
+	if(splatting_settings.render_geometry){
+		// Calculate the exact size of the entire embedded layout in bytes
+		const uint64_t tracking_bytes = sizeof(uint32_t) + (uint64_t)(tile_grid.x*tile_grid.y)* sizeof(uint32_t);
+		const uint64_t tracking_elements = (tracking_bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+		
+		const uint64_t safe_max_instances = (uint64_t)num_rendered + (31 * (tile_grid.x*tile_grid.y));
+		const uint64_t pool_elements = safe_max_instances * (((uint64_t)BLOCK_X * (uint64_t)BLOCK_Y) / 64);
+		
+		const size_t mask_bytes = (tracking_elements + pool_elements) * sizeof(uint64_t);
+
+		// This single call clears the counter to 0, blanks the offset table, and clears the bitmask pool!
+		CHECK_CUDA(cudaMemset(binningState.point_list_keys_unsorted, 0, mask_bytes), debug);
+	}
+
+
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
 		splatting_settings,
 		binningState.point_list,
+		splatting_settings.render_geometry ? binningState.point_list_keys_unsorted : nullptr,
 		width, height,
 		focal_x, focal_y,
 		geomState.means2D,

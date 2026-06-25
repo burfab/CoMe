@@ -6,6 +6,7 @@
 #pragma once
 
 #include "../auxiliary.h"
+#include <type_traits>
 #include "stopthepop_common.cuh"
 
 #include <cooperative_groups.h>
@@ -15,7 +16,55 @@ namespace cg = cooperative_groups;
 constexpr float SIGMA_THRESHOLD = 3.00f;
 constexpr float LOG_HALF = -0.6931471805599453f;
 
+	template <bool WITH_BATCH_INFO>
+	struct __device__ id_type_t {
+		private:
+		uint32_t id_;
+		uint32_t batch_idx_and_offset_;
 
+		static constexpr uint32_t OFFSET_BITS = 5;
+		static constexpr uint32_t OFFSET_MASK = (1u << OFFSET_BITS) - 1; // 0x1F
+	public:
+		__device__ id_type_t(){}
+		__device__ id_type_t(uint32_t id) : id_(id){}
+		__device__ id_type_t(uint32_t id, int32_t batch_idx, uint8_t batch_offset) : id_(id){set_batch(batch_idx, batch_offset);}
+
+
+		inline __device__ uint32_t& id() {
+			return id_;
+		}
+		inline __device__ const uint32_t& id() const {
+			return id_;
+		}
+		inline __device__ uint8_t batch_offset() const {
+			return batch_idx_and_offset_ & OFFSET_MASK;
+		}
+		inline __device__ int32_t batch_idx() const {
+			return (batch_idx_and_offset_ >> OFFSET_BITS);
+		}
+		void __device__ set_batch(uint32_t batch_idx, uint32_t batch_offset) {
+			batch_idx_and_offset_ =
+				(batch_idx) << OFFSET_BITS |
+				(batch_offset) & OFFSET_MASK;
+		}
+	};
+
+	template <>
+	struct __device__ id_type_t<false>{
+		private:
+		uint32_t id_;
+	public:
+		__device__ id_type_t(){}
+		__device__ id_type_t(uint32_t id) : id_(id){}
+
+
+		inline __device__ uint32_t& id() {
+			return id_;
+		}
+		inline __device__ const uint32_t& id() const {
+			return id_;
+		}
+	};
 struct TransmittanceVacancyGSGS {
     static constexpr float MAX_G = 0.99f;
 
@@ -210,6 +259,16 @@ __device__ void initArray(T(&arr)[S], T v = 0)
 	}
 }
 
+template<bool WITH_BATCH_INFO,size_t S>
+__device__ void initArray(id_type_t<WITH_BATCH_INFO> (&arr)[S], uint32_t v = 0)
+{
+#pragma unroll
+	for (int i = 0; i < S; ++i)
+	{
+		arr[i].id() = v;
+	}
+}
+
 template<int32_t NUM, typename CG, typename KT, typename VT>
 __device__ void mergeSortRegToSmem(CG& cg, KT* keys, VT* values, KT* fin_keys, VT* fin_values, KT key, VT value)
 {
@@ -381,10 +440,69 @@ __device__ void batcherSort(CG& cg, KT* keys, VT* vals)
 }
 
 
+__device__
+inline uint32_t fn_bitmask_claim_memory(uint32_t* per_pixel_bit_mask, uint2 range,int block_idx_x, int block_idx_y,int H, int horizontal_blocks){
+	const int vertical_blocks = (H + BLOCK_Y - 1) / BLOCK_Y;
+	const int num_tiles = horizontal_blocks * vertical_blocks;
+
+	uint32_t* global_batch_counter = (uint32_t*)per_pixel_bit_mask;
+	uint32_t* tile_instanced_offsets = global_batch_counter + 1;
+	const int tile_id = block_idx_y * horizontal_blocks + block_idx_x;
+
+	// Calculate the ACTUAL number of batches this tile's total Gaussians require
+	const uint32_t num_points = range.y - range.x;
+	const uint32_t actual_tile_batches = (num_points + 31) >> 5; // Divide by 32 rounded up
+
+	// Atomically request the total batch count for this specific tile
+	const auto shared_tile_batch_start = atomicAdd(global_batch_counter, actual_tile_batches);
+	tile_instanced_offsets[tile_id] = shared_tile_batch_start;
+	return shared_tile_batch_start;
+}
+
+
+template <typename T>
+__device__
+inline T* fn_bitmask_lookup_base_full(T* per_pixel_bit_mask, int block_idx_x, int block_idx_y, int H, int horizontal_blocks){
+	static_assert(std::is_same_v<std::remove_const_t<T>, uint32_t>);
+	const int vertical_blocks = (H + BLOCK_Y - 1) / BLOCK_Y;
+	const int num_tiles = horizontal_blocks * vertical_blocks;
+
+	const uint32_t* tile_instanced_offsets = (const uint32_t*)per_pixel_bit_mask + 1;
+	const int tile_id = block_idx_y * horizontal_blocks + block_idx_x;
+	
+	uint32_t tile_batch_start = tile_instanced_offsets[tile_id];
+
+	uint64_t tracking_bytes = sizeof(uint32_t) + (uint64_t)num_tiles * sizeof(uint32_t);
+	uint64_t tracking_elements_u64 = (tracking_bytes + 7) / 8;
+	
+	uint32_t* bitmask_pool_start = (uint32_t*)per_pixel_bit_mask + (tracking_elements_u64 * 2);
+	uint32_t* tile_mask_base = bitmask_pool_start + (tile_batch_start * (BLOCK_X * BLOCK_Y));
+	return tile_mask_base;
+}
+
+
+
+template <typename T>
+__device__
+inline T* fn_bitmask_lookup_base(T* per_pixel_bit_mask, uint32_t offset, int H, int horizontal_blocks) {
+	static_assert(std::is_same_v<std::remove_const_t<T>, uint32_t>);
+    const int vertical_blocks = (H + BLOCK_Y - 1) / BLOCK_Y;
+    const int num_tiles = horizontal_blocks * vertical_blocks;
+
+    const uint64_t tracking_bytes =
+        sizeof(uint32_t) + (uint64_t)num_tiles * sizeof(uint32_t);
+
+    const uint64_t tracking_elements_u64 = (tracking_bytes + 7) / 8;
+    T* bitmask_pool_start =
+        (T*)((uint32_t*)per_pixel_bit_mask + (tracking_elements_u64 * 2));
+    return bitmask_pool_start + ((size_t)offset * BLOCK_X * BLOCK_Y);
+}
+
+
 template <int ITERATIONS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename BF, typename FF>
 __device__ void GaussiansRayEvaluation(
     const uint2* __restrict__ ranges,
-    const uint32_t* __restrict__ point_list,
+    const uint32_t* __restrict__ point_list, const uint64_t* __restrict__ per_pixel_bit_mask,
     int W, int H,
     float focal_x, float focal_y,
     const float* view2gaussian,
@@ -431,6 +549,8 @@ __device__ void GaussiansRayEvaluation(
         range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
     warp.sync();
 
+	const uint32_t* tile_mask_base = fn_bitmask_lookup_base_full((const uint32_t*)per_pixel_bit_mask, block.group_index().x, block.group_index().y, H, horizontal_blocks);
+
     const float2 pixf = { pixpos.x + 0.5f, pixpos.y + 0.5f };
     const float2 ray  = {
         (pixf.x - W / 2.0f) / focal_x,
@@ -448,6 +568,17 @@ __device__ void GaussiansRayEvaluation(
         for (int progress = range.x; progress < range.y; progress += WARP_SIZE)
         {
 			if(!warp.any(active)) break;
+			
+			// 1. Calculate which 32-gaussian chunk index we are processing relative to this tile
+            const int batch_idx = (progress - range.x) / WARP_SIZE;
+            
+            // 2. Fetch the mask for this pixel's current batch
+            const uint32_t current_pixel_mask = *(tile_mask_base + (batch_idx * 256) + block.thread_rank());
+
+			const auto warp_pixel_mask = (cg::reduce(warp, current_pixel_mask, cg::bit_or<uint32_t>()));
+			if(warp_pixel_mask == 0) continue;
+			const bool is_bit_set_outter = (warp_pixel_mask & (1U << warp.thread_rank())) != 0;
+
 			//---------------------LOADING TO CACHE---------------------------
 			//use half warps to load cache, need to load 14 values
 			//first 10 load V2G
@@ -473,7 +604,7 @@ __device__ void GaussiansRayEvaluation(
 
 
 			const auto fn_wrap_shfl_down = [](uint lane_id, auto val) -> auto {
-				uint src_lane = (lane_id + 1) % WARP_SIZE;
+				uint src_lane = (lane_id + 1) & (WARP_SIZE-1);
 				return __shfl_sync(0xFFFFFFFF,val, src_lane, WARP_SIZE);
 			};
 
@@ -484,87 +615,78 @@ __device__ void GaussiansRayEvaluation(
 					float V2G[10];
 					float4 con_o;
 					float2 point_xy_im;
-					if(global_idx < range.y) {
+
+					// Your elegant optimization: only load if some lane actually needs it
+					if(global_idx < range.y && is_bit_set_outter) {
 						load_id = point_list[global_idx];
 					}
 					if(load_id != -1){
-						fn_load_con_o(conic_opacity+load_id,con_o);
+						fn_load_con_o(conic_opacity+load_id, con_o);
 						fn_load_points_xy(points_xy_image + load_id, point_xy_im);
+						fn_load_v2g(view2gaussian+load_id*VIEW2GAUSSIAN_OFFSET, V2G);
 					}
 
-					uint32_t cull_halfs = load_id == -1 ? 0x3 : 0;
-					if (load_id != -1){
-						if constexpr (CULL_ALPHA){
-							const int y = block.thread_index().y;
-							const int z = block.thread_index().z;
-
-							for (int half = 0; half < 2; ++half)
-							{
-								const int xid = half == 0 ? (y & ~0x1) : (y | 0x1);
-								const glm::vec2 tail_rect_min = {
-									static_cast<float>(block.group_index().x * BLOCK_X + 4 * xid),
-									static_cast<float>(block.group_index().y * BLOCK_Y + 4 * z) };
-								const glm::vec2 tail_rect_max = { tail_rect_min.x + 3.0f, tail_rect_min.y + 3.0f };
-
-								glm::vec2 max_pos;
-								const float power = max_contrib_power_rect_gaussian_float<3, 3>(
-									con_o, point_xy_im, tail_rect_min, tail_rect_max, max_pos);
-
-								const float alpha = min(0.99f, con_o.w * exp(-power));
-								if (alpha < 1.0f / 255.0f) cull_halfs |= ((uint32_t)0x1 << half);
-							}
-						}
-					}
-					if(!warp.any(cull_halfs != 0x3)) continue;
-
-					if(load_id != -1){
-						fn_load_v2g(view2gaussian+load_id*VIEW2GAUSSIAN_OFFSET,V2G);
-					}
-
-					//each thread computes the culling of this gaussian for all pixels in warp
-					//so for block size 16,4,4
-					//we have 2,4,4 = 32, that is 2 4x4 tiles
-
-					for(int j=0; j < WARP_SIZE;j++){
-						warp.sync();
+					// Ultimate Upgrade: Only loop over the exact Gaussians that 
+					// at least one pixel in this warp actually needs.
+					uint32_t mask_to_process = warp_pixel_mask;
+					
+					while (mask_to_process != 0) {
 						if(!warp.any(active)) break;
-						#pragma unroll
-						for (int l = 0; l < VIEW2GAUSSIAN_OFFSET; l++) V2G[l] = fn_wrap_shfl_down(warp.thread_rank(), V2G[l]);
-						con_o.x = fn_wrap_shfl_down(warp.thread_rank(), con_o.x);
-						con_o.y = fn_wrap_shfl_down(warp.thread_rank(), con_o.y);
-						con_o.z = fn_wrap_shfl_down(warp.thread_rank(), con_o.z);
-						con_o.w = fn_wrap_shfl_down(warp.thread_rank(), con_o.w);
-						load_id = fn_wrap_shfl_down(warp.thread_rank(), load_id);
-						cull_halfs = fn_wrap_shfl_down(warp.thread_rank(), cull_halfs);
-						const bool is_culled = cull_halfs & (block.thread_index().y & 0x1 ? 0x2 : 0x1);
-						if(load_id == -1 || !active || is_culled) continue;
-						//float V2G[10]; fn_load_v2g(smem_V2G[coll_cache_idx], V2G);
-						//const auto con_o = smem_con_o[coll_cache_idx];
 
-						float3 Ld = { V2G[0] * ray.x + V2G[1] * ray.y + V2G[2],
-									V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
-									V2G[2] * ray.x + V2G[4] * ray.y + V2G[5] };
-						float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z,
-									2.0f * (V2G[6] * ray.x + V2G[7] * ray.y + V2G[8]),
-									V2G[9],
-									con_o.w };
-						const float  depth  = -ABC.y / (2.0f * ABC.x);
-						const float3 normal = { Ld.x, Ld.y, Ld.z };
+						// Find index of the first set bit (1-indexed, so subtract 1 for 0-31 lane ID)
+						const int j = __ffs(mask_to_process) - 1;
+						// Clear the bit so we move to the next active Gaussian in the next iteration
+						mask_to_process &= ~(1U << j);
 
-						if (depth < NEAR_PLANE) continue;
+						// Does the current thread's pixel need this specific Gaussian?
+						const bool is_bit_set = active && ((current_pixel_mask & (1U << j)) != 0);
 
-						float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
-						if (power > 0.0f) power = 0.0f;
-						const float G     = expf(power);
-						const float alpha = min(0.99f, con_o.w * G);
-
-						if (alpha < 1.0f / 255.0f)
-							continue;
+						// Direct query: Broadcast target data directly from lane 'j'
+						const int target_load_id = __shfl_sync(0xFFFFFFFF, load_id, j, WARP_SIZE);
 						
-						blend_data.contributor++;
-						if (!blend_function(FIRST_ITER_AS_TYPE,
-								pixpos, blend_data, load_id, G, alpha, depth,
-										V2G, ray, debugType, normal, ABC)) { active = false; }
+						// Safety guard: If lane j didn't load a valid Gaussian, skip
+						if (target_load_id == -1) continue;
+
+						// Broadcast remaining attributes from the owner thread (lane j)
+						float4 target_con_o;
+						target_con_o.x = __shfl_sync(0xFFFFFFFF, con_o.x, j, WARP_SIZE);
+						target_con_o.y = __shfl_sync(0xFFFFFFFF, con_o.y, j, WARP_SIZE);
+						target_con_o.z = __shfl_sync(0xFFFFFFFF, con_o.z, j, WARP_SIZE);
+						target_con_o.w = __shfl_sync(0xFFFFFFFF, con_o.w, j, WARP_SIZE);
+
+						float target_V2G[VIEW2GAUSSIAN_OFFSET];
+						#pragma unroll
+						for (int l = 0; l < VIEW2GAUSSIAN_OFFSET; l++) {
+							target_V2G[l] = __shfl_sync(0xFFFFFFFF, V2G[l], j, WARP_SIZE);
+						}
+
+						// Only lanes that actually need this Gaussian execute the math path
+						if (is_bit_set) {
+							float3 Ld = {
+								target_V2G[0] * ray.x + target_V2G[1] * ray.y + target_V2G[2],
+								target_V2G[1] * ray.x + target_V2G[3] * ray.y + target_V2G[4],
+								target_V2G[2] * ray.x + target_V2G[4] * ray.y + target_V2G[5]};
+							float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z, 
+									2.0f * (target_V2G[6] * ray.x + target_V2G[7] * ray.y + target_V2G[8]),
+									target_V2G[9], 
+									target_con_o.w};
+
+							const float depth = -ABC.y / (2.0f * ABC.x);
+							const float3 normal = {Ld.x, Ld.y, Ld.z};
+							float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
+							if (power > 0.0f) power = 0.0f;
+							const float G = expf(power);
+							const float alpha = min(0.99f, target_con_o.w * G);
+							
+							blend_data.contributor++;
+							if (!blend_function(
+									FIRST_ITER_AS_TYPE,
+									pixpos, blend_data,
+									target_load_id, G, alpha,
+									depth, target_V2G, ray,
+									debugType, normal,
+									ABC)) { active = false; }
+						}
 					}
 			}
         }
@@ -580,6 +702,19 @@ __device__ void GaussiansRayEvaluation(
 	for (int iter = 1; iter < ITERATIONS; iter++) fn_loop(std::false_type{},iter);
 }
 
+template <bool ENABLE, int SIZE>
+struct SortRayGaussiansBatchAndMaskStorage_t;
+
+template <int SIZE>
+struct SortRayGaussiansBatchAndMaskStorage_t<true, SIZE> {
+    uint32_t idx[SIZE];
+    uint32_t mask[SIZE];
+};
+
+template <int SIZE>
+struct SortRayGaussiansBatchAndMaskStorage_t<false, SIZE> {};
+
+
 // 0x1 -> tail
 // 0x2 -> mid
 // 0x4 -> front
@@ -592,10 +727,11 @@ __device__ void GaussiansRayEvaluation(
 #define DEBUG_HIERARCHICAL 0x0
 
 // MID_WINDOW needs to be pow2+4, minimum 8
-template <int ITERATIONS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename SF, typename BF, typename FF>
+template <bool WITH_BATCH_RENDER_INFO, int ITERATIONS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, typename PF, typename SF, typename BF, typename FF>
 __device__ void sortGaussiansRayHierarchicaEvaluation(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
+	uint64_t *__restrict__ per_pixel_bit_mask, 
 	int W, int H,
 	float focal_x, float focal_y,
 	const float* view2gaussian,
@@ -610,6 +746,8 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	BF&& blend_function,
 	FF&& fin_function)
 {
+	using id_type = id_type_t<WITH_BATCH_RENDER_INFO>;
+
 	
 
 #if (DEBUG_HIERARCHICAL & 0x100) != 0
@@ -659,6 +797,8 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	constexpr int PerThreadSortWindow = HEAD_WINDOW;
 	constexpr int MidSortWindow = MID_WINDOW;
 
+
+
 	// head sorting setup
 	float head_depths[PerThreadSortWindow];
 	// GOF: stuff
@@ -667,26 +807,42 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 
 	[[maybe_unused]] const uint2 _t1{0, 0};
 	decltype(store_function(_t1, 0, 0.0f, 0.0f, 0.0f)) head_stores[PerThreadSortWindow];
-	int head_ids[PerThreadSortWindow];
+	id_type head_ids[PerThreadSortWindow];
 
 	// mid sorting setup
 	__shared__ float mid_depths[4][4][4][MidSortWindow];
-	__shared__ int mid_ids[4][4][4][MidSortWindow];
+	__shared__ id_type mid_ids[4][4][4][MidSortWindow];
 	[[maybe_unused]] uint32_t mid_front = 0;
 	[[maybe_unused]] auto mid_access = [&](uint32_t offset)
 		{
 			return (mid_front + offset) % MidSortWindow;
 		};
 
+
 	// tail sorting setup
 	__shared__ float tail_depths[4][4][64];
-	__shared__ int tail_ids[4][4][64];
+	__shared__ id_type tail_ids[4][4][64];
 
 	// tail viewdir is 0, mid viewdirs are 1-4
 	__shared__ float3 tail_and_mid_viewdir[4][4][5];
 
 	// global helper
 	__shared__ uint2 range;
+
+	constexpr int N_MY_BATCHES = WITH_BATCH_RENDER_INFO ? 3 : 0;
+	SortRayGaussiansBatchAndMaskStorage_t<WITH_BATCH_RENDER_INFO, N_MY_BATCHES> my_batches;
+	
+	if constexpr (WITH_BATCH_RENDER_INFO){
+		for(int bi = 0; bi < N_MY_BATCHES; bi++){
+			my_batches.idx[bi]=-1;
+			my_batches.mask[bi] = 0;
+		}
+	}
+
+
+
+
+
 
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -755,6 +911,72 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 	//not needed here right? 
 	warp.sync();
 
+	//We now need to allocate this blocks bit mask memory
+	__shared__ uint32_t shared_tile_batch_start;
+	uint32_t *tile_mask_base = nullptr;
+
+	if constexpr (WITH_BATCH_RENDER_INFO)
+	{
+		if (block.thread_rank() == 0)
+			shared_tile_batch_start = fn_bitmask_claim_memory((uint32_t*)per_pixel_bit_mask, range, block.group_index().x, block.group_index().y, H, horizontal_blocks);
+		// Synchronize block so everyone has the shared token before building pointers
+		block.sync();
+		tile_mask_base = fn_bitmask_lookup_base((uint32_t*)per_pixel_bit_mask, shared_tile_batch_start, H, horizontal_blocks);
+	}
+
+	auto fn_fetch_batch = [&, tile_mask_base](int bi) {
+		if constexpr (WITH_BATCH_RENDER_INFO){
+			if (my_batches.idx[bi] == -1) return;
+			
+			const uint32_t* gmem_ptr = tile_mask_base + (my_batches.idx[bi] * 256) + block.thread_rank();
+			my_batches.mask[bi] = *gmem_ptr;
+		}
+	};
+
+	auto fn_retire_batch = [&, tile_mask_base](int bi) {
+		if constexpr (WITH_BATCH_RENDER_INFO){
+			if (my_batches.idx[bi] == -1) return;
+			
+			uint32_t* gmem_ptr = tile_mask_base + (my_batches.idx[bi] * 256) + block.thread_rank();
+			*gmem_ptr = my_batches.mask[bi];
+		}
+	};
+	
+	auto fn_update_pixel_bitmask = [&my_batches, &fn_retire_batch, &fn_fetch_batch](const id_type &blended_id){
+		if constexpr (WITH_BATCH_RENDER_INFO){
+			const int batch_idx = (int)blended_id.batch_idx();
+			const uint32_t offset = blended_id.batch_offset();
+
+			int index_to_my_batch = -1;
+			#pragma unroll
+			for (int bi = 0; bi < N_MY_BATCHES; ++bi) {
+				if (my_batches.idx[bi] == batch_idx) {
+					index_to_my_batch = bi; break;
+				}
+			}
+
+			// insert if missing
+			if (index_to_my_batch == -1) {
+				constexpr int eviction_idx = N_MY_BATCHES - 1;
+				fn_retire_batch(eviction_idx);
+				
+				#pragma unroll
+				for (int bi = N_MY_BATCHES - 1; bi > 0; bi--) {
+					my_batches.idx[bi]  = my_batches.idx[bi - 1];
+					my_batches.mask[bi] = my_batches.mask[bi - 1];
+				}
+
+				index_to_my_batch = 0;
+				my_batches.idx[index_to_my_batch] = batch_idx;
+				fn_fetch_batch(index_to_my_batch);
+			}
+			my_batches.mask[index_to_my_batch] |= (1u << offset);
+		}
+	};
+
+
+
+
 	// do it exactly as GOF (+0.5f)
 	const float2 pixf = { pixpos.x + 0.5f, pixpos.y + 0.5f };
 	const float2 ray = { 
@@ -803,15 +1025,22 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
           auto blend_one = [&]() {
             fill_counters -= FillHeadOne;
 
-            if (!active || head_ids[0] == -1)
+            if (!active || head_ids[0].id() == -1)
               return;
+
             // float* view2gaussian_j = ;
 			if (!blend_function(FIRST_ITER_AS_TYPE,
-					pixpos, blend_data, head_ids[0], head_stores[0],
+					pixpos, blend_data, head_ids[0].id(), head_stores[0],
 					head_depths[0],
-					&view2gaussian[head_ids[0] * VIEW2GAUSSIAN_OFFSET], ray,
-					debugType, head_normals[0], head_ABCs[0])) { active = false; return; }
+					&view2gaussian[head_ids[0].id() * VIEW2GAUSSIAN_OFFSET], ray,
+					debugType, head_normals[0], head_ABCs[0])) { 
+						active = false; return; 
+					}
 
+			//don't && them, compiler doesn't like it
+			if constexpr (decltype(FIRST_ITER_AS_TYPE)::value) {
+				fn_update_pixel_bitmask(head_ids[0]);
+			}
 #if (DEBUG_HIERARCHICAL & 0x8) != 0
 #if (DEBUG_HIERARCHICAL & 0x100)
             if (pixpos.x == target.x && pixpos.y == target.y)
@@ -841,23 +1070,24 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
               float4 mid_conic_opacity;
               float2 mid_point_xy;
 
-              int load_id;
-              if constexpr (MidSortWindow == 8) {
-                load_id =
-                    mid_ids[block.thread_index().y][block.thread_index().z]
-                           [block.thread_index().x / 4][warp.thread_rank() % 4];
-              } else {
-                load_id =
-                    mid_ids[block.thread_index().y][block.thread_index().z]
-                           [block.thread_index().x / 4]
-                           [mid_access(warp.thread_rank() % 4)];
-              }
-              if (!checkvalid || load_id != -1) {
-                mid_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
-                mid_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
-                mid_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
-                mid_conic_opacity = conic_opacity[load_id];
-                mid_point_xy = points_xy_image[load_id];
+              id_type load_id = [&](){
+				if constexpr (MidSortWindow == 8) {
+					return
+						mid_ids[block.thread_index().y][block.thread_index().z]
+							[block.thread_index().x / 4][warp.thread_rank() % 4];
+				} else {
+					return
+						mid_ids[block.thread_index().y][block.thread_index().z]
+							[block.thread_index().x / 4]
+							[mid_access(warp.thread_rank() % 4)];
+				}
+			  }();
+              if (!checkvalid || load_id.id() != -1) {
+                mid_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id.id()]);
+                mid_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id.id() + 1]);
+                mid_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id.id() + 2]);
+                mid_conic_opacity = conic_opacity[load_id.id()];
+                mid_point_xy = points_xy_image[load_id.id()];
               }
 
 #if (DEBUG_HIERARCHICAL & 0x4) != 0
@@ -872,23 +1102,24 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                 }
 
                 // take one from mid
-                int coll_id;
-                if constexpr (MidSortWindow == 8) {
-                  coll_id =
-                      mid_ids[block.thread_index().y][block.thread_index().z]
-                             [block.thread_index().x / 4][inner];
-                } else {
-                  coll_id =
-                      mid_ids[block.thread_index().y][block.thread_index().z]
-                             [block.thread_index().x / 4][mid_access(inner)];
-                }
+                id_type coll_id = [&](){
+					if constexpr (MidSortWindow == 8) {
+						return
+						mid_ids[block.thread_index().y][block.thread_index().z]
+								[block.thread_index().x / 4][inner];
+					} else {
+						return
+						mid_ids[block.thread_index().y][block.thread_index().z]
+								[block.thread_index().x / 4][mid_access(inner)];
+					}
+				}();
 
                 // every thread has the same id so this is safe
-                if (checkvalid && coll_id == -1)
+                if (checkvalid && coll_id.id() == -1)
                   continue;
 
                 const float *V2G =
-                    view2gaussian + (coll_id * VIEW2GAUSSIAN_OFFSET);
+                    view2gaussian + (coll_id.id() * VIEW2GAUSSIAN_OFFSET);
                 float3 Ld = {V2G[0] * ray.x + V2G[1] * ray.y + V2G[2],
                              V2G[1] * ray.x + V2G[3] * ray.y + V2G[4],
                              V2G[2] * ray.x + V2G[4] * ray.y + V2G[5]};
@@ -926,7 +1157,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                 if (alpha < 1.0f / 255.0f)
                   continue;
 
-                auto store = store_function(pixpos, coll_id, G, alpha, depth);
+                auto store = store_function(pixpos, coll_id.id(), G, alpha, depth);
 
                 // push alpha and depth into per thread sorted array
 #pragma unroll
@@ -961,13 +1192,13 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
           auto pushPullThroughMid = [&](bool checkvalid) {
             // prepare depth for shfl
             float3 tail_depth_info[3];
-            int load_id =
+            id_type load_id =
                 tail_ids[block.thread_index().y][block.thread_index().z]
                         [block.thread_index().x];
-            if (!checkvalid || load_id != -1) {
-              tail_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
-              tail_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
-              tail_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
+            if (!checkvalid || load_id.id() != -1) {
+              tail_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id.id()]);
+              tail_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id.id() + 1]);
+              tail_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id.id() + 2]);
             } else {
               tail_depth_info[0] = tail_depth_info[1] =
                   tail_depth_info[2] = {0, 0, 0};
@@ -985,7 +1216,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 
               // take 4 from tail to mid
               int tid = 4 * mid + (warp.thread_rank() % 4);
-              int coll_id =
+              id_type coll_id =
                   tail_ids[block.thread_index().y][block.thread_index().z][tid];
 
               float depth = depthAlongRay(
@@ -997,7 +1228,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                                       [1 + block.thread_index().x / 4]);
 
               // note: we can only get invalid during draining here
-              if (checkvalid && coll_id == -1) {
+              if (checkvalid && coll_id.id() == -1) {
                 depth = FLT_MAX;
               }
 
@@ -1182,15 +1413,15 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
             float4 in_conic_opacity;
             float2 in_point_xy;
 
-            int load_id = -1;
+            int load_id_temp = -1;
             const int tid = progress + warp.thread_rank();
             if (tid < range.y) {
-              load_id = point_list[tid];
+              load_id_temp = point_list[tid];
             }
 
-            if (load_id != -1 && CULL_ALPHA) {
-              in_conic_opacity = conic_opacity[load_id];
-              in_point_xy = points_xy_image[load_id];
+            if (load_id_temp != -1 && CULL_ALPHA) {
+              in_conic_opacity = conic_opacity[load_id_temp];
+              in_point_xy = points_xy_image[load_id_temp];
             }
 
 #if (DEBUG_HIERARCHICAL & 0x1) != 0
@@ -1202,7 +1433,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
             for (int half = 0; half < 2; ++half) {
               int xid = half == 0 ? (block.thread_index().y & (~0x1))
                                   : (block.thread_index().y | 0x1);
-              if (load_id != -1) {
+              if (load_id_temp != -1) {
                 // cull against tail tile
                 if (CULL_ALPHA) {
                   // tile boundaries
@@ -1225,15 +1456,19 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                 }
               }
             }
+			id_type load_id = [&](){
+				if constexpr(WITH_BATCH_RENDER_INFO) return id_type(load_id_temp, (progress-range.x)/WARP_SIZE, warp.thread_rank());
+				else return id_type(load_id_temp);
+			}();
 
             float3 in_depth_info[3];
-            if (load_id != -1 &&
+            if (load_id.id() != -1 &&
                 (!CULL_ALPHA || !(halfs_culled_mask ==
                                   0x3))) // if culling and not both halfs culled
             {
-              in_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id]);
-              in_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id + 1]);
-              in_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id + 2]);
+              in_depth_info[0] = make_float3(cov3Ds_inv[3 * load_id.id()]);
+              in_depth_info[1] = make_float3(cov3Ds_inv[3 * load_id.id() + 1]);
+              in_depth_info[2] = make_float3(cov3Ds_inv[3 * load_id.id() + 2]);
             }
 
             for (int half = 0; half < 2; ++half) {
@@ -1241,7 +1476,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                                   : (block.thread_index().y | 0x1);
               float depth = FLT_MAX;
 
-              if (load_id != -1) {
+              if (load_id.id() != -1) {
                 // if not culled, compute depth
                 if (!CULL_ALPHA || !(halfs_culled_mask & (0x1U << half))) {
                   depth = depthAlongRay(
@@ -1253,7 +1488,7 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
               tail_depths[xid][block.thread_index().z]
                          [32 + warp.thread_rank()] = depth;
               tail_ids[xid][block.thread_index().z][32 + warp.thread_rank()] =
-                  depth == FLT_MAX ? -1 : load_id;
+                  depth == FLT_MAX ? id_type(-1) : load_id;
 #if (DEBUG_HIERARCHICAL & 0x1) != 0
               printf("(%d) %d - %d %d %d - %d : %f\n", half, warp.thread_rank(),
                      xid, block.thread_index().z, 0, load_id, depth);
@@ -1289,12 +1524,12 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                                     : (block.thread_index().y | 0x1);
 
                 float *d = tail_depths[xid][block.thread_index().z];
-                int *id = tail_ids[xid][block.thread_index().z];
+                id_type *id = tail_ids[xid][block.thread_index().z];
 
                 float k = d[32 + warp.thread_rank()];
-                int v = id[32 + warp.thread_rank()];
+                const id_type v = id[32 + warp.thread_rank()];
                 // determine number of valid
-                uint32_t count_valid = __popc(warp.ballot(v != -1));
+                uint32_t count_valid = __popc(warp.ballot(v.id() != -1));
                 if (half == warp.thread_rank() / 16)
                   fill_counters += count_valid * FillTailOne;
                 mergeSortRegToSmem<32>(warp, d, id, d, id, k, v);
@@ -1315,12 +1550,12 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                 int xid = half == 0 ? (block.thread_index().y & (~0x1))
                                     : (block.thread_index().y | 0x1);
                 float *d = tail_depths[xid][block.thread_index().z];
-                int *id = tail_ids[xid][block.thread_index().z];
+                id_type *id = tail_ids[xid][block.thread_index().z];
                 d[warp.thread_rank()] = d[32 + warp.thread_rank()];
-                int v = id[32 + warp.thread_rank()];
+                id_type v = id[32 + warp.thread_rank()];
                 id[warp.thread_rank()] = v;
                 // determine number of valid
-                uint32_t count_valid = __popc(warp.ballot(v != -1));
+                uint32_t count_valid = __popc(warp.ballot(v.id() != -1));
                 if (half == warp.thread_rank() / 16)
                   fill_counters += count_valid * FillTailOne;
 
@@ -1469,6 +1704,9 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
 
 	// thread state variables
 	if constexpr (ITERATIONS>0) fn_loop(std::true_type{},0);
+	if constexpr (WITH_BATCH_RENDER_INFO){
+		for(int bi = 0; bi < N_MY_BATCHES; bi++) fn_retire_batch(bi);
+	}
 	for (int iter = 1; iter < ITERATIONS; iter++) fn_loop(std::false_type{},iter);
 }
 
@@ -1537,7 +1775,9 @@ template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW,
 __global__ void __launch_bounds__(16 * 16, 4)
     sortGaussiansRayHierarchicalCUDA_renderForward(
         const uint2 *__restrict__ ranges,
-        const uint32_t *__restrict__ point_list, int W, int H, float focal_x,
+        const uint32_t *__restrict__ point_list, 
+        uint64_t *__restrict__ per_pixel_bit_mask, 
+		int W, int H, float focal_x,
         float focal_y, const float far_plane, const bool include_alpha,
         const float *view2gaussian, const float2 *__restrict__ points_xy_image,
         const float4 *__restrict__ cov3Ds_inv,
@@ -1571,6 +1811,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
     uint32_t blend_contributor{0};
     float3 ray_dir;
     float gt_color[CHANNELS];
+	uint64_t XXX;
 
     float weighted_normal_sum[CHANNELS];
 
@@ -1595,6 +1836,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
     bd.variance = 0.f;
     bd.occupation = 0.f;
     bd.occupation2 = 0.f;
+	bd.XXX = 0;
 
     bd.f_transmittance.x<0>() = 0.f;
     bd.f_transmittance.f<0, 0>() = 1.f;
@@ -1633,6 +1875,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
     if (test_T < 0.0001f) {
       return false;
     }
+	blend_data.XXX ^= id;
     // Keep track of max transmittance for this Gaussian
     if (cov2Ds) {
       atomicMax((int *)&cov2Ds[id * 7 + 6], __float_as_int(blend_data.T));
@@ -1786,11 +2029,15 @@ __global__ void __launch_bounds__(16 * 16, 4)
 
     blend_data.T = test_T;
 
+	//if(pixpos.x == W/2&& pixpos.y == H/2) printf("FWID: %d\n", id);
+
     return true;
   };
   auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
                           CudaRasterizer::DebugVisualization debugType,
                           int range, float3 o) {
+	if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashFW: %llu iter: %d blend: %d\n", blend_data.XXX, 0, blend_data.blend_contributor);
+
     uint32_t pix_id = W * pixpos.y + pixpos.x;
 
     // for binary search
@@ -1889,8 +2136,8 @@ __global__ void __launch_bounds__(16 * 16, 4)
     return false;
   };
 
-  sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-      ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+  sortGaussiansRayHierarchicaEvaluation<GSGS_TWO_PASS,1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+      ranges, point_list, GSGS_TWO_PASS ? per_pixel_bit_mask : nullptr, W, H, focal_x, focal_y, view2gaussian,
       points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity,
       debugType, prep_function, store_function, blend_function, fin_function);
 }
@@ -1898,7 +2145,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
 __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_binarySearchForward2(
 	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint32_t* __restrict__ point_list, const uint64_t* __restrict__ per_pixel_bit_mask,
 	int W, int H,
 	float focal_x, float focal_y, 
 	const float far_plane,
@@ -2102,9 +2349,9 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
           };
 
 
-          sortGaussiansRayHierarchicaEvaluation<BINARY_SEARCH_ITERATIONS, HEAD_WINDOW, MID_WINDOW,
+          sortGaussiansRayHierarchicaEvaluation<false, BINARY_SEARCH_ITERATIONS, HEAD_WINDOW, MID_WINDOW,
                                                 CULL_ALPHA>(
-              ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+              ranges, point_list, nullptr,W, H, focal_x, focal_y, view2gaussian,
               points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
               conic_opacity, debugType, prep_function, store_function,
               blend_function, 
@@ -2115,7 +2362,7 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool EXACT_DEPTH = false, bool ENABLE_DEBUG_VIZ = false>
 __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchForward(
 	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint32_t* __restrict__ point_list, const uint64_t * __restrict__ per_pixel_bit_mask,
 	int W, int H,
 	float focal_x, float focal_y, 
 	const float far_plane,
@@ -2145,12 +2392,12 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 
           struct BlendData {
 			uint32_t iter{0};
-            float T;
             float depth_min;
             float depth_max;
 			float T_p[SPLIT+1];
             float interval;
             float3 ray_dir;
+			uint64_t XXX;
             uint32_t contributor = 0;
             uint32_t max_contributor{0};
             uint32_t blend_contributor{0};
@@ -2172,7 +2419,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
             BlendData bd;
             uint32_t pix_id = pixpos.y * W + pixpos.x;
             bd.ray_dir = ray_dir;
-            bd.T = 1.0f;
 
             for (int p = 0; p < SPLIT + 1; ++p) {
               bd.T_p[p] = 1.0f;
@@ -2193,6 +2439,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 			bd.depth_max = inside ? fmaxf(depth_init + SAMPLE_RANGE, 0.f) : 0.f;
 			bd.interval = (bd.depth_max - bd.depth_min)*ONE_OVER_SPLIT;
 
+			bd.XXX = 0;
             return bd;
           };
           auto blend_function =
@@ -2200,7 +2447,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
                   float _,float G_peak, float t_peak, const float *view2gaussian_j,
                   float2 ray, CudaRasterizer::DebugVisualization debugType,
                   float3 normal_, float4 ABC_) {
-
 					constexpr auto FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
 					constexpr int START_ID = FIRST_ITER ? 0 : 1;
 					constexpr int END_ID = FIRST_ITER  ? SPLIT+1 : SPLIT;
@@ -2209,13 +2455,12 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
                 [[maybe_unused]] const float CC = ABC_.z;
                 [[maybe_unused]] const float op = ABC_.w;
 
-				const float test_T = blend_data.T * (1.f-G_peak);
+				if(!blend_data.in_range) return false;
+				blend_data.XXX ^= id;
 
 				//try early return:
 				//sigma
 
-				if(!blend_data.in_range || 
-					++blend_data.blend_contributor > blend_data.forward_max_blend_contributor) return false;
 
 				//const float G_sigma = rsqrtf(AA);
 				//if(t_peak < blend_data.depth_min - G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return true;
@@ -2241,14 +2486,17 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 					const float T_i = transmittance_helper.T(t);
 					blend_data.T_p[i] *= T_i;
 				}
+				//if(pixpos.x == W/2&& pixpos.y == H/2 && blend_data.iter == 0) printf("BSID: %d\n", id);
 
-				blend_data.T = test_T;
-                return true;
+				if(++blend_data.blend_contributor >= blend_data.forward_max_blend_contributor) return false;
+				else return true;
               };
           auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
                                   CudaRasterizer::DebugVisualization debugType,
                                   int range, float3 o) {
 
+			if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashBS: %llu iter: %d blend: %d\n", blend_data.XXX, blend_data.iter, blend_data.blend_contributor);
+			blend_data.XXX = 0;
             uint32_t pix_id = W * pixpos.y + pixpos.x;
 			if(blend_data.iter == 0){
                 blend_data.in_range = (blend_data.T_p[0] >= 0.5f) && (blend_data.T_p[SPLIT] <= 0.5f) && blend_data.in_range;
@@ -2300,7 +2548,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 					out_color[DEPTH_OFFSET * H * W + pix_id] = final_depth;
 					out_color[ALPHA_OFFSET * H * W + pix_id] = T_L-T_R;
 				}
-				blend_data.T = 1.f;
 				return false;
 			}else{
 				blend_data.blend_contributor = 0;
@@ -2308,9 +2555,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 				for (int p = 1; p < SPLIT; ++p) {
 					blend_data.T_p[p] = 1.0f;
 				}
-
-				blend_data.T = 1.f;
-
 				return true;
 			}
 
@@ -2319,7 +2563,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 
           GaussiansRayEvaluation<BINARY_SEARCH_ITERATIONS, HEAD_WINDOW, MID_WINDOW,
                                                 CULL_ALPHA>(
-              ranges, point_list, W, H, focal_x, focal_y, view2gaussian,
+              ranges, point_list, per_pixel_bit_mask, W, H, focal_x, focal_y, view2gaussian,
               points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
               conic_opacity, debugType, prep_function, 
               blend_function, 
@@ -2414,8 +2658,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 
 
 
-	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
+	sortGaussiansRayHierarchicaEvaluation<false, 1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
 		prep_function, store_function, 
               blend_function, 
 		fin_function);
@@ -2537,8 +2781,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 		};
 
 
-	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
+	sortGaussiansRayHierarchicaEvaluation<false, 1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian, points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, debugType,
 		prep_function, store_function, 
               blend_function, 
 		fin_function);
@@ -3362,8 +3606,8 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 		};
 
 
-	sortGaussiansRayHierarchicaEvaluation<ITERATIONS, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
+	sortGaussiansRayHierarchicaEvaluation<false, ITERATIONS, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, 
               blend_function, 
 		fin_function);
@@ -3553,8 +3797,8 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			return false;
 		};
 
-	sortGaussiansRayHierarchicaEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
+	sortGaussiansRayHierarchicaEvaluation<false, 1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, 
               blend_function, 
 		fin_function);

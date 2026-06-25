@@ -68,6 +68,7 @@ namespace CudaRasterizer
 		uint32_t* point_list;
 		char* list_sorting_space;
 
+		static BinningState fromChunk(char*& chunk, size_t P, bool use_unsorted_for_rendered_bitmask, int num_tiles);
 		static BinningState fromChunk(char*& chunk, size_t P);
 	};
 

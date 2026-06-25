@@ -893,6 +893,7 @@ void FORWARD::render(
 	const uint2* ranges,
 	const SplattingSettings splatting_settings,
 	const uint32_t* point_list,
+	uint64_t* per_pixel_bitmask_rendered,
 	int W, int H,
 	float focal_x, float focal_y,
 	const float2* means2D,
@@ -976,10 +977,10 @@ void FORWARD::render(
 	{
 
 #define CALL_HIER_BINARY_SEARCH_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG) sortGaussiansRayHierarchicalCUDA_binarySearchForward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, true, DEBUG><<<grid, {16, 4, 4}>>>( \
-ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
+ranges, point_list, per_pixel_bitmask_rendered, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
 
 #define CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT, RENDER_GEOMETRY) sortGaussiansRayHierarchicalCUDA_renderForward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, EXACT_DEPTH, DEBUG, CONSIDER_MAX_WEIGHT,RENDER_GEOMETRY><<<grid, {16, 4, 4}>>>( \
-ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
+ranges, point_list, per_pixel_bitmask_rendered, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.include_alpha, view2gaussian, means2D, cov3D_inv, projmatrix_inv, (float3 *)cam_pos, colors, confidences, conic_opacity, final_T, n_contrib, bg_color,max_weights, cov2Ds, debugVisualization.type, out_color, gt_color)
 #define CALL_HIER_RENDER_GEOMETRY(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT) if (splatting_settings.render_geometry) { CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT,true); } else { CALL_HIER_DEBUG(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, CONSIDER_MAX_WEIGHT, false); }
 #define CALL_HIER_EXACT_DEPTH_CONSIDER_MAX_WEIGHT(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH) if (splatting_settings.consider_max_weight) { CALL_HIER_RENDER_GEOMETRY(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, true); } else { CALL_HIER_RENDER_GEOMETRY(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DEBUG, EXACT_DEPTH, false); }
 

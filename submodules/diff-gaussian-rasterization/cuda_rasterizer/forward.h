@@ -81,6 +81,7 @@ namespace FORWARD
 		const uint2* ranges,
 		const SplattingSettings splatting_settings,
 		const uint32_t* point_list,
+		uint64_t* per_pixel_bit_mask_rendered,
 		int W, int H,
 		float focal_x, float focal_y,
 		const float2* points_xy_image,
