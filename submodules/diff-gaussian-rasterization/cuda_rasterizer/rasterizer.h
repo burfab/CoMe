@@ -378,7 +378,7 @@ namespace CudaRasterizer
                    float *dL_dconic, float *dL_dopacity, float *dL_dcolor,
                    float *dL_dmean3D, float *dL_dcov3D, float *dL_dsh,
                    float *dL_dscale, float *dL_drot, float *dL_dconfidences, 
-                   float *dL_dextra_features, float *dL_dview2gaussian,
+                   float *dL_dextra_features, float *dL_dview2gaussian, float *first_pass_bw,
                    bool debug);
 
           static int

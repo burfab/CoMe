@@ -516,190 +516,138 @@ __device__ void GaussiansRayEvaluation(
     BF &&blend_function,
     FF &&fin_function)
 {
-    // block size must be: 16,4,4
     auto block = cg::this_thread_block();
     auto warp  = cg::tiled_partition<WARP_SIZE>(block);
     auto halfwarp = cg::tiled_partition<WARP_SIZE/2>(block);
 
     // --- shared memory ---
-    // One row per gaussian in the warp-wide batch.
-    // Loaded once before the j-loop; inner loop only reads smem.
     __shared__ uint2  range;
-    __shared__ uint  block_active;
+    __shared__ uint   block_active;
 
-    // --- pixel setup (identical to previous version) ---
-    const uint2 tile_min    = { block.group_index().x * BLOCK_X,
-                                 block.group_index().y * BLOCK_Y };
-    const uint2 tail_corner = { tile_min.x + 4 * block.thread_index().y,
-                                 tile_min.y + 4 * block.thread_index().z };
+    // --- pixel setup ---
+    const uint2 tile_min    = { block.group_index().x * BLOCK_X, block.group_index().y * BLOCK_Y };
+    const uint2 tail_corner = { tile_min.x + 4 * block.thread_index().y, tile_min.y + 4 * block.thread_index().z };
 
-    const glm::mat4 inverse_vp = loadMatrix4x4(projmatrix_inv);
-    const float3 campos = *cam_pos;
-
-	const int midid = halfwarp.thread_rank() / 4;
-	const int midrank = halfwarp.thread_rank() % 4;
-	const int midy = midid / 2;
-	const int midx = midid % 2;
-	const int heady = midrank / 2;
-	const int headx = midrank % 2;
-	const uint2 pixpos = { tail_corner.x + midx * 2 + headx, tail_corner.y + midy * 2 + heady };
+    const int midid = halfwarp.thread_rank() / 4;
+    const int midrank = halfwarp.thread_rank() % 4;
+    const int midy = midid / 2;
+    const int midx = midid % 2;
+    const int heady = midrank / 2;
+    const int headx = midrank % 2;
+    const uint2 pixpos = { tail_corner.x + midx * 2 + headx, tail_corner.y + midy * 2 + heady };
 
     const int32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
     if (warp.thread_rank() == 0)
         range = ranges[block.group_index().y * horizontal_blocks + block.group_index().x];
     warp.sync();
 
-	const uint32_t* tile_mask_base = fn_bitmask_lookup_base_full((const uint32_t*)per_pixel_bit_mask, block.group_index().x, block.group_index().y, H, horizontal_blocks);
+    const uint32_t* tile_mask_base = fn_bitmask_lookup_base_full((const uint32_t*)per_pixel_bit_mask, block.group_index().x, block.group_index().y, H, horizontal_blocks);
 
     const float2 pixf = { pixpos.x + 0.5f, pixpos.y + 0.5f };
-    const float2 ray  = {
-        (pixf.x - W / 2.0f) / focal_x,
-        (pixf.y - H / 2.0f) / focal_y
-    };
-
-	const float3 r{ray.x, ray.y, 1.0f};
+    const float2 ray  = { (pixf.x - W / 2.0f) / focal_x, (pixf.y - H / 2.0f) / focal_y };
+    const float3 r{ray.x, ray.y, 1.0f};
 
     bool active_outer = pixpos.x < W && pixpos.y < H;
     auto blend_data = prep_function(active_outer, pixpos, r);
 
-	auto fn_loop =[&](auto FIRST_ITER_AS_TYPE,int iter){
-        blend_data.contributor = 0;
+    auto fn_loop =[&](auto FIRST_ITER_AS_TYPE, int iter){
         bool active = active_outer;
+        
         for (int progress = range.x; progress < range.y; progress += WARP_SIZE)
         {
-			if(!warp.any(active)) break;
-			
-			// 1. Calculate which 32-gaussian chunk index we are processing relative to this tile
-            const int batch_idx = (progress - range.x) / WARP_SIZE;
+            if(!warp.any(active)) break;
             
-            // 2. Fetch the mask for this pixel's current batch
+            const int batch_idx = (progress - range.x) / WARP_SIZE;
             const uint32_t current_pixel_mask = *(tile_mask_base + (batch_idx * 256) + block.thread_rank());
 
-			const auto warp_pixel_mask = (cg::reduce(warp, current_pixel_mask, cg::bit_or<uint32_t>()));
-			if(warp_pixel_mask == 0) continue;
-			const bool is_bit_set_outter = (warp_pixel_mask & (1U << warp.thread_rank())) != 0;
+            const auto warp_pixel_mask = (cg::reduce(warp, current_pixel_mask, cg::bit_or<uint32_t>()));
+            if(warp_pixel_mask == 0) continue;
+            const bool is_bit_set_outter = (warp_pixel_mask & (1U << warp.thread_rank())) != 0;
 
-			//---------------------LOADING TO CACHE---------------------------
-			//use half warps to load cache, need to load 14 values
-			//first 10 load V2G
-			//next 4 load con_o
-			//rounds needed is CACHE_LEN / #half_warps
-			//V2G index is: (float*)ptr + half_warp.idx for idx in [0,9]
-			//con_o index is: (float*)ptr + half_warp.idx-10 for idx in [10,13]
-			//need load id: this is per half_warp it is block.thread_rank() / 16
-			const auto fn_load_con_o =[](const float4* src, float4 &dest){
-				dest.x = src->x;
-				dest.y = src->y;
-				dest.z = src->z;
-				dest.w = src->w;
-			};
-			const auto fn_load_points_xy =[](const float2* src, float2 &dest){
-				dest.x = src->x;
-				dest.y = src->y;
-			};
-			const auto fn_load_v2g =[](const float* src, float (&dest)[VIEW2GAUSSIAN_OFFSET]){
-				for(int i=0;i<VIEW2GAUSSIAN_OFFSET;i++)
-					dest[i] = src[i];
-			};
+            // --- LOCALIZED BATCH PROCESSING BLOCK ---
+            // Scoping these variables tightly hints to the compiler that their registers 
+            // can be completely reclaimed after this scope block terminates.
+            {
+                auto global_idx = progress + warp.thread_rank();
+                int load_id = -1;
+                float con_o_w = 0.0f;
+                float V2G[VIEW2GAUSSIAN_OFFSET];
 
+                if(global_idx < range.y && is_bit_set_outter) {
+                    load_id = point_list[global_idx];
+                }
+                if(load_id != -1){
+                    con_o_w = conic_opacity[load_id].w;
+                    // Inlining the load loop cuts the lambda overhead
+                    #pragma unroll
+                    for(int i = 0; i < VIEW2GAUSSIAN_OFFSET; i++) {
+                        V2G[i] = view2gaussian[load_id * VIEW2GAUSSIAN_OFFSET + i];
+                    }
+                }
 
-			const auto fn_wrap_shfl_down = [](uint lane_id, auto val) -> auto {
-				uint src_lane = (lane_id + 1) & (WARP_SIZE-1);
-				return __shfl_sync(0xFFFFFFFF,val, src_lane, WARP_SIZE);
-			};
+                uint32_t mask_to_process = warp_pixel_mask;
+                
+                while (mask_to_process != 0) {
+                    if(!warp.any(active)) break;
 
-			//------------------------BLEND-----------------------------
-			{
-					auto global_idx = progress + warp.thread_rank();
-					int load_id = -1;
-					float V2G[10];
-					float4 con_o;
-					float2 point_xy_im;
+                    const int j = __ffs(mask_to_process) - 1;
+                    mask_to_process &= ~(1U << j);
 
-					// Your elegant optimization: only load if some lane actually needs it
-					if(global_idx < range.y && is_bit_set_outter) {
-						load_id = point_list[global_idx];
-					}
-					if(load_id != -1){
-						fn_load_con_o(conic_opacity+load_id, con_o);
-						fn_load_points_xy(points_xy_image + load_id, point_xy_im);
-						fn_load_v2g(view2gaussian+load_id*VIEW2GAUSSIAN_OFFSET, V2G);
-					}
+                    const bool is_bit_set = active && ((current_pixel_mask & (1U << j)) != 0);
 
-					// Ultimate Upgrade: Only loop over the exact Gaussians that 
-					// at least one pixel in this warp actually needs.
-					uint32_t mask_to_process = warp_pixel_mask;
-					
-					while (mask_to_process != 0) {
-						if(!warp.any(active)) break;
+                    const int target_load_id = __shfl_sync(0xFFFFFFFF, load_id, j, WARP_SIZE);
+                    if (target_load_id == -1) continue;
 
-						// Find index of the first set bit (1-indexed, so subtract 1 for 0-31 lane ID)
-						const int j = __ffs(mask_to_process) - 1;
-						// Clear the bit so we move to the next active Gaussian in the next iteration
-						mask_to_process &= ~(1U << j);
+                    const float target_con_o_w = __shfl_sync(0xFFFFFFFF, con_o_w, j, WARP_SIZE);
 
-						// Does the current thread's pixel need this specific Gaussian?
-						const bool is_bit_set = active && ((current_pixel_mask & (1U << j)) != 0);
+                    float target_V2G[VIEW2GAUSSIAN_OFFSET];
+                    #pragma unroll
+                    for (int l = 0; l < VIEW2GAUSSIAN_OFFSET; l++) {
+                        target_V2G[l] = __shfl_sync(0xFFFFFFFF, V2G[l], j, WARP_SIZE);
+                    }
 
-						// Direct query: Broadcast target data directly from lane 'j'
-						const int target_load_id = __shfl_sync(0xFFFFFFFF, load_id, j, WARP_SIZE);
-						
-						// Safety guard: If lane j didn't load a valid Gaussian, skip
-						if (target_load_id == -1) continue;
+                    if (is_bit_set && active) {
+                        float3 Ld = {
+                            target_V2G[0] * ray.x + target_V2G[1] * ray.y + target_V2G[2],
+                            target_V2G[1] * ray.x + target_V2G[3] * ray.y + target_V2G[4],
+                            target_V2G[2] * ray.x + target_V2G[4] * ray.y + target_V2G[5]};
+                        float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z, 
+                                2.0f * (target_V2G[6] * ray.x + target_V2G[7] * ray.y + target_V2G[8]),
+                                target_V2G[9], 
+                                target_con_o_w};
 
-						// Broadcast remaining attributes from the owner thread (lane j)
-						float4 target_con_o;
-						target_con_o.x = __shfl_sync(0xFFFFFFFF, con_o.x, j, WARP_SIZE);
-						target_con_o.y = __shfl_sync(0xFFFFFFFF, con_o.y, j, WARP_SIZE);
-						target_con_o.z = __shfl_sync(0xFFFFFFFF, con_o.z, j, WARP_SIZE);
-						target_con_o.w = __shfl_sync(0xFFFFFFFF, con_o.w, j, WARP_SIZE);
-
-						float target_V2G[VIEW2GAUSSIAN_OFFSET];
-						#pragma unroll
-						for (int l = 0; l < VIEW2GAUSSIAN_OFFSET; l++) {
-							target_V2G[l] = __shfl_sync(0xFFFFFFFF, V2G[l], j, WARP_SIZE);
-						}
-
-						// Only lanes that actually need this Gaussian execute the math path
-						if (is_bit_set) {
-							float3 Ld = {
-								target_V2G[0] * ray.x + target_V2G[1] * ray.y + target_V2G[2],
-								target_V2G[1] * ray.x + target_V2G[3] * ray.y + target_V2G[4],
-								target_V2G[2] * ray.x + target_V2G[4] * ray.y + target_V2G[5]};
-							float4 ABC = { ray.x * Ld.x + ray.y * Ld.y + Ld.z, 
-									2.0f * (target_V2G[6] * ray.x + target_V2G[7] * ray.y + target_V2G[8]),
-									target_V2G[9], 
-									target_con_o.w};
-
-							const float depth = -ABC.y / (2.0f * ABC.x);
-							const float3 normal = {Ld.x, Ld.y, Ld.z};
-							float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
-							if (power > 0.0f) power = 0.0f;
-							const float G = expf(power);
-							const float alpha = min(0.99f, target_con_o.w * G);
-							
-							blend_data.contributor++;
-							if (!blend_function(
-									FIRST_ITER_AS_TYPE,
-									pixpos, blend_data,
-									target_load_id, G, alpha,
-									depth, target_V2G, ray,
-									debugType, normal,
-									ABC)) { active = false; }
-						}
-					}
-			}
+                        const float depth = -ABC.y / (2.0f * ABC.x);
+                        const float3 normal = {Ld.x, Ld.y, Ld.z};
+                        float power = -0.5f * (-(ABC.y / ABC.x) * (ABC.y / 4.0f) + ABC.z);
+                        if (power > 0.0f) power = 0.0f;
+                        const float G = expf(power);
+                        const float alpha = min(0.99f, target_con_o_w * G);
+                        
+                        if (!blend_function(
+                                FIRST_ITER_AS_TYPE,
+                                pixpos, blend_data,
+                                target_load_id, G, alpha,
+                                depth, target_V2G, ray,
+                                debugType, normal,
+                                ABC)) { active = false; }
+                    }
+                }
+            } // Register lifetimes for load_id, con_o_w, and V2G explicitly signal end-of-life here
         }
 
+        // --- TAIL RECOVERY BLOCK ---
+        // Postponing the load of global variables to exactly where they are consumed 
+        // stops the compiler from holding them during the long loop sequence.
         if (pixpos.x < W && pixpos.y < H)
         {
-            const float3 o = { cam_pos->x, cam_pos->y, cam_pos->z };
+            // const glm::mat4 inverse_vp = loadMatrix4x4(projmatrix_inv); // Completely unreferenced! Deleted.
+            const float3 o = *cam_pos; 
             active_outer = active_outer && fin_function(pixpos, blend_data, debugType, range.y - range.x, o);
         }
-	};
+    };
 
-	if constexpr (ITERATIONS>0) fn_loop(std::true_type{},0);
-	for (int iter = 1; iter < ITERATIONS; iter++) fn_loop(std::false_type{},iter);
+    if constexpr (ITERATIONS>0) fn_loop(std::true_type{},0);
+    for (int iter = 1; iter < ITERATIONS; iter++) fn_loop(std::false_type{},iter);
 }
 
 template <bool ENABLE, int SIZE>
@@ -1001,7 +949,6 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
           initArray(head_depths, FLT_MAX);
           initArray(head_stores);
           initArray(head_ids, -1);
-		  blend_data.contributor = 0;
           fill_counters = 0;
           mid_front = 0;
           bool active = active_outer;
@@ -1138,7 +1085,6 @@ __device__ void sortGaussiansRayHierarchicaEvaluation(
                 if (!active || depth < NEAR_PLANE)
                   continue;
 
-                blend_data.contributor++;
 
                 float min_value = -(ABC.y / ABC.x) * (ABC.y / 4.f) + ABC.z;
 
@@ -1796,7 +1742,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
     float T;
     float T_opa;
     float C[CHANNELS * 2];
-    uint32_t contributor = 0;
+    uint32_t contributor;
     float opacity;
     float depth;
     float variance;
@@ -1808,7 +1754,6 @@ __global__ void __launch_bounds__(16 * 16, 4)
     float occupation;
     float occupation2;
     uint32_t max_contributor{0};
-    uint32_t blend_contributor{0};
     float3 ray_dir;
     float gt_color[CHANNELS];
 	uint64_t XXX;
@@ -1821,6 +1766,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
   auto prep_function = [&](bool inside, const uint2 &pixpos,
                            const float3 ray_dir) {
     BlendData bd;
+	bd.contributor = 0;
     bd.ray_dir = ray_dir;
     bd.T = 1.0f;
     bd.T_opa = 1.0f;
@@ -1875,13 +1821,14 @@ __global__ void __launch_bounds__(16 * 16, 4)
     if (test_T < 0.0001f) {
       return false;
     }
+	blend_data.contributor++;
+
 	blend_data.XXX ^= id;
     // Keep track of max transmittance for this Gaussian
     if (cov2Ds) {
       atomicMax((int *)&cov2Ds[id * 7 + 6], __float_as_int(blend_data.T));
     }
 
-    blend_data.blend_contributor++;
     const float weight = alpha * blend_data.T;
 
     // only do this when enabled to reduce memory pressure
@@ -2036,7 +1983,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
   auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
                           CudaRasterizer::DebugVisualization debugType,
                           int range, float3 o) {
-	if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashFW: %llu iter: %d blend: %d\n", blend_data.XXX, 0, blend_data.blend_contributor);
+	//if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashFW: %llu iter: %d blend: %d\n", blend_data.XXX, 0, blend_data.blend_contributor);
 
     uint32_t pix_id = W * pixpos.y + pixpos.x;
 
@@ -2076,7 +2023,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
     // +++++++++Normal Variance Loss ++++++++++
 
     n_contrib[pix_id] = (blend_data.max_contributor & 0xFFFF) |
-                        ((blend_data.blend_contributor & 0xFFFF) << 16);
+                        ((blend_data.contributor & 0xFFFF) << 16);
 
     blend_data.confidence /= max((1 - blend_data.T), 1e-3f);
 
@@ -2112,7 +2059,7 @@ __global__ void __launch_bounds__(16 * 16, 4)
                     fmaxf((float)blend_data.blend_contributor, 1.f);
                       */
     } else {
-      outputDebugVis(debugType, out_color, pix_id, blend_data.blend_contributor,
+      outputDebugVis(debugType, out_color, pix_id, blend_data.contributor,
                      blend_data.T, blend_data.depth, blend_data.opacity,
                      blend_data.distortion, blend_data.extent_loss,
                      blend_data.confidence, range, blend_data.max_contributor,
@@ -2200,6 +2147,7 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
           auto prep_function = [&](bool inside, const uint2 &pixpos,
                                    const float3 ray_dir) {
             BlendData bd;
+			bd.contributor = 0;
             uint32_t pix_id = pixpos.y * W + pixpos.x;
             bd.ray_dir = ray_dir;
             bd.T = 1.0f;
@@ -2246,8 +2194,6 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
 				//try early return:
 				//sigma
 
-				if(!blend_data.in_range || 
-					++blend_data.blend_contributor > blend_data.forward_max_blend_contributor) return false;
 
 				//const float G_sigma = rsqrtf(AA);
 				//if(t_peak < blend_data.depth_min - G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return true;
@@ -2275,6 +2221,8 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
 				}
 
 				blend_data.T = test_T;
+				if(!blend_data.in_range || 
+					++blend_data.contributor >= blend_data.forward_max_blend_contributor) return false;
                 return true;
               };
           auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
@@ -2335,7 +2283,6 @@ __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_b
 				blend_data.T = 1.f;
 				return false;
 			}else{
-				blend_data.blend_contributor = 0;
 				blend_data.contributor = 0;
 				for (int p = 1; p < SPLIT; ++p) {
 					blend_data.T_p[p] = 1.0f;
@@ -2380,7 +2327,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 	const float* __restrict__ bg_color,
 	float* __restrict__ max_weights,
 	float* __restrict__ cov2Ds,
-	CudaRasterizer::DebugVisualization debugType,
 	float* __restrict__ out_color,
 	float* __restrict__ gt_color)
 {
@@ -2400,7 +2346,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 			uint64_t XXX;
             uint32_t contributor = 0;
             uint32_t max_contributor{0};
-            uint32_t blend_contributor{0};
             uint32_t forward_max_blend_contributor{0};
 			bool in_range;
           };
@@ -2417,6 +2362,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
           auto prep_function = [&](bool inside, const uint2 &pixpos,
                                    const float3 ray_dir) {
             BlendData bd;
+			bd.contributor = 0;
             uint32_t pix_id = pixpos.y * W + pixpos.x;
             bd.ray_dir = ray_dir;
 
@@ -2488,14 +2434,14 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 				}
 				//if(pixpos.x == W/2&& pixpos.y == H/2 && blend_data.iter == 0) printf("BSID: %d\n", id);
 
-				if(++blend_data.blend_contributor >= blend_data.forward_max_blend_contributor) return false;
+				if(++blend_data.contributor >= blend_data.forward_max_blend_contributor) return false;
 				else return true;
               };
           auto fin_function = [&](const uint2 &pixpos, BlendData &blend_data,
                                   CudaRasterizer::DebugVisualization debugType,
                                   int range, float3 o) {
 
-			if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashBS: %llu iter: %d blend: %d\n", blend_data.XXX, blend_data.iter, blend_data.blend_contributor);
+			//if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashBS: %llu iter: %d blend: %d\n", blend_data.XXX, blend_data.iter, blend_data.blend_contributor);
 			blend_data.XXX = 0;
             uint32_t pix_id = W * pixpos.y + pixpos.x;
 			if(blend_data.iter == 0){
@@ -2550,7 +2496,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 				}
 				return false;
 			}else{
-				blend_data.blend_contributor = 0;
 				blend_data.contributor = 0;
 				for (int p = 1; p < SPLIT; ++p) {
 					blend_data.T_p[p] = 1.0f;
@@ -2565,7 +2510,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
                                                 CULL_ALPHA>(
               ranges, point_list, per_pixel_bit_mask, W, H, focal_x, focal_y, view2gaussian,
               points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
-              conic_opacity, debugType, prep_function, 
+              conic_opacity, CudaRasterizer::DebugVisualization::Disabled, prep_function, 
               blend_function, 
 			  fin_function);
 }
@@ -2609,6 +2554,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 		{
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
 			BlendData bd;
+			bd.contributor = 0;
 			bd.ray_dir = ray_dir;
 
 			bd.T = 1.f;
@@ -2634,6 +2580,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			{
 				return false;
 			}
+			blend_data.contributor++;
 
 			const float weight = alpha * blend_data.T;
 			// TODO: consider using vectors and better loads?
@@ -2706,6 +2653,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 		{
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
 			BlendData bd;
+			bd.contributor = 0;
 			bd.ray_dir = ray_dir;
 
 			// needed for opacity evaluation
@@ -2732,6 +2680,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 			if (++blend_data.current_contributor > blend_data.max_contributor) {
 				return false;
 			}
+			blend_data.contributor++;
 			float alpha_point = alpha;
 
 			if (t > blend_data.max_depth) {
@@ -2789,12 +2738,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_opac
 }
 
 
-
-
 template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true, bool RENDER_GEOMETRY=true>
-__global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_backward(
+__global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_binarySearchBackward(
 	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list,
+	const uint32_t* __restrict__ point_list, 
+	const uint64_t * __restrict__ per_pixel_bit_mask,
 	int W, int H,
 	float focal_x, float focal_y, 
 	const float far_plane,
@@ -2813,6 +2761,90 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 	const float* __restrict__ pixel_colors,
 	const float* __restrict__ gt_colors,
 	const float* __restrict__ dL_dpixels,
+	float* __restrict__ first_pass_bw)
+{
+	const float ddelx_dx = 0.5 * W;
+	const float ddely_dy = 0.5 * H;
+	// int num_blends = 0;
+	struct BlendData{
+		int contributor;
+		int max_blend_contributor_forward;
+		float depth;
+		float dT_dtmedian;
+		float T;
+	};
+
+	auto prep_function = [&](bool inside, const uint2& pixpos, const float3 raydir)
+		{
+			uint32_t pix_id = W * pixpos.y + pixpos.x;
+			BlendData bd;
+			bd.max_blend_contributor_forward = inside ? (n_contrib[pix_id] >> 16) & 0xFFFF : 0;
+			bd.contributor = 0;
+			bd.depth = inside ? pixel_colors[DEPTH_OFFSET * H * W + pix_id] : 0;
+			bd.dT_dtmedian = 0.0f;
+			bd.T = 1.0f;
+
+			return bd;
+		};
+
+	auto blend_function = [&](auto FIRST_ITER_AS_TYPE,const uint2& pixpos, BlendData& blend_data, int global_id, float G, float alpha,float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
+		{
+            constexpr bool FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
+			[[maybe_unused]] const float AA = ABC_.x;
+			[[maybe_unused]] const float BB = ABC_.y;
+			[[maybe_unused]] const float CC = ABC_.z;
+			//eq 16 from paper https://arxiv.org/html/2601.17835v1#S4.SS1
+			//now t_peak is t
+			TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
+			float dT_dtmed;
+			const float T_tmed = transmittance_helper.dT_dt(blend_data.depth, dT_dtmed);
+			blend_data.dT_dtmedian += 1.f/(T_tmed) * dT_dtmed;
+			blend_data.T *= T_tmed;
+			if(++blend_data.contributor >= blend_data.max_blend_contributor_forward) return false;
+			return true;
+		};
+
+	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
+		{
+			uint32_t pix_id = pixpos.y * W + pixpos.x;
+			blend_data.dT_dtmedian = 1.f / fmaxf(-0.5f*(blend_data.dT_dtmedian), 1e-7f);
+			first_pass_bw[H*W*0+pix_id] = blend_data.dT_dtmedian;
+			return false;
+		};
+
+
+	GaussiansRayEvaluation<1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+		ranges, point_list, per_pixel_bit_mask, W, H, focal_x, focal_y, view2gaussian,
+		points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos,
+		conic_opacity, CudaRasterizer::DebugVisualization::Disabled, prep_function, 
+		blend_function, 
+		fin_function);
+}
+
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true, bool RENDER_GEOMETRY=true>
+__global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_backward(
+	const uint2* __restrict__ ranges,
+	const uint32_t* __restrict__ point_list, 
+	const uint64_t * __restrict__ per_pixel_bit_mask,
+	int W, int H,
+	float focal_x, float focal_y, 
+	const float far_plane,
+	const bool detach_alpha_extent,
+	const bool include_alpha,
+	const float* view2gaussian,
+	const float* __restrict__ bg_color,
+	const float2* __restrict__ points_xy_image,
+	const float4* __restrict__ cov3Ds_inv,
+	const float* __restrict__ projmatrix_inv,
+	const float3* __restrict__ cam_pos,
+	const float4* __restrict__ conic_opacity,
+	const float* __restrict__ colors,
+	const float* __restrict__ final_Ts,
+	const uint32_t* __restrict__ n_contrib,
+	const float* __restrict__ pixel_colors,
+	const float* __restrict__ gt_colors,
+	const float* __restrict__ dL_dpixels,
+	const float* __restrict__ first_pass_bw,
 	float3* __restrict__ dL_dmean2D,
 	float4* __restrict__ dL_dconic2D,
 	float* __restrict__ dL_dopacity,
@@ -2820,10 +2852,11 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 	float* __restrict__ dL_dconfidences,
 	float* dL_dview2gaussian)
 {
-	constexpr int ITERATIONS = GSGS_TWO_PASS && RENDER_GEOMETRY ? 2 : 1; //1
 	const float ddelx_dx = 0.5 * W;
 	const float ddely_dy = 0.5 * H;
 	// int num_blends = 0;
+
+
 	struct BlendData
 	{
 		//for iter=0: compute eq 16 of paper https://arxiv.org/html/2601.17835v1#S4.SS1
@@ -2835,8 +2868,8 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 		//++++++++++++GOF
 		float dL_dnormal2D[3]; // Normal
 		float dL_dmt_dT_dtm;
-		float dL_dmax_depth;
 		float max_depth = 0.f;
+		float dL_dmax_depth;
 		float final_D;
 		float final_D2;
 		float final_A;
@@ -2867,7 +2900,6 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 		float dt_dC;
 		float dt_dw;
 
-		uint32_t blend_contributor;
 		uint32_t max_contributor;
 		uint32_t contributor = 0;
 		uint32_t current_contributor = 0;
@@ -2887,11 +2919,14 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 		float dL_dnormal_variance;
 		float dL_doccupation;
 	};
-	auto prep_function = [&](bool inside, const uint2& pixpos, const float3 raydir)
+
+
+
+		auto prep_function = [&](bool inside, const uint2& pixpos, const float3 raydir)
 		{
 			uint32_t pix_id = W * pixpos.y + pixpos.x;
 			BlendData bd;
-			bd.dT_dtmedian = 0.0f;
+			bd.contributor = 0;
 			bd.T = 1.0f;
 			bd.T_final = inside ? final_Ts[pix_id] : 0;
 			//++++++++++++GOF
@@ -2921,7 +2956,6 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 			bd.opacity = 0.f;
 			bd.dL_dopacity = inside ? dL_dpixels[ALPHA_OFFSET * H * W + pix_id] : 0;
 
-			bd.blend_contributor = inside ? (n_contrib[pix_id] >> 16) & 0xFFFF : 0;
 			bd.max_contributor = inside ? n_contrib[pix_id] & 0xFFFF : 0;
 			bd.max_depth = inside ? pixel_colors[DEPTH_OFFSET * H * W + pix_id] : 0;
 			bd.dL_dmt_dT_dtm = 0.f;
@@ -2986,6 +3020,11 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 					bd.final_normal[i] = pixel_colors[(CHANNELS+i) * H * W + pix_id];
 				}
 				bd.dL_dmax_depth = dL_dpixels[DEPTH_OFFSET * H * W + pix_id];
+				if constexpr (GSGS_TWO_PASS && RENDER_GEOMETRY){
+					bd.dL_dmt_dT_dtm = bd.dL_dmax_depth * first_pass_bw[H*W*0+pix_id];
+				}else {
+					bd.dL_dmt_dT_dtm = 0.f;
+				}
 			}
 			bd.last_alpha = 0;
 			//++++++++++++GOF
@@ -3006,6 +3045,7 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 		{
 			return G;
 		};
+
 	auto blend_function = [&](auto FIRST_ITER_AS_TYPE,const uint2& pixpos, BlendData& blend_data, int global_id, float G, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
 		{
             constexpr bool FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
@@ -3015,24 +3055,11 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 			[[maybe_unused]] const float BB = ABC_.y;
 			[[maybe_unused]] const float CC = ABC_.z;
 			float test_T = blend_data.T * (1.0f - alpha);
-			if constexpr(RENDER_GEOMETRY && GSGS_TWO_PASS && ITERATIONS == 2 && FIRST_ITER){
-				if (test_T < 0.0001f)
-				{
-					return false;
-				}			
-				//eq 16 from paper https://arxiv.org/html/2601.17835v1#S4.SS1
-				//now t_peak is t
-				TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
-				float dT_dtmed;
-				const float T_tmed = transmittance_helper.dT_dt(blend_data.max_depth, dT_dtmed);
-				blend_data.dT_dtmedian += 0.5f/(T_tmed) * dT_dtmed;
-				blend_data.T = test_T;
-				return true;
-			} else {
 			if (test_T < 0.0001f)
 			{
 				return false;
 			}			
+			blend_data.contributor++;
 			//++++++++++++GOF
 			const float normal[3] = {normal_.x, normal_.y, normal_.z};
 			//++++++++++++GOF		
@@ -3214,7 +3241,7 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 				blend_data.dt_dw = 0.f;
 #endif
 				}
-			}else if(ITERATIONS == 2 && RENDER_GEOMETRY && GSGS_TWO_PASS){
+			}else if(RENDER_GEOMETRY && GSGS_TWO_PASS){
 				const float dt_dA = 0.5f * BB * inv_A * inv_A;
 				const float dt_dB = -0.5f * inv_A;
 				float dLd_dT_dtm = 0.f;
@@ -3533,18 +3560,10 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 #endif
 
 			return true;
-				}
 
 		};
 	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
 		{
-			if(ITERATIONS == 2 && GSGS_TWO_PASS && RENDER_GEOMETRY && blend_data.iter++ == 0){
-				blend_data.dL_dmt_dT_dtm = (blend_data.dL_dmax_depth) / fmaxf(-blend_data.dT_dtmedian, 1e-7f);
-				
-				//reset
-				blend_data.T = 1.f;
-				return true;
-			}
 #ifdef DEBUG_OPACITY_FIELD
 			float diff = blend_data.opacity_final - blend_data.opacity;
 			if (abs(diff) > 1e-5)
@@ -3606,7 +3625,7 @@ __global__ void __launch_bounds__(16 * 16,4) sortGaussiansRayHierarchicalCUDA_ba
 		};
 
 
-	sortGaussiansRayHierarchicaEvaluation<false, ITERATIONS, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+	sortGaussiansRayHierarchicaEvaluation<false, 1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
 		ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
 		prep_function, store_function, 
               blend_function, 
@@ -3706,6 +3725,7 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blen
 			{
 				return false;
 			}			
+			blend_data.contributor++;
 			const float2 xy = points_xy_image[id];
 			const float2 d = { xy.x - static_cast<float>(pixpos.x), xy.y - static_cast<float>(pixpos.y) };
 

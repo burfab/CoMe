@@ -213,6 +213,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	CudaRasterizer::SplattingSettings settings = settings_dict.get<CudaRasterizer::SplattingSettings>();
 
 	if(extra_features.size(1) != settings.blend_extra_features) throw std::runtime_error("Error ");
+	
+	auto float_opts = means3D.options().dtype(torch::kFloat32);
 
 	torch::Tensor dL_dmeans3D = torch::zeros({P, 3}, means3D.options());
 	torch::Tensor dL_dmeans2D = torch::zeros({P, 3}, means3D.options());
@@ -228,6 +230,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 	torch::Tensor dL_dview2gaussian = torch::zeros({P, VIEW2GAUSSIAN_OFFSET}, means3D.options());
 
 
+	torch::Tensor first_pass_bw = torch::zeros({H, W, 1}, float_opts);
 
 
 	if (P != 0)
@@ -273,6 +276,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
 											 dL_dconfidences.contiguous().data<float>(),
 											 dL_dextra_features.contiguous().data<float>(),
 											 dL_dview2gaussian.contiguous().data<float>(),
+											 first_pass_bw.contiguous().data<float>(),
 											 debug);
 	}
 

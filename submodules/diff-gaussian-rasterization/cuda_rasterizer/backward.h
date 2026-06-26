@@ -27,7 +27,7 @@ namespace BACKWARD
 
 
 void render(const dim3 grid, dim3 block, const uint2 *ranges,
-            SplattingSettings splatting_settings, const uint32_t *point_list,
+            SplattingSettings splatting_settings, const uint32_t *point_list, const uint64_t *per_pixel_bit_mask,
             int W, int H, float focal_x, float focal_y, const float *bg_color,
             const float2 *means2D, const float4 *cov3D_inv,
             const float *projmatrix_inv, const glm::vec3 *cam_pos,
@@ -37,7 +37,7 @@ void render(const dim3 grid, dim3 block, const uint2 *ranges,
             const float *pixel_colors, const float *gt_colors,
             const float *dL_dpixels, float3 *dL_dmean2D, float4 *dL_dconic2D,
             float *dL_dopacity, float *dL_dcolors, float *dL_dconfidences, 
-            float *dL_dview2gaussian);
+            float *dL_dview2gaussian, float *first_pass_bw);
 
 void preprocess(int P, int D, int M, const bool proper_ewa_scaling,
                 const float3 *means, const int *radii, const float *shs,

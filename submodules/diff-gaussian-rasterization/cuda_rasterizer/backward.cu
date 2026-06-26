@@ -1098,6 +1098,7 @@ void BACKWARD::render(
 	const uint2* ranges,
 	SplattingSettings splatting_settings,
 	const uint32_t* point_list,
+	const uint64_t *per_pixel_bitmask,
 	int W, int H,
 	float focal_x, float focal_y,
 	const float* bg_color,
@@ -1119,7 +1120,8 @@ void BACKWARD::render(
 	float* dL_dopacity,
 	float* dL_dcolors,
 	float* dL_dconfidences,
-	float* dL_dview2gaussian)
+	float* dL_dview2gaussian,
+	float *first_pass_bw)
 {
 	#define CALL_KBUFFER(WINDOW) renderkBufferBackwardCUDA<NUM_CHANNELS, WINDOW> << <grid, block >> > (ranges, point_list, W, H, means2D, cov3D_inv, projmatrix_inv, (float3*)cam_pos, colors, conic_opacity, final_Ts, n_contrib, bg_color, pixel_colors, dL_dpixels, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors)
 
@@ -1173,9 +1175,15 @@ void BACKWARD::render(
 	else if (splatting_settings.sort_settings.sort_mode == SortMode::HIERARCHICAL)
 	{
 #define CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, DETACH_ALPHA, EXACT_DEPTH, RENDER_GEOMETRY) \
+if(RENDER_GEOMETRY){\
+	sortGaussiansRayHierarchicalCUDA_binarySearchBackward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, DETACH_ALPHA, EXACT_DEPTH, RENDER_GEOMETRY, RENDER_GEOMETRY><<<grid, {16, 4, 4}>>>( \
+		ranges, point_list, per_pixel_bitmask, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.detach_alpha_extent, splatting_settings.include_alpha, view2gaussian, bg_color, means2D, cov3D_inv, projmatrix_inv, (float3*) cam_pos, conic_opacity, \
+		colors, final_Ts, n_contrib, pixel_colors, gt_colors,  dL_dpixels, first_pass_bw);\
+	}\
 	sortGaussiansRayHierarchicalCUDA_backward<NUM_CHANNELS, HEAD_QUEUE_SIZE, MID_QUEUE_SIZE, HIER_CULLING, DETACH_ALPHA, EXACT_DEPTH, RENDER_GEOMETRY, RENDER_GEOMETRY><<<grid, {16, 4, 4}>>>( \
-		ranges, point_list, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.detach_alpha_extent, splatting_settings.include_alpha, view2gaussian, bg_color, means2D, cov3D_inv, projmatrix_inv, (float3*) cam_pos, conic_opacity, \
-		colors, final_Ts, n_contrib, pixel_colors, gt_colors,  dL_dpixels, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dconfidences, dL_dview2gaussian);
+		ranges, point_list, per_pixel_bitmask, W, H, focal_x, focal_y, splatting_settings.far_plane, splatting_settings.detach_alpha_extent, splatting_settings.include_alpha, view2gaussian, bg_color, means2D, cov3D_inv, projmatrix_inv, (float3*) cam_pos, conic_opacity, \
+		colors, final_Ts, n_contrib, pixel_colors, gt_colors,  dL_dpixels, first_pass_bw, dL_dmean2D, dL_dconic2D, dL_dopacity, dL_dcolors, dL_dconfidences, dL_dview2gaussian);\
+
 
 #define CALL_HIER(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, RENDER_GEOMETRY) \
 if (splatting_settings.detach_alpha && splatting_settings.exact_depth) { CALL_HIER_DETACHALPHA(HIER_CULLING, MID_QUEUE_SIZE, HEAD_QUEUE_SIZE, true, true, RENDER_GEOMETRY); } \

@@ -784,6 +784,7 @@ void CudaRasterizer::Rasterizer::backward(
 	float* dL_dconfidences,
 	float* dL_dextra_features,
 	float* dL_dview2gaussian,
+	float *first_pass_bw,
 	bool debug)
 {
 	bool requires_cov3D_inv = splatting_settings.sort_settings.requiresDepthAlongRay();
@@ -877,6 +878,7 @@ void CudaRasterizer::Rasterizer::backward(
 		imgState.ranges,
 		splatting_settings,
 		binningState.point_list,
+		splatting_settings.render_geometry ? binningState.point_list_keys_unsorted : nullptr,
 		width, height,
 		focal_x, focal_y,
 		background,
@@ -898,7 +900,7 @@ void CudaRasterizer::Rasterizer::backward(
 		dL_dopacity,
 		dL_dcolor,
 		dL_dconfidences,
-		dL_dview2gaussian), debug)
+		dL_dview2gaussian, first_pass_bw), debug)
 
 	// Take care of the rest of preprocessing. Was the precomputed covariance
 	// given to us or a scales/rot pair? If precomputed, pass that. If not,
