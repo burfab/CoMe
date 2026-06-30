@@ -1756,7 +1756,6 @@ __global__ void __launch_bounds__(16 * 16, 4)
     uint32_t max_contributor{0};
     float3 ray_dir;
     float gt_color[CHANNELS];
-	uint64_t XXX;
 
     float weighted_normal_sum[CHANNELS];
 
@@ -1782,7 +1781,6 @@ __global__ void __launch_bounds__(16 * 16, 4)
     bd.variance = 0.f;
     bd.occupation = 0.f;
     bd.occupation2 = 0.f;
-	bd.XXX = 0;
 
     bd.f_transmittance.x<0>() = 0.f;
     bd.f_transmittance.f<0, 0>() = 1.f;
@@ -1823,7 +1821,6 @@ __global__ void __launch_bounds__(16 * 16, 4)
     }
 	blend_data.contributor++;
 
-	blend_data.XXX ^= id;
     // Keep track of max transmittance for this Gaussian
     if (cov2Ds) {
       atomicMax((int *)&cov2Ds[id * 7 + 6], __float_as_int(blend_data.T));
@@ -2342,12 +2339,11 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
             float depth_max;
 			float T_p[SPLIT+1];
             float interval;
-            float3 ray_dir;
-			uint64_t XXX;
             uint32_t contributor = 0;
-            uint32_t max_contributor{0};
             uint32_t forward_max_blend_contributor{0};
 			bool in_range;
+
+			float &L_distortion_last_iter(){return interval;}
           };
 
 		  auto fn_linear_step = [](BlendData& bd){
@@ -2364,7 +2360,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
             BlendData bd;
 			bd.contributor = 0;
             uint32_t pix_id = pixpos.y * W + pixpos.x;
-            bd.ray_dir = ray_dir;
 
             for (int p = 0; p < SPLIT + 1; ++p) {
               bd.T_p[p] = 1.0f;
@@ -2385,7 +2380,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 			bd.depth_max = inside ? fmaxf(depth_init + SAMPLE_RANGE, 0.f) : 0.f;
 			bd.interval = (bd.depth_max - bd.depth_min)*ONE_OVER_SPLIT;
 
-			bd.XXX = 0;
             return bd;
           };
           auto blend_function =
@@ -2402,28 +2396,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
                 [[maybe_unused]] const float op = ABC_.w;
 
 				if(!blend_data.in_range) return false;
-				blend_data.XXX ^= id;
-
-				//try early return:
-				//sigma
-
-
-				//const float G_sigma = rsqrtf(AA);
-				//if(t_peak < blend_data.depth_min - G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return true;
-				//if(t_peak > blend_data.depth_max + G_sigma * SIGMA_THRESHOLD && blend_data.iter != BINARY_SEARCH_ITERATIONS) return false;
-
-//MYCODE: working
-/* 
-				const float q_peak = AA*t_peak*t_peak + BB*t_peak + CC;
-				const float power_peak = -0.5*(q_peak);
-				const float G_peak = op * expf(fminf(power_peak,0.f));
-*/
-				//vacany at peak is squared
-				//const float vacancy2_peak = (1.f-G_peak);
-				//alpha is G_peak thus use it
-
-
-
 				TransmittanceVacancy transmittance_helper(ABC_.x, G_peak, t_peak);
 				#pragma unroll
 				for(int i = START_ID; i < END_ID;i++){
@@ -2442,7 +2414,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
                                   int range, float3 o) {
 
 			//if(pixpos.x == W/2&& pixpos.y == H/2) printf("HashBS: %llu iter: %d blend: %d\n", blend_data.XXX, blend_data.iter, blend_data.blend_contributor);
-			blend_data.XXX = 0;
             uint32_t pix_id = W * pixpos.y + pixpos.x;
 			if(blend_data.iter == 0){
                 blend_data.in_range = (blend_data.T_p[0] >= 0.5f) && (blend_data.T_p[SPLIT] <= 0.5f) && blend_data.in_range;
@@ -2472,17 +2443,6 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
             if (pixpos.x == debug_target_pixel.x &&
                 pixpos.y == debug_target_pixel.y) {
               printf("+++++++++++++++++++++++++++++++++++++++++++\n");
-            }
-#endif
-#ifdef DEBUG_OPACITY_FIELD
-            if (pixpos.x < 10 && pixpos.y < 10) {
-              float d = blend_data.C[CHANNELS * 2];
-              float3 depth = {o.x + d * blend_data.ray_dir.x,
-                              o.y + d * blend_data.ray_dir.y,
-                              o.z + d * blend_data.ray_dir.z};
-              printf("[%d, %d]: depth: %.3f, depth point %.3f %.3f %.3f\n",
-                     pixpos.y, pixpos.x, blend_data.C[CHANNELS * 2], depth.x,
-                     depth.y, depth.z);
             }
 #endif
 
@@ -2821,816 +2781,805 @@ __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_bina
 		fin_function);
 }
 
-template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true, bool DETACH_ALPHA = true, bool EXACT_DEPTH = false, bool GSGS_TWO_PASS=true, bool RENDER_GEOMETRY=true>
+
+
+template <int32_t CHANNELS, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA, bool DETACH_ALPHA, bool EXACT_DEPTH, bool GSGS_TWO_PASS, bool RENDER_GEOMETRY>
 __global__ void __launch_bounds__(16 * 16, 4) sortGaussiansRayHierarchicalCUDA_backward(
-	const uint2* __restrict__ ranges,
-	const uint32_t* __restrict__ point_list, 
-	const uint64_t * __restrict__ per_pixel_bit_mask,
-	int W, int H,
-	float focal_x, float focal_y, 
-	const float far_plane,
-	const bool detach_alpha_extent,
-	const bool include_alpha,
-	const float* view2gaussian,
-	const float* __restrict__ bg_color,
-	const float2* __restrict__ points_xy_image,
-	const float4* __restrict__ cov3Ds_inv,
-	const float* __restrict__ projmatrix_inv,
-	const float3* __restrict__ cam_pos,
-	const float4* __restrict__ conic_opacity,
-	const float* __restrict__ colors,
-	const float* __restrict__ final_Ts,
-	const uint32_t* __restrict__ n_contrib,
-	const float* __restrict__ pixel_colors,
-	const float* __restrict__ gt_colors,
-	const float* __restrict__ dL_dpixels,
-	const float* __restrict__ first_pass_bw,
-	float3* __restrict__ dL_dmean2D,
-	float4* __restrict__ dL_dconic2D,
-	float* __restrict__ dL_dopacity,
-	float* __restrict__ dL_dcolors,
-	float* __restrict__ dL_dconfidences,
-	float* dL_dview2gaussian)
+	const uint2* __restrict__ ranges, const uint32_t* __restrict__ point_list, 
+	const uint64_t * __restrict__ per_pixel_bit_mask, int W, int H, float focal_x, float focal_y, 
+	const float far_plane, const bool detach_alpha_extent, const bool include_alpha, 
+	const float* view2gaussian, const float* __restrict__ bg_color, const float2* __restrict__ points_xy_image, 
+	const float4* __restrict__ cov3Ds_inv, const float* __restrict__ projmatrix_inv, const float3* __restrict__ cam_pos, 
+	const float4* __restrict__ conic_opacity, const float* __restrict__ colors, const float* __restrict__ final_Ts, 
+	const uint32_t* __restrict__ n_contrib, const float* __restrict__ pixel_colors, const float* __restrict__ gt_colors, 
+	const float* __restrict__ dL_dpixels, const float* __restrict__ first_pass_bw, float3* __restrict__ dL_dmean2D, 
+	float4* __restrict__ dL_dconic2D, float* __restrict__ dL_dopacity, float* __restrict__ dL_dcolors, 
+	float* __restrict__ dL_dconfidences, float* dL_dview2gaussian)
 {
-	const float ddelx_dx = 0.5 * W;
-	const float ddely_dy = 0.5 * H;
-	// int num_blends = 0;
+			const float ddelx_dx = 0.5 * W;
+			const float ddely_dy = 0.5 * H;
+			// int num_blends = 0;
 
 
-	struct BlendData
-	{
-		//for iter=0: compute eq 16 of paper https://arxiv.org/html/2601.17835v1#S4.SS1
-		//for iter=1: compute eq 17 of paper https://arxiv.org/html/2601.17835v1#S4.SS1 and do standard backward
-		float dT_dtmedian;
-		int iter = 0;
-		float T_final;
-		float dL_dpixel[CHANNELS];
-		//++++++++++++GOF
-		float dL_dnormal2D[3]; // Normal
-		float dL_dmt_dT_dtm;
-		float max_depth = 0.f;
-		float dL_dmax_depth;
-		float final_D;
-		float final_D2;
-		float final_A;
-		float dL_dreg;
-		float dL_dextent_loss;
-		float extent_loss_rem;
-		float last_alpha;
-		float accum_normal_rec[3] = {0};
-		float last_normal[3] = { 0 };
-		float last_dL_dT = 0;
-
-		float variance_bg_color_term; 
-		float remaining_variance;
-		float remaining_normal_variance;
-		float remaining_A;
-		float remaining_D;
-		float remaining_D2;
-
-		// Opacity field loss
-		float opacity_final;
-		float T_opa_final;
-		float T_opa;
-		float opacity;
-		float dL_dopacity;
-		float dL_dt;
-		float dt_dA;
-		float dt_dB;
-		float dt_dC;
-		float dt_dw;
-
-		uint32_t max_contributor;
-		uint32_t contributor = 0;
-		uint32_t current_contributor = 0;
-
-		uint32_t depth_global_id{-1};
-		float2 ray;
-
-		//++++++++++++GOF
-		float gt_color[CHANNELS];
-		float final_color[CHANNELS];
-		float final_normal[CHANNELS];
-		float T;
-		float C[CHANNELS*2];
-		float confidence;
-		float dL_dconfidence;
-		float dL_dvariance;
-		float dL_dnormal_variance;
-		float dL_doccupation;
-	};
-
-
-
-		auto prep_function = [&](bool inside, const uint2& pixpos, const float3 raydir)
-		{
-			uint32_t pix_id = W * pixpos.y + pixpos.x;
-			BlendData bd;
-			bd.contributor = 0;
-			bd.T = 1.0f;
-			bd.T_final = inside ? final_Ts[pix_id] : 0;
-			//++++++++++++GOF
-			bd.final_D = inside ? final_Ts[pix_id + H * W] : 0;
-			bd.final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
-			bd.final_A = 1 - bd.T_final;
-			bd.dL_dreg = inside ? dL_dpixels[DISTORTION_OFFSET * H * W + pix_id] : 0;
-
-			// new opacity loss
-			bd.extent_loss_rem = inside ? pixel_colors[OPACITY_LOSS_OFFSET * H * W + pix_id] : 0;
-			bd.dL_dextent_loss = inside ? dL_dpixels[OPACITY_LOSS_OFFSET * H * W + pix_id] : 0;
-			bd.dL_dt = 0.f;
-			bd.dt_dA = 0.f;
-			bd.dt_dB = 0.f;
-			bd.dt_dC = 0.f;
-			bd.dt_dw = 0.f;
-			bd.ray = {raydir.x, raydir.y};
-
-			bd.remaining_A = bd.final_A;
-			bd.remaining_D = bd.final_D;
-			bd.remaining_D2 = bd.final_D2;
-
-			// Opacity field loss
-			bd.opacity_final = inside ? pixel_colors[ALPHA_OFFSET * H * W + pix_id] : 0;
-			bd.T_opa_final = inside ? final_Ts[pix_id + 3 * H * W] : 0;
-			bd.T_opa = 1.0f;
-			bd.opacity = 0.f;
-			bd.dL_dopacity = inside ? dL_dpixels[ALPHA_OFFSET * H * W + pix_id] : 0;
-
-			bd.max_contributor = inside ? n_contrib[pix_id] & 0xFFFF : 0;
-			bd.max_depth = inside ? pixel_colors[DEPTH_OFFSET * H * W + pix_id] : 0;
-			bd.dL_dmt_dT_dtm = 0.f;
-
-			// blend_data.extent_loss /= (blend_data.depth + 1e-9);
-			// depth is detached (for now)
-			// bd.dL_dextent_loss /= (bd.max_depth + 1e-9);
-
-			// confidence
-			bd.dL_dconfidence = inside ? dL_dpixels[CONFIDENCE_OFFSET * H * W + pix_id] : 0;
-			// compensate for normalization
-			//TODO: was this a bug or intentional, was 1e-9f
-			bd.dL_dconfidence /= max(1 - bd.T_final, 1e-3f);
-
-			//++++++++++++GOF
-			for (int ch = 0; ch < CHANNELS*2; ++ch)
+			struct BlendData
 			{
-				bd.C[ch] = 0.f;
-			}
-			for (int ch = 0; ch < CHANNELS; ++ch)
-			{
-				if (inside)
-				{
-					bd.dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
-					bd.final_color[ch] = pixel_colors[ch * H * W + pix_id] - bd.T_final * bg_color[ch];
-					bd.gt_color[ch] = gt_colors[ch * H * W + pix_id];
-				}
-			}
-			if(inside)
-			{
+				//for iter=0: compute eq 16 of paper https://arxiv.org/html/2601.17835v1#S4.SS1
+				//for iter=1: compute eq 17 of paper https://arxiv.org/html/2601.17835v1#S4.SS1 and do standard backward
+				float dT_dtmedian;
+				int iter = 0;
+				float T_final;
+				float dL_dpixel[CHANNELS];
+				//++++++++++++GOF
+				float dL_dnormal2D[3]; // Normal
+				float dL_dmt_dT_dtm;
+				float max_depth = 0.f;
+				float dL_dmax_depth;
+				float final_D;
+				float final_D2;
+				float final_A;
+				float dL_dreg;
+				float dL_dextent_loss;
+				float extent_loss_rem;
+				float last_alpha;
+				float accum_normal_rec[3] = {0};
+				float last_normal[3] = { 0 };
+				float last_dL_dT = 0;
 
-				bd.variance_bg_color_term = 0.f;
-				for(int ch = 0; ch < CHANNELS; ch++){
-					const float diff = (bd.gt_color[ch] - bg_color[ch]);
-					bd.variance_bg_color_term += (diff*diff);
-				}
-				bd.variance_bg_color_term *= bd.T_final;
+				float variance_bg_color_term; 
+				float remaining_variance;
+				float remaining_normal_variance;
+				float remaining_A;
+				float remaining_D;
+				float remaining_D2;
 
+				// Opacity field loss
+				float opacity_final;
+				float T_opa_final;
+				float T_opa;
+				float opacity;
+				float dL_dopacity;
+				float dL_dt;
+				float dt_dA;
+				float dt_dB;
+				float dt_dC;
+				float dt_dw;
 
-				bd.remaining_variance = pixel_colors[VARIANCE_OFFSET* H * W + pix_id] - bd.variance_bg_color_term;
-				bd.remaining_normal_variance = pixel_colors[NORMAL_VARIANCE_OFFSET* H * W + pix_id];
-				bd.dL_dvariance = dL_dpixels[VARIANCE_OFFSET * H * W + pix_id];
-				bd.dL_dnormal_variance = dL_dpixels[NORMAL_VARIANCE_OFFSET * H * W + pix_id];
-				
-			}
-			else
-			{
-				bd.remaining_variance = 0.f;
-				bd.remaining_normal_variance = 0.f;
-				bd.dL_dvariance = 0.f;
-				bd.dL_dnormal_variance = 0.f;
+				uint32_t max_contributor;
+				uint32_t contributor = 0;
+				uint32_t current_contributor = 0;
 
-				bd.variance_bg_color_term = 0.f;
-			}
+				uint32_t depth_global_id{-1};
+				float2 ray;
 
-			//++++++++++++GOF
-			if(inside)
-			{
-				for (int i = 0; i < 3; i++)
-				{	
-					bd.dL_dnormal2D[i] = dL_dpixels[(CHANNELS+i) * H * W + pix_id];
-					bd.final_normal[i] = pixel_colors[(CHANNELS+i) * H * W + pix_id];
-				}
-				bd.dL_dmax_depth = dL_dpixels[DEPTH_OFFSET * H * W + pix_id];
-				if constexpr (GSGS_TWO_PASS && RENDER_GEOMETRY){
-					bd.dL_dmt_dT_dtm = bd.dL_dmax_depth * first_pass_bw[H*W*0+pix_id];
-				}else {
-					bd.dL_dmt_dT_dtm = 0.f;
-				}
-			}
-			bd.last_alpha = 0;
-			//++++++++++++GOF
-			
-			//also divide by 
-			if(inside){
-				bd.dL_doccupation =
-					dL_dpixels[OCCUPATION_OFFSET * H * W + pix_id] /
-					max(1 - bd.T_final, 1e-3f);
-					//fmaxf((float)bd.blend_contributor, 1.f);
-			}else {
-				bd.dL_doccupation = 0;
-			}
-				
-			return bd;
-		};
-	auto store_function = [](const uint2&, int coll_id, float G, float alpha, float depth)
-		{
-			return G;
-		};
-
-	auto blend_function = [&](auto FIRST_ITER_AS_TYPE,const uint2& pixpos, BlendData& blend_data, int global_id, float G, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
-		{
-            constexpr bool FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
-			const float4 con_o = conic_opacity[global_id];
-			const float alpha = min(0.99f, con_o.w * G);
-			[[maybe_unused]] const float AA = ABC_.x;
-			[[maybe_unused]] const float BB = ABC_.y;
-			[[maybe_unused]] const float CC = ABC_.z;
-			float test_T = blend_data.T * (1.0f - alpha);
-			if (test_T < 0.0001f)
-			{
-				return false;
-			}			
-			blend_data.contributor++;
-			//++++++++++++GOF
-			const float normal[3] = {normal_.x, normal_.y, normal_.z};
-			//++++++++++++GOF		
-
-			// normalize normal
-			float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + 1e-7);
-			const float normal_normalized[3] = { -normal[0] / length, -normal[1] / length, -normal[2] / length};
-
-			// ++num_blends;
-
-			const float2 xy = points_xy_image[global_id];
-			const float2 d = { xy.x - static_cast<float>(pixpos.x), xy.y - static_cast<float>(pixpos.y) };
-
-
-			const float dchannel_dcolor = alpha * blend_data.T;
-
-
-            //Gradients for depth supervision
-			float dL_dA = 0.0f; //dL_dmin_value * (BB / AA) * (BB / AA) / 4.f; //0.0f
-			float dL_dB = 0.0f; //dL_dmin_value * -BB / (2 *AA);//0.0f
-			float dL_dC = 0.0f;
-
-
-			{
-
-			// 1. Recompute geom_intensity (or load it if saved from the forward pass)
-			float peak_exponent = -0.5f * (AA * t * t + BB * t + CC);
-			if(peak_exponent > 0.f) peak_exponent=0.f;
-			float geom_intensity = expf(peak_exponent);
-
-			// 2. dL / d(geom_intensity)
-			float dL_dgeom = blend_data.dL_doccupation ;//+ blend_data.dL_doccupation2 * 2.0f * geom_intensity;
-
-			// 3. dL / d(peak_exponent) -> because d(exp(x))/dx = exp(x)
-			float dL_dexp = dL_dgeom * geom_intensity;
-
-			// 5. Accumulate gradients into CC, BB, and AA
-			dL_dC += blend_data.T * alpha * dL_dexp * -0.5f;
-			dL_dB += blend_data.T * alpha * dL_dexp * (-0.5f * t);
-			dL_dA += blend_data.T * alpha * dL_dexp * (-0.5f * t * t);
-			}
-
-
-
-			// Propagate gradients to per-Gaussian colors and keep
-			// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
-			// pair).
-			float dL_dalpha = 0.0f;
-
-			float dL_dcolors_gaussian[CHANNELS];
-			float rgb[3];
-
-			for (int ch = 0; ch < CHANNELS; ch++)
-			{
-				dL_dcolors_gaussian[ch] = 0.f;
-				rgb[ch] = colors[global_id * CHANNELS + ch];
-
-				// reconstruct color up to this point
-				blend_data.C[ch] += rgb[ch] * alpha * blend_data.T;
-				// the contribution of all other gaussian coming after
-				float accum_rec_ch = (blend_data.final_color[ch] - blend_data.C[ch]) / test_T;
-
-				const float dL_dchannel = blend_data.dL_dpixel[ch];
-				dL_dalpha += (rgb[ch] - accum_rec_ch) * dL_dchannel;
-				// Update the gradients w.r.t. color of the Gaussian. 
-				// Atomic, since this pixel is just one of potentially
-				// many that were affected by this Gaussian.
-				dL_dcolors_gaussian[ch]+=dchannel_dcolor*dL_dchannel;
-			}
-			// +++++++++Variance Loss ++++++++++
-			float sum_D_i = 0.f;
-			float variance_strength = blend_data.dL_dvariance;
-			//
-			for (int ch = 0; ch < CHANNELS; ch++)
-			{
-				const float c = rgb[ch];
-				dL_dcolors_gaussian[ch]+=2.f * variance_strength * dchannel_dcolor * (c - blend_data.gt_color[ch]);
-				float D_i = (c - blend_data.gt_color[ch]) * (c - blend_data.gt_color[ch]);
-				blend_data.remaining_variance -= dchannel_dcolor * D_i;
-				sum_D_i += D_i;
-			}
-			//// we need to divide by T, because later this is multiplied by T
-			//#define DETACH_ALPHA_COLOR_VARIANCE
-			#ifndef DETACH_ALPHA_COLOR_VARIANCE
-			dL_dalpha += (variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_variance))/(blend_data.T+0.000001f);
-			#endif //DETACH_ALPHA_COLOR_VARIANCE
-			// +++++++++Variance Loss ++++++++++
-
-			float dL_dnormal_normalized[3] = {0};
-			// // Propagate gradients to per-Gaussian normals
-			for (int ch = 0; ch < 3; ch++) {
-				// reconstruct color up to this point
-				blend_data.C[ch+CHANNELS] += normal_normalized[ch] * alpha * blend_data.T;
-				// the contribution of all other gaussian coming after
-				blend_data.accum_normal_rec[ch] = (blend_data.final_normal[ch] - blend_data.C[ch+CHANNELS]) / test_T;
-
-				dL_dalpha += (normal_normalized[ch] - blend_data.accum_normal_rec[ch]) * blend_data.dL_dnormal2D[ch];
-				dL_dnormal_normalized[ch] = alpha * blend_data.T * blend_data.dL_dnormal2D[ch];
-			}
-
-			// +++++++++ Normal Variance Loss ++++++++++
-			sum_D_i = 0.f;
-			float normal_variance_strength = blend_data.dL_dnormal_variance;
-			for (int ch = 0; ch < 3; ch++) {
-				float difference = (normal_normalized[ch] - blend_data.final_normal[ch]);
-				dL_dnormal_normalized[ch] += 2.f * normal_variance_strength * alpha * blend_data.T * difference;
-
-				float D_i = difference * difference;
-				blend_data.remaining_normal_variance -= dchannel_dcolor * D_i;
-				sum_D_i += D_i;
-			}
-
-			//#define DETACH_ALPHA_NORMAL_VARIANCE
-			#ifndef DETACH_ALPHA_NORMAL_VARIANCE
-			dL_dalpha += (normal_variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_normal_variance))/(blend_data.T+0.000001f);
-			#endif //DETACH_ALPHA_NORMAL_VARIANCE
-			// +++++++++ Normal Variance Loss ++++++++++
-			
-			// float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + 1e-7);
-			// const float normal_normalized[3] = { -normal[0] / length, -normal[1] / length, -normal[2] / length};
-			float dL_dlength = (dL_dnormal_normalized[0] * normal[0] + dL_dnormal_normalized[1] * normal[1] + dL_dnormal_normalized[2] * normal[2]);
-			dL_dlength *= 1.f / (length * length);
-			float dL_dnormal[3] = {
-				(-dL_dnormal_normalized[0] + dL_dlength * normal[0]) / length,
-				(-dL_dnormal_normalized[1] + dL_dlength * normal[1]) / length,
-				(-dL_dnormal_normalized[2] + dL_dlength * normal[2]) / length
+				//++++++++++++GOF
+				float gt_color[CHANNELS];
+				float final_color[CHANNELS];
+				float final_normal[CHANNELS];
+				float T;
+				float C[CHANNELS*2];
+				float confidence;
+				float dL_dconfidence;
+				float dL_dvariance;
+				float dL_dnormal_variance;
+				float dL_doccupation;
 			};
 
 
 
-			//DEPTH
-			float dL_do = 0;
-			float inv_A = 1.f / AA;
-			float dLdepth_dG = 0.f;
-			if constexpr(!GSGS_TWO_PASS){
-			if (++blend_data.current_contributor == blend_data.max_contributor) {
-					blend_data.depth_global_id = global_id;
-#ifdef CORRECT_EXACT_DEPTH_GRAD
-				//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
-				if (test_T < 0.5f && EXACT_DEPTH) {
-					float Fp = (-0.5/(blend_data.T*ABC_.w)) + (1.0f/ABC_.w);
-					float con = CC + 2 * logf(Fp);
-					float disc = abs(BB*BB - 4 * AA * (con));
-					float median_t = sqrtf(disc + 1e-9);
+				auto prep_function = [&](bool inside, const uint2& pixpos, const float3 raydir)
+				{
+					uint32_t pix_id = W * pixpos.y + pixpos.x;
+					BlendData bd;
+					bd.contributor = 0;
+					bd.T = 1.0f;
+					bd.T_final = inside ? final_Ts[pix_id] : 0;
+					//++++++++++++GOF
+					bd.final_D = inside ? final_Ts[pix_id + H * W] : 0;
+					bd.final_D2 = inside ? final_Ts[pix_id + 2 * H * W] : 0;
+					bd.final_A = 1 - bd.T_final;
+					bd.dL_dreg = inside ? dL_dpixels[DISTORTION_OFFSET * H * W + pix_id] : 0;
 
-					float grad_A = (BB * BB - 2 * AA * (con)) / (median_t * 2 * AA * AA);
-					float grad_B = t / median_t;
-					float grad_C = 1.f / median_t;
-					// 3. Accumulate projected gradients
-					dL_dA += blend_data.dL_dmax_depth * grad_A;
-					dL_dB += blend_data.dL_dmax_depth * grad_B;
-					dL_dC += blend_data.dL_dmax_depth * grad_C;
+					// new opacity loss
+					bd.extent_loss_rem = inside ? pixel_colors[OPACITY_LOSS_OFFSET * H * W + pix_id] : 0;
+					bd.dL_dextent_loss = inside ? dL_dpixels[OPACITY_LOSS_OFFSET * H * W + pix_id] : 0;
+					bd.dL_dt = 0.f;
+					bd.dt_dA = 0.f;
+					bd.dt_dB = 0.f;
+					bd.dt_dC = 0.f;
+					bd.dt_dw = 0.f;
+					bd.ray = {raydir.x, raydir.y};
 
-					blend_data.dt_dA = grad_A;
-					blend_data.dt_dB = grad_B;
-					blend_data.dt_dC = grad_C;
-					blend_data.dt_dw = 0.f;
-				} else {
-					// plain depth (test_T >= 0.5)
-					dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
-					dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
-					dL_dC += 0* (blend_data.dL_dmax_depth);
-					dL_do += 0* (blend_data.dL_dmax_depth);
+					bd.remaining_A = bd.final_A;
+					bd.remaining_D = bd.final_D;
+					bd.remaining_D2 = bd.final_D2;
 
-					blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
-					blend_data.dt_dB = -0.5f * inv_A;
-					blend_data.dt_dC = 0.f;
-					blend_data.dt_dw = 0.f;
-				}
-#else
-				dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
-				dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
-				dL_dC += 0* (blend_data.dL_dmax_depth);
-				dL_do += 0* (blend_data.dL_dmax_depth);
+					// Opacity field loss
+					bd.opacity_final = inside ? pixel_colors[ALPHA_OFFSET * H * W + pix_id] : 0;
+					bd.T_opa_final = inside ? final_Ts[pix_id + 3 * H * W] : 0;
+					bd.T_opa = 1.0f;
+					bd.opacity = 0.f;
+					bd.dL_dopacity = inside ? dL_dpixels[ALPHA_OFFSET * H * W + pix_id] : 0;
 
-				blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
-				blend_data.dt_dB = -0.5f * inv_A;
-				blend_data.dt_dC = 0.f;
-				blend_data.dt_dw = 0.f;
-#endif
-				}
-			}else if(RENDER_GEOMETRY && GSGS_TWO_PASS){
-				const float dt_dA = 0.5f * BB * inv_A * inv_A;
-				const float dt_dB = -0.5f * inv_A;
-				float dLd_dT_dtm = 0.f;
+					bd.max_contributor = inside ? n_contrib[pix_id] & 0xFFFF : 0;
+					bd.max_depth = inside ? pixel_colors[DEPTH_OFFSET * H * W + pix_id] : 0;
+					bd.dL_dmt_dT_dtm = 0.f;
 
+					// blend_data.extent_loss /= (blend_data.depth + 1e-9);
+					// depth is detached (for now)
+					// bd.dL_dextent_loss /= (bd.max_depth + 1e-9);
 
+					// confidence
+					bd.dL_dconfidence = inside ? dL_dpixels[CONFIDENCE_OFFSET * H * W + pix_id] : 0;
+					// compensate for normalization
+					//TODO: was this a bug or intentional, was 1e-9f
+					bd.dL_dconfidence /= max(1 - bd.T_final, 1e-3f);
 
-
-				//binary search loss
-				blend_data.depth_global_id = (uint32_t)-1;
-				TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
-
-
-
-				float dT_dA; float dT_dalpha; float dT_dtpeak;
-				const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dA, dT_dalpha, dT_dtpeak);
-
-
-				//blend_data.dL_doccupation2 loss part
-				//div by blend_data.T as we later mul by it
-				//dL_dalpha += (blend_data.dL_doccupation2 * blend_data.occupation2/(1.f-alpha) * -1.f) / blend_data.T;
-				//blend_data.occupation2 -= (1.f-T_tmed) * -(test_T);
-
-
-				//alpha is a function of tpeak
-				//dT_dtpeak += dT_dalpha * (-0.5f * (AA * t * 2.f + BB)) * alpha;
-				float dL_dT_dtmed = (0.5/T_tmed) * (blend_data.dL_dmt_dT_dtm);
-				//dL_dA += dL_dT_dtmed * dT_dA;// (dT_dA + dT_dtpeak * (0.5f * BB*inv_A*inv_A));
-				//dL_dB += dL_dT_dtmed * ((-0.5f * inv_A) * dT_dtpeak);
-
-				//divide by blend_data.T as its later multiplied by it
-				//dL_dalpha += (dL_dT_dtmed * (dT_dalpha + dT_dtpeak * alpha * -(AA * t + 0.5 * BB) + dT_dA * alpha * -0.5 * t * t))/blend_data.T;
-
-				//lets take derivaite of alpha wrt B and A and op
-				//alpha is a function of tpeak and of A
-				//alpha = op * exp(-0.5 * (A * tt + B * t + C))
-				//dalpha/dA = alpha * (-0.5*tt)
-				//dalpha/dt = alpha * (A * -1 * t - 0.5 * B) = alpha * -(A * t + 0.5 * B)
-
-
-				//alpha = op * exp(-0.5 * (A * tt + B * t + C))
-				//dalpha/dA = alpha * (-0.5*tt)
-				//dalpha/dB = alpha * (-0.5*t)
-				//dalpha/dC = alpha * (-0.5)
-				//dalpha/dt = alpha * (A * -1 * t - 0.5 * B) = alpha * -(A * t + 0.5 * B)
-				//dalpha/do = G
-				//t = -B/(2A)
-				//dt/dA = 0.5 * B * inv_A * inv_A
-				//dt/dB = -0.5 * inv_A
-				
-				//also add this, this is just added to the 2d mean positions
-				dLdepth_dG = con_o.w * dT_dalpha * dL_dT_dtmed;
-
-
-				dL_do += dL_dT_dtmed * (dT_dalpha * G);
-				dL_dA += dL_dT_dtmed * (-0.5 * t*t * dT_dalpha * alpha + dT_dtpeak * dt_dA + dT_dA);
-				dL_dB += dL_dT_dtmed * (-0.5 * t * dT_dalpha* alpha  + dT_dtpeak * dt_dB);
-				dL_dC += dL_dT_dtmed * (-0.5 * dT_dalpha* alpha );
-				
-
-
-			}
-
-
-
-
-			// NDC mapping is taken from 2DGS paper, please check here https://arxiv.org/pdf/2403.17888.pdf
-
-			//++++++++++++GOF
-			// gradient for the distoration loss is taken from 2DGS paper, please check https://arxiv.org/pdf/2403.17888.pdf
-			float dL_dmax_t = 0.0f;
-			float dL_dweight = 0.0f;
-			
-
-			//TODO: replace with bool argument to function
-			if(blend_data.dL_dreg != 0.f){
-				const float max_t = t;
-				const float mapped_max_t = (far_plane * max_t - far_plane * NEAR_PLANE) / ((far_plane - NEAR_PLANE) * max_t);
-				
-				float dmax_t_dd = (far_plane * NEAR_PLANE) / ((far_plane - NEAR_PLANE) * max_t * max_t);
-
-				dL_dmax_t += 2.0f * (blend_data.T * alpha) * (mapped_max_t * blend_data.final_A - blend_data.final_D) * blend_data.dL_dreg * dmax_t_dd;
-				dL_dA += 0.5f * BB * inv_A * inv_A * (dL_dmax_t);
-				dL_dB += -0.5f * inv_A* (dL_dmax_t);
-				dL_dC += 0* (dL_dmax_t);
-				dL_do += 0* (dL_dmax_t);
-
-				// if weight is not detached
-				if constexpr (!DETACH_ALPHA) {
-					dL_dweight += (blend_data.final_D2 + mapped_max_t * mapped_max_t * blend_data.final_A - 2 * mapped_max_t * blend_data.final_D) * blend_data.dL_dreg;	
-
-					blend_data.remaining_A -= blend_data.T * alpha;
-					blend_data.remaining_D -= mapped_max_t * blend_data.T * alpha;
-					blend_data.remaining_D2 -= mapped_max_t * mapped_max_t * blend_data.T * alpha;
-
-					// in front-to-back order, we need T_i * (dL/d_wi - 1/test_T * \sum_{j=i+1}^N w_j dL_dw_j
-					float dL_di_plus_one = (blend_data.final_D2 * blend_data.remaining_A + blend_data.final_A * blend_data.remaining_D2 - 2.f * blend_data.final_D * blend_data.remaining_D);
-					dL_dalpha += dL_dweight - dL_di_plus_one / (test_T) * blend_data.dL_dreg;
-				}
-			}
-
-			dL_dalpha *= blend_data.T;
-
-			// here, the depth of the Gaussian is larger than the depth of the pixel
-			float alpha_point = 0.f;
-
-			
-			//TODO: replace with bool argument to function
-			if(blend_data.dL_dopacity != 0.f){
-				if (t > blend_data.max_depth) {
-					// TODO: propagate gradient to AA, BB, CC directly
-					float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
-					float p = -0.5f * min_value;
-					if (p > 0.0f){
-						p = 0.0f;
+					//++++++++++++GOF
+					for (int ch = 0; ch < CHANNELS*2; ++ch)
+					{
+						bd.C[ch] = 0.f;
 					}
-					float expp = exp(p);
-					alpha_point = min(0.99f, ABC_.w * expp);
-					float dalpha_point = (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity));
-					float dL_dalpha_point = dalpha_point * blend_data.dL_dopacity;
+					for (int ch = 0; ch < CHANNELS; ++ch)
+					{
+						if (inside)
+						{
+							bd.dL_dpixel[ch] = dL_dpixels[ch * H * W + pix_id];
+							bd.final_color[ch] = pixel_colors[ch * H * W + pix_id] - bd.T_final * bg_color[ch];
+							bd.gt_color[ch] = gt_colors[ch * H * W + pix_id];
+						}
+					}
+					if(inside)
+					{
+
+						bd.variance_bg_color_term = 0.f;
+						for(int ch = 0; ch < CHANNELS; ch++){
+							const float diff = (bd.gt_color[ch] - bg_color[ch]);
+							bd.variance_bg_color_term += (diff*diff);
+						}
+						bd.variance_bg_color_term *= bd.T_final;
+
+
+						bd.remaining_variance = pixel_colors[VARIANCE_OFFSET* H * W + pix_id] - bd.variance_bg_color_term;
+						bd.remaining_normal_variance = pixel_colors[NORMAL_VARIANCE_OFFSET* H * W + pix_id];
+						bd.dL_dvariance = dL_dpixels[VARIANCE_OFFSET * H * W + pix_id];
+						bd.dL_dnormal_variance = dL_dpixels[NORMAL_VARIANCE_OFFSET * H * W + pix_id];
+						
+					}
+					else
+					{
+						bd.remaining_variance = 0.f;
+						bd.remaining_normal_variance = 0.f;
+						bd.dL_dvariance = 0.f;
+						bd.dL_dnormal_variance = 0.f;
+
+						bd.variance_bg_color_term = 0.f;
+					}
+
+					//++++++++++++GOF
+					if(inside)
+					{
+						for (int i = 0; i < 3; i++)
+						{	
+							bd.dL_dnormal2D[i] = dL_dpixels[(CHANNELS+i) * H * W + pix_id];
+							bd.final_normal[i] = pixel_colors[(CHANNELS+i) * H * W + pix_id];
+						}
+						bd.dL_dmax_depth = dL_dpixels[DEPTH_OFFSET * H * W + pix_id];
+						if constexpr (GSGS_TWO_PASS && RENDER_GEOMETRY){
+							bd.dL_dmt_dT_dtm = bd.dL_dmax_depth * first_pass_bw[H*W*0+pix_id];
+						}else {
+							bd.dL_dmt_dT_dtm = 0.f;
+						}
+					}
+					bd.last_alpha = 0;
+					//++++++++++++GOF
 					
-					//might cause instability as simple would be to make central gaussian represent gray color and then setting to opaque
-					dL_do += dL_dalpha_point * expp; 
-
-
-					// derive gradients w.r.t. AA,BB,CC
-					// alpha_point = min(0.99f, ABC_.w * exp(p));
-					float dL_dexpp = dL_dalpha_point * ABC_.w;
-					float dL_dp = dL_dexpp * expp;
-
-					// float p = -0.5f * min_value;
-					float dL_dmin_value = dL_dp * -0.5f;
-
-					// float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
-					dL_dA += dL_dmin_value * blend_data.max_depth * blend_data.max_depth;
-					dL_dB += dL_dmin_value * blend_data.max_depth;
-					dL_dC += dL_dmin_value;
-
-					// dO_dt = dO_dalpha * dalpha_dt
-					// float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
-					blend_data.dL_dt += dL_dalpha_point * (-alpha_point * (AA * blend_data.max_depth + BB / 2));
-				}
-				// otherwise (eval at max contrib)
-				else {
-					alpha_point = alpha;
-					// just add the gradient to alpha, the computation will take care of the rest
-					dL_dalpha += (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity)) * blend_data.dL_dopacity;
-				}
-			}
-
-			// first, accumulate the opacity
-			blend_data.opacity += alpha_point * blend_data.T_opa;
-			blend_data.T_opa *= (1 - alpha_point);
-
-			// const float C = (far_plane * NEAR_PLANE * sqrtf(2 * logf(255 * ABC_.w))) / (far_plane - NEAR_PLANE);
-
-			// float dL_dNDC = blend_data.T * alpha * blend_data.dL_dextent_loss * C;
-
-			// extent: C * 4 * AA^(3/2) / (BB * BB)
-			// dL_dA += 6 * sqrtf(AA) / powf(BB, 2) * dL_dNDC;
-
-			// // extent: C * 4 * AA^(3/2) / (BB * BB)
-			// dL_dB += - 8 * AA * sqrtf(AA) / powf(BB, 3) * dL_dNDC;
-
-			// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
-
-			//TODO: replace with bool argument to function
-			if(blend_data.dL_dextent_loss != 0.f){
-				const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
-				float C = (CC - 2 * logf(255 * ABC_.w));
-				float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
-
-				float dL_dNDC = blend_data.T * blend_data.dL_dextent_loss * FN;
-				dL_dNDC /= (BB * BB * extent);
-
-				if (include_alpha) {
-					dL_dNDC *= alpha;
-				}
-
-				// extent: C * 4 * AA^(3/2) / (BB * BB)
-				dL_dA += (2 * (BB * BB - 6 * AA * C)) * dL_dNDC;
-
-				// extent: C * 4 * AA / (BB * BB)
-				dL_dB += (16 * AA * AA * C - 2 * AA * BB * BB) / BB * dL_dNDC;
-
-				// formula is below anyway
-				dL_dC += (-4 * AA * AA) * dL_dNDC;
-
-				float NDCspan = FN * (2 * AA * extent) / (BB * BB);
-
-				if (!detach_alpha_extent) {
-					dL_do += (8 * AA * AA) / ABC_.w * dL_dNDC;
-
-					if (include_alpha) {
-						blend_data.extent_loss_rem -= blend_data.T * alpha * NDCspan;		
-						dL_dalpha += blend_data.T * (NDCspan - blend_data.extent_loss_rem / test_T) * blend_data.dL_dextent_loss;
-				
+					//also divide by 
+					if(inside){
+						bd.dL_doccupation =
+							dL_dpixels[OCCUPATION_OFFSET * H * W + pix_id] /
+							max(1 - bd.T_final, 1e-3f);
+							//fmaxf((float)bd.blend_contributor, 1.f);
+					}else {
+						bd.dL_doccupation = 0;
 					}
-					else {
-						blend_data.extent_loss_rem -= blend_data.T * NDCspan;		
-						dL_dalpha += blend_data.extent_loss_rem / (1 - alpha) * blend_data.dL_dextent_loss;
+						
+					return bd;
+				};
+			auto store_function = [](const uint2&, int coll_id, float G, float alpha, float depth)
+				{
+					return G;
+				};
+
+			auto blend_function = [&](auto FIRST_ITER_AS_TYPE,const uint2& pixpos, BlendData& blend_data, int global_id, float G, float t, const float* view2gaussian_j, float2 ray, CudaRasterizer::DebugVisualization debugType, float3 normal_, float4 ABC_)
+				{
+					constexpr bool FIRST_ITER = decltype(FIRST_ITER_AS_TYPE)::value;
+					const float4 con_o = conic_opacity[global_id];
+					const float alpha = min(0.99f, con_o.w * G);
+					[[maybe_unused]] const float AA = ABC_.x;
+					[[maybe_unused]] const float BB = ABC_.y;
+					[[maybe_unused]] const float CC = ABC_.z;
+					float test_T = blend_data.T * (1.0f - alpha);
+					if (test_T < 0.0001f)
+					{
+						return false;
+					}			
+					blend_data.contributor++;
+					//++++++++++++GOF
+					const float normal[3] = {normal_.x, normal_.y, normal_.z};
+					//++++++++++++GOF		
+
+					// normalize normal
+					float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + 1e-7);
+					const float normal_normalized[3] = { -normal[0] / length, -normal[1] / length, -normal[2] / length};
+
+					// ++num_blends;
+
+					const float2 xy = points_xy_image[global_id];
+					const float2 d = { xy.x - static_cast<float>(pixpos.x), xy.y - static_cast<float>(pixpos.y) };
+
+
+					const float dchannel_dcolor = alpha * blend_data.T;
+
+
+					//Gradients for depth supervision
+					float dL_dA = 0.0f; //dL_dmin_value * (BB / AA) * (BB / AA) / 4.f; //0.0f
+					float dL_dB = 0.0f; //dL_dmin_value * -BB / (2 *AA);//0.0f
+					float dL_dC = 0.0f;
+
+
+					{
+
+					// 1. Recompute geom_intensity (or load it if saved from the forward pass)
+					float peak_exponent = -0.5f * (AA * t * t + BB * t + CC);
+					if(peak_exponent > 0.f) peak_exponent=0.f;
+					float geom_intensity = expf(peak_exponent);
+
+					// 2. dL / d(geom_intensity)
+					float dL_dgeom = blend_data.dL_doccupation ;//+ blend_data.dL_doccupation2 * 2.0f * geom_intensity;
+
+					// 3. dL / d(peak_exponent) -> because d(exp(x))/dx = exp(x)
+					float dL_dexp = dL_dgeom * geom_intensity;
+
+					// 5. Accumulate gradients into CC, BB, and AA
+					dL_dC += blend_data.T * alpha * dL_dexp * -0.5f;
+					dL_dB += blend_data.T * alpha * dL_dexp * (-0.5f * t);
+					dL_dA += blend_data.T * alpha * dL_dexp * (-0.5f * t * t);
 					}
+
+
+
+					// Propagate gradients to per-Gaussian colors and keep
+					// gradients w.r.t. alpha (blending factor for a Gaussian/pixel
+					// pair).
+					float dL_dalpha = 0.0f;
+
+					float dL_dcolors_gaussian[CHANNELS];
+					float rgb[3];
+
+					for (int ch = 0; ch < CHANNELS; ch++)
+					{
+						dL_dcolors_gaussian[ch] = 0.f;
+						rgb[ch] = colors[global_id * CHANNELS + ch];
+
+						// reconstruct color up to this point
+						blend_data.C[ch] += rgb[ch] * alpha * blend_data.T;
+						// the contribution of all other gaussian coming after
+						float accum_rec_ch = (blend_data.final_color[ch] - blend_data.C[ch]) / test_T;
+
+						const float dL_dchannel = blend_data.dL_dpixel[ch];
+						dL_dalpha += (rgb[ch] - accum_rec_ch) * dL_dchannel;
+						// Update the gradients w.r.t. color of the Gaussian. 
+						// Atomic, since this pixel is just one of potentially
+						// many that were affected by this Gaussian.
+						dL_dcolors_gaussian[ch]+=dchannel_dcolor*dL_dchannel;
+					}
+					// +++++++++Variance Loss ++++++++++
+					float sum_D_i = 0.f;
+					float variance_strength = blend_data.dL_dvariance;
+					//
+					for (int ch = 0; ch < CHANNELS; ch++)
+					{
+						const float c = rgb[ch];
+						dL_dcolors_gaussian[ch]+=2.f * variance_strength * dchannel_dcolor * (c - blend_data.gt_color[ch]);
+						float D_i = (c - blend_data.gt_color[ch]) * (c - blend_data.gt_color[ch]);
+						blend_data.remaining_variance -= dchannel_dcolor * D_i;
+						sum_D_i += D_i;
+					}
+					//// we need to divide by T, because later this is multiplied by T
+					//#define DETACH_ALPHA_COLOR_VARIANCE
+					#ifndef DETACH_ALPHA_COLOR_VARIANCE
+					dL_dalpha += (variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_variance))/(blend_data.T+0.000001f);
+					#endif //DETACH_ALPHA_COLOR_VARIANCE
+					// +++++++++Variance Loss ++++++++++
+
+					float dL_dnormal_normalized[3] = {0};
+					// // Propagate gradients to per-Gaussian normals
+					for (int ch = 0; ch < 3; ch++) {
+						// reconstruct color up to this point
+						blend_data.C[ch+CHANNELS] += normal_normalized[ch] * alpha * blend_data.T;
+						// the contribution of all other gaussian coming after
+						blend_data.accum_normal_rec[ch] = (blend_data.final_normal[ch] - blend_data.C[ch+CHANNELS]) / test_T;
+
+						dL_dalpha += (normal_normalized[ch] - blend_data.accum_normal_rec[ch]) * blend_data.dL_dnormal2D[ch];
+						dL_dnormal_normalized[ch] = alpha * blend_data.T * blend_data.dL_dnormal2D[ch];
+					}
+
+					// +++++++++ Normal Variance Loss ++++++++++
+					sum_D_i = 0.f;
+					float normal_variance_strength = blend_data.dL_dnormal_variance;
+					for (int ch = 0; ch < 3; ch++) {
+						float difference = (normal_normalized[ch] - blend_data.final_normal[ch]);
+						dL_dnormal_normalized[ch] += 2.f * normal_variance_strength * alpha * blend_data.T * difference;
+
+						float D_i = difference * difference;
+						blend_data.remaining_normal_variance -= dchannel_dcolor * D_i;
+						sum_D_i += D_i;
+					}
+
+					//#define DETACH_ALPHA_NORMAL_VARIANCE
+					#ifndef DETACH_ALPHA_NORMAL_VARIANCE
+					dL_dalpha += (normal_variance_strength * (  blend_data.T*sum_D_i  - (1.0f/((1.0f - alpha+ 0.000001f))) * blend_data.remaining_normal_variance))/(blend_data.T+0.000001f);
+					#endif //DETACH_ALPHA_NORMAL_VARIANCE
+					// +++++++++ Normal Variance Loss ++++++++++
+					
+					// float length = sqrt(normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2] + 1e-7);
+					// const float normal_normalized[3] = { -normal[0] / length, -normal[1] / length, -normal[2] / length};
+					float dL_dlength = (dL_dnormal_normalized[0] * normal[0] + dL_dnormal_normalized[1] * normal[1] + dL_dnormal_normalized[2] * normal[2]);
+					dL_dlength *= 1.f / (length * length);
+					float dL_dnormal[3] = {
+						(-dL_dnormal_normalized[0] + dL_dlength * normal[0]) / length,
+						(-dL_dnormal_normalized[1] + dL_dlength * normal[1]) / length,
+						(-dL_dnormal_normalized[2] + dL_dlength * normal[2]) / length
+					};
+
+
+
+					//DEPTH
+					float dL_do = 0;
+					float inv_A = 1.f / AA;
+					float dLdepth_dG = 0.f;
+					if constexpr(!GSGS_TWO_PASS){
+					if (++blend_data.current_contributor == blend_data.max_contributor) {
+							blend_data.depth_global_id = global_id;
+		#ifdef CORRECT_EXACT_DEPTH_GRAD
+						//BUGFIX? it always used to compute the gradient with exact depth even in the case it wasn't computed, i.e. if (test_T<0.5) wasn't there
+						if (test_T < 0.5f && EXACT_DEPTH) {
+							float Fp = (-0.5/(blend_data.T*ABC_.w)) + (1.0f/ABC_.w);
+							float con = CC + 2 * logf(Fp);
+							float disc = abs(BB*BB - 4 * AA * (con));
+							float median_t = sqrtf(disc + 1e-9);
+
+							float grad_A = (BB * BB - 2 * AA * (con)) / (median_t * 2 * AA * AA);
+							float grad_B = t / median_t;
+							float grad_C = 1.f / median_t;
+							// 3. Accumulate projected gradients
+							dL_dA += blend_data.dL_dmax_depth * grad_A;
+							dL_dB += blend_data.dL_dmax_depth * grad_B;
+							dL_dC += blend_data.dL_dmax_depth * grad_C;
+
+							blend_data.dt_dA = grad_A;
+							blend_data.dt_dB = grad_B;
+							blend_data.dt_dC = grad_C;
+							blend_data.dt_dw = 0.f;
+						} else {
+							// plain depth (test_T >= 0.5)
+							dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
+							dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
+							dL_dC += 0* (blend_data.dL_dmax_depth);
+							dL_do += 0* (blend_data.dL_dmax_depth);
+
+							blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
+							blend_data.dt_dB = -0.5f * inv_A;
+							blend_data.dt_dC = 0.f;
+							blend_data.dt_dw = 0.f;
+						}
+		#else
+						dL_dA += 0.5f * BB * inv_A * inv_A * (blend_data.dL_dmax_depth);
+						dL_dB += -0.5f * inv_A* (blend_data.dL_dmax_depth);
+						dL_dC += 0* (blend_data.dL_dmax_depth);
+						dL_do += 0* (blend_data.dL_dmax_depth);
+
+						blend_data.dt_dA = 0.5f * BB * inv_A * inv_A;
+						blend_data.dt_dB = -0.5f * inv_A;
+						blend_data.dt_dC = 0.f;
+						blend_data.dt_dw = 0.f;
+		#endif
+						}
+					}else if(RENDER_GEOMETRY && GSGS_TWO_PASS){
+						const float dt_dA = 0.5f * BB * inv_A * inv_A;
+						const float dt_dB = -0.5f * inv_A;
+						float dLd_dT_dtm = 0.f;
+
+
+
+
+						//binary search loss
+						blend_data.depth_global_id = (uint32_t)-1;
+						TransmittanceVacancy transmittance_helper(ABC_.x, alpha, t);
+
+
+
+						float dT_dA; float dT_dalpha; float dT_dtpeak;
+						const float T_tmed = transmittance_helper.dT_dGaussian(blend_data.max_depth, dT_dA, dT_dalpha, dT_dtpeak);
+
+
+						//blend_data.dL_doccupation2 loss part
+						//div by blend_data.T as we later mul by it
+						//dL_dalpha += (blend_data.dL_doccupation2 * blend_data.occupation2/(1.f-alpha) * -1.f) / blend_data.T;
+						//blend_data.occupation2 -= (1.f-T_tmed) * -(test_T);
+
+
+						//alpha is a function of tpeak
+						//dT_dtpeak += dT_dalpha * (-0.5f * (AA * t * 2.f + BB)) * alpha;
+						float dL_dT_dtmed = (0.5/T_tmed) * (blend_data.dL_dmt_dT_dtm);
+						//dL_dA += dL_dT_dtmed * dT_dA;// (dT_dA + dT_dtpeak * (0.5f * BB*inv_A*inv_A));
+						//dL_dB += dL_dT_dtmed * ((-0.5f * inv_A) * dT_dtpeak);
+
+						//divide by blend_data.T as its later multiplied by it
+						//dL_dalpha += (dL_dT_dtmed * (dT_dalpha + dT_dtpeak * alpha * -(AA * t + 0.5 * BB) + dT_dA * alpha * -0.5 * t * t))/blend_data.T;
+
+						//lets take derivaite of alpha wrt B and A and op
+						//alpha is a function of tpeak and of A
+						//alpha = op * exp(-0.5 * (A * tt + B * t + C))
+						//dalpha/dA = alpha * (-0.5*tt)
+						//dalpha/dt = alpha * (A * -1 * t - 0.5 * B) = alpha * -(A * t + 0.5 * B)
+
+
+						//alpha = op * exp(-0.5 * (A * tt + B * t + C))
+						//dalpha/dA = alpha * (-0.5*tt)
+						//dalpha/dB = alpha * (-0.5*t)
+						//dalpha/dC = alpha * (-0.5)
+						//dalpha/dt = alpha * (A * -1 * t - 0.5 * B) = alpha * -(A * t + 0.5 * B)
+						//dalpha/do = G
+						//t = -B/(2A)
+						//dt/dA = 0.5 * B * inv_A * inv_A
+						//dt/dB = -0.5 * inv_A
+						
+						//also add this, this is just added to the 2d mean positions
+						dLdepth_dG = con_o.w * dT_dalpha * dL_dT_dtmed;
+
+
+						dL_do += dL_dT_dtmed * (dT_dalpha * G);
+						dL_dA += dL_dT_dtmed * (-0.5 * t*t * dT_dalpha * alpha + dT_dtpeak * dt_dA + dT_dA);
+						dL_dB += dL_dT_dtmed * (-0.5 * t * dT_dalpha* alpha  + dT_dtpeak * dt_dB);
+						dL_dC += dL_dT_dtmed * (-0.5 * dT_dalpha* alpha );
+						
+
+
+					}
+
+
+
+
+					// NDC mapping is taken from 2DGS paper, please check here https://arxiv.org/pdf/2403.17888.pdf
+
+					//++++++++++++GOF
+					// gradient for the distoration loss is taken from 2DGS paper, please check https://arxiv.org/pdf/2403.17888.pdf
+					float dL_dmax_t = 0.0f;
+					float dL_dweight = 0.0f;
+					
+
+					//TODO: replace with bool argument to function
+					if(blend_data.dL_dreg != 0.f){
+						const float max_t = t;
+						const float mapped_max_t = (far_plane * max_t - far_plane * NEAR_PLANE) / ((far_plane - NEAR_PLANE) * max_t);
+						
+						float dmax_t_dd = (far_plane * NEAR_PLANE) / ((far_plane - NEAR_PLANE) * max_t * max_t);
+
+						dL_dmax_t += 2.0f * (blend_data.T * alpha) * (mapped_max_t * blend_data.final_A - blend_data.final_D) * blend_data.dL_dreg * dmax_t_dd;
+						dL_dA += 0.5f * BB * inv_A * inv_A * (dL_dmax_t);
+						dL_dB += -0.5f * inv_A* (dL_dmax_t);
+						dL_dC += 0* (dL_dmax_t);
+						dL_do += 0* (dL_dmax_t);
+
+						// if weight is not detached
+						if constexpr (!DETACH_ALPHA) {
+							dL_dweight += (blend_data.final_D2 + mapped_max_t * mapped_max_t * blend_data.final_A - 2 * mapped_max_t * blend_data.final_D) * blend_data.dL_dreg;	
+
+							blend_data.remaining_A -= blend_data.T * alpha;
+							blend_data.remaining_D -= mapped_max_t * blend_data.T * alpha;
+							blend_data.remaining_D2 -= mapped_max_t * mapped_max_t * blend_data.T * alpha;
+
+							// in front-to-back order, we need T_i * (dL/d_wi - 1/test_T * \sum_{j=i+1}^N w_j dL_dw_j
+							float dL_di_plus_one = (blend_data.final_D2 * blend_data.remaining_A + blend_data.final_A * blend_data.remaining_D2 - 2.f * blend_data.final_D * blend_data.remaining_D);
+							dL_dalpha += dL_dweight - dL_di_plus_one / (test_T) * blend_data.dL_dreg;
+						}
+					}
+
+					dL_dalpha *= blend_data.T;
+
+					// here, the depth of the Gaussian is larger than the depth of the pixel
+					float alpha_point = 0.f;
+
+					
+					//TODO: replace with bool argument to function
+					if(blend_data.dL_dopacity != 0.f){
+						if (t > blend_data.max_depth) {
+							// TODO: propagate gradient to AA, BB, CC directly
+							float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
+							float p = -0.5f * min_value;
+							if (p > 0.0f){
+								p = 0.0f;
+							}
+							float expp = exp(p);
+							alpha_point = min(0.99f, ABC_.w * expp);
+							float dalpha_point = (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity));
+							float dL_dalpha_point = dalpha_point * blend_data.dL_dopacity;
+							
+							//might cause instability as simple would be to make central gaussian represent gray color and then setting to opaque
+							dL_do += dL_dalpha_point * expp; 
+
+
+							// derive gradients w.r.t. AA,BB,CC
+							// alpha_point = min(0.99f, ABC_.w * exp(p));
+							float dL_dexpp = dL_dalpha_point * ABC_.w;
+							float dL_dp = dL_dexpp * expp;
+
+							// float p = -0.5f * min_value;
+							float dL_dmin_value = dL_dp * -0.5f;
+
+							// float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
+							dL_dA += dL_dmin_value * blend_data.max_depth * blend_data.max_depth;
+							dL_dB += dL_dmin_value * blend_data.max_depth;
+							dL_dC += dL_dmin_value;
+
+							// dO_dt = dO_dalpha * dalpha_dt
+							// float min_value = (AA * blend_data.max_depth * blend_data.max_depth + BB * blend_data.max_depth + CC);
+							blend_data.dL_dt += dL_dalpha_point * (-alpha_point * (AA * blend_data.max_depth + BB / 2));
+						}
+						// otherwise (eval at max contrib)
+						else {
+							alpha_point = alpha;
+							// just add the gradient to alpha, the computation will take care of the rest
+							dL_dalpha += (blend_data.T_opa - 1.f / (1 - alpha_point) * (blend_data.opacity_final - blend_data.opacity)) * blend_data.dL_dopacity;
+						}
+					}
+
+					// first, accumulate the opacity
+					blend_data.opacity += alpha_point * blend_data.T_opa;
+					blend_data.T_opa *= (1 - alpha_point);
+
+					// const float C = (far_plane * NEAR_PLANE * sqrtf(2 * logf(255 * ABC_.w))) / (far_plane - NEAR_PLANE);
+
+					// float dL_dNDC = blend_data.T * alpha * blend_data.dL_dextent_loss * C;
+
+					// extent: C * 4 * AA^(3/2) / (BB * BB)
+					// dL_dA += 6 * sqrtf(AA) / powf(BB, 2) * dL_dNDC;
+
+					// // extent: C * 4 * AA^(3/2) / (BB * BB)
+					// dL_dB += - 8 * AA * sqrtf(AA) / powf(BB, 3) * dL_dNDC;
+
+					// float NDCspan = C * 4 * AA * sqrtf(AA) / (BB * BB);
+
+					//TODO: replace with bool argument to function
+					if(blend_data.dL_dextent_loss != 0.f){
+						const float FN = (far_plane * NEAR_PLANE) / (far_plane - NEAR_PLANE);
+						float C = (CC - 2 * logf(255 * ABC_.w));
+						float extent = sqrtf(abs(BB*BB - 4* AA*C) + 1e-9);
+
+						float dL_dNDC = blend_data.T * blend_data.dL_dextent_loss * FN;
+						dL_dNDC /= (BB * BB * extent);
+
+						if (include_alpha) {
+							dL_dNDC *= alpha;
+						}
+
+						// extent: C * 4 * AA^(3/2) / (BB * BB)
+						dL_dA += (2 * (BB * BB - 6 * AA * C)) * dL_dNDC;
+
+						// extent: C * 4 * AA / (BB * BB)
+						dL_dB += (16 * AA * AA * C - 2 * AA * BB * BB) / BB * dL_dNDC;
+
+						// formula is below anyway
+						dL_dC += (-4 * AA * AA) * dL_dNDC;
+
+						float NDCspan = FN * (2 * AA * extent) / (BB * BB);
+
+						if (!detach_alpha_extent) {
+							dL_do += (8 * AA * AA) / ABC_.w * dL_dNDC;
+
+							if (include_alpha) {
+								blend_data.extent_loss_rem -= blend_data.T * alpha * NDCspan;		
+								dL_dalpha += blend_data.T * (NDCspan - blend_data.extent_loss_rem / test_T) * blend_data.dL_dextent_loss;
+						
+							}
+							else {
+								blend_data.extent_loss_rem -= blend_data.T * NDCspan;		
+								dL_dalpha += blend_data.extent_loss_rem / (1 - alpha) * blend_data.dL_dextent_loss;
+							}
+						}
+					}
+
+					// Account for fact that alpha also influences how much of
+					// the background color is added if nothing left to blend
+					float bg_dot_dpixel = 0;
+					for (int i = 0; i < CHANNELS; i++)
+						bg_dot_dpixel += bg_color[i] * blend_data.dL_dpixel[i];
+
+
+
+					dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * bg_dot_dpixel;
+						
+					//alpha also influences how much the background color adds to the variance loss
+					//variance wrt bg: blend_data.T_final * sum_ch ((blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]));
+					//dVar_dalpha = d_T_final/d_alpha * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch])
+					//d_T_final/d_alpha = -blend_data.T_final / (1.f-alpha)
+					#ifndef DETACH_ALPHA_COLOR_VARIANCE
+					dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * blend_data.variance_bg_color_term * blend_data.dL_dvariance;
+					#endif
+
+					// Helpful reusable temporary variables
+					const float dL_dG = con_o.w * dL_dalpha;
+					const float gdx = G * d.x;
+					const float gdy = G * d.y;
+					const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
+					const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
+
+					// Update gradients w.r.t. 2D mean position of the Gaussian
+					atomicAdd(&dL_dmean2D[global_id].x, (dL_dG + dLdepth_dG)* dG_ddelx * ddelx_dx);
+					atomicAdd(&dL_dmean2D[global_id].y, (dL_dG + dLdepth_dG)* dG_ddely * ddely_dy);
+					const float abs_dL_dmean2D = abs((dL_dG+dLdepth_dG) * dG_ddelx * ddelx_dx) + abs((dL_dG +dLdepth_dG)* dG_ddely * ddely_dy);
+					atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
+
+
+					// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
+					//not needed anymore
+					/*
+					atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * (0*dL_dG+dLdepth_dG));
+					atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * (0*dL_dG+dLdepth_dG));
+					atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * (0*dL_dG+dLdepth_dG));
+					*/
+
+					// Update gradients w.r.t. opacity of the Gaussian
+					atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha + dL_do);
+
+					//++++++++++++GOF
+					const float dG_dpower = G;
+					const float dL_dpower = dL_dG * dG_dpower;
+
+					// // float power = -0.5f * min_value;
+					const float dL_dmin_value = dL_dpower * -0.5f;
+					// float min_value = -(BB*BB)/(4*AA) + CC;
+					// const float dL_dA = dL_dmin_value * (BB*BB)/4 *  1. / (AA*AA);
+					dL_dA += dL_dmin_value * (BB / AA) * (BB / AA) / 4.f;
+					dL_dB += dL_dmin_value * -BB / (2 *AA);
+					dL_dC += dL_dmin_value * 1.0f;
+
+					// const float normal[3] = { view2gaussian_j[0] * ray.x + view2gaussian_j[1] * ray.y + view2gaussian_j[2], 
+					// 						view2gaussian_j[1] * ray.x + view2gaussian_j[3] * ray.y + view2gaussian_j[4],
+					// 						view2gaussian_j[2] * ray.x + view2gaussian_j[4] * ray.y + view2gaussian_j[5]};
+
+					// use AA, BB, CC so that the name is unique
+					// float AA = ray.x * normal[0] + ray.y * normal[1] + normal[2];
+					// float BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
+					// float CC = view2gaussian_j[9];
+					
+
+					dL_dnormal[0] += dL_dA * ray.x;
+					dL_dnormal[1] += dL_dA * ray.y;
+					dL_dnormal[2] += dL_dA;
+					
+					// write the gradients to global memory directly
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 0]), dL_dnormal[0] * ray.x);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 1]), dL_dnormal[0] * ray.y + dL_dnormal[1] * ray.x);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 2]), dL_dnormal[0] + dL_dnormal[2] * ray.x);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 3]), dL_dnormal[1] * ray.y);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 4]), dL_dnormal[1] + dL_dnormal[2] * ray.y);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 5]), dL_dnormal[2]);
+					
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 6]), dL_dB * 2 * ray.x);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 7]), dL_dB * 2 * ray.y);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 8]), dL_dB * 2);
+					atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 9]), dL_dC);
+
+
+					for(int ch =0; ch < CHANNELS;ch++) atomicAdd(&(dL_dcolors[global_id * CHANNELS + ch]), dL_dcolors_gaussian[ch]);
+					// confidence gradient
+					atomicAdd(&(dL_dconfidences[global_id]), blend_data.dL_dconfidence * alpha * blend_data.T);
+
+
+					//++++++++++++GOF
+
+					blend_data.T = test_T;
+		#ifdef ENABLE_NAN_CHECKS
+					if(isnan(dL_dnormal[0]) || isnan(dL_dnormal[1]) || isnan(dL_dnormal[2]))
+					{
+						printf("Normals(%f, %f, %f)\n", dL_dnormal[0], dL_dnormal[1], dL_dnormal[2]);
+					}
+					if(isnan(dL_dA) || isnan(dL_dB) || isnan(dL_dC) || isnan(blend_data.dL_dmax_depth))
+					{
+						printf("dABC(%f, %f, %f, %f, %f, %f)\n", dL_dA, dL_dB, dL_dC, dL_dt, blend_data.dL_dmax_depth, blend_data.max_depth);
+					}
+					if(isnan(dL_dmean2D[global_id].x) || isnan(dL_dmean2D[global_id].y) || isnan(dL_dmean2D[global_id].z))
+					{
+					printf("(%f, %f, %f)\n",dL_dmean2D[global_id].x, dL_dmean2D[global_id].y, dL_dmean2D[global_id].z);
+					}
+					for(int i = 0; i < 10; i++)
+					{
+					if(isnan(dL_dview2gaussian[global_id * 10 + i]))
+					{
+						printf("dL_dview2gaussian %d : %f, %f, %f, %f)\n", i, dL_dview2gaussian[global_id * 10 + i]);
+					}
+					}
+		#endif
+
+					return true;
+
+				};
+			auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
+				{
+		#ifdef DEBUG_OPACITY_FIELD
+					float diff = blend_data.opacity_final - blend_data.opacity;
+					if (abs(diff) > 1e-5)
+						printf("%u, %u:\t O %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff, blend_data.opacity_final, blend_data.opacity);
+					float diff2 = blend_data.T_opa_final - blend_data.T_opa;
+					if (abs(diff2) > 1e-5)
+						printf("%u, %u:\t T %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff2, blend_data.T_opa_final, blend_data.T_opa);
+		#endif
+				if (blend_data.depth_global_id != (uint32_t)-1 &&
+					blend_data.dL_dt != 0.f) {
+					float dL_dA = blend_data.dt_dA * blend_data.dL_dt;
+					float dL_dB = blend_data.dt_dB * blend_data.dL_dt;
+					float dL_dC = 
+						blend_data.dt_dC * blend_data.dL_dt; // NEW
+
+					float dL_dnormal[3] = {dL_dA * blend_data.ray.x,
+											dL_dA * blend_data.ray.y,
+											dL_dA};
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 0],
+							dL_dnormal[0] * blend_data.ray.x);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 1],
+							dL_dnormal[0] * blend_data.ray.y +
+								dL_dnormal[1] * blend_data.ray.x);
+					atomicAdd(
+						&dL_dview2gaussian[blend_data.depth_global_id *
+												VIEW2GAUSSIAN_OFFSET +
+											2],
+						dL_dnormal[0] + dL_dnormal[2] * blend_data.ray.x);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 3],
+							dL_dnormal[1] * blend_data.ray.y);
+					atomicAdd(
+						&dL_dview2gaussian[blend_data.depth_global_id *
+												VIEW2GAUSSIAN_OFFSET +
+											4],
+						dL_dnormal[1] + dL_dnormal[2] * blend_data.ray.y);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 5],
+							dL_dnormal[2]);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 6],
+							dL_dB * 2.f * blend_data.ray.x);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 7],
+							dL_dB * 2.f * blend_data.ray.y);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 8],
+							dL_dB * 2.f);
+					atomicAdd(&dL_dview2gaussian
+								[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 9],
+							dL_dC); // NEW
+					atomicAdd(&dL_dopacity[blend_data.depth_global_id],
+							blend_data.dt_dw * blend_data.dL_dt);
 				}
-			}
 
-			// Account for fact that alpha also influences how much of
-			// the background color is added if nothing left to blend
-			float bg_dot_dpixel = 0;
-			for (int i = 0; i < CHANNELS; i++)
-				bg_dot_dpixel += bg_color[i] * blend_data.dL_dpixel[i];
+								return false;
+				};
 
 
-
-			dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * bg_dot_dpixel;
-				
-			//alpha also influences how much the background color adds to the variance loss
-			//variance wrt bg: blend_data.T_final * sum_ch ((blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch]));
-			//dVar_dalpha = d_T_final/d_alpha * (blend_data.gt_color[ch] - bg_color[ch]) * (blend_data.gt_color[ch] - bg_color[ch])
-			//d_T_final/d_alpha = -blend_data.T_final / (1.f-alpha)
-			#ifndef DETACH_ALPHA_COLOR_VARIANCE
-			dL_dalpha += (-blend_data.T_final / (1.f - alpha)) * blend_data.variance_bg_color_term * blend_data.dL_dvariance;
-			#endif
-
-			// Helpful reusable temporary variables
-			const float dL_dG = con_o.w * dL_dalpha;
-			const float gdx = G * d.x;
-			const float gdy = G * d.y;
-			const float dG_ddelx = -gdx * con_o.x - gdy * con_o.y;
-			const float dG_ddely = -gdy * con_o.z - gdx * con_o.y;
-
-			// Update gradients w.r.t. 2D mean position of the Gaussian
-			atomicAdd(&dL_dmean2D[global_id].x, (dL_dG + dLdepth_dG)* dG_ddelx * ddelx_dx);
-			atomicAdd(&dL_dmean2D[global_id].y, (dL_dG + dLdepth_dG)* dG_ddely * ddely_dy);
-			const float abs_dL_dmean2D = abs((dL_dG+dLdepth_dG) * dG_ddelx * ddelx_dx) + abs((dL_dG +dLdepth_dG)* dG_ddely * ddely_dy);
-            atomicAdd(&dL_dmean2D[global_id].z, abs_dL_dmean2D);
-
-
-			// Update gradients w.r.t. 2D covariance (2x2 matrix, symmetric)
-			//not needed anymore
-			/*
-			atomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * (0*dL_dG+dLdepth_dG));
-			atomicAdd(&dL_dconic2D[global_id].y, -0.5f * gdx * d.y * (0*dL_dG+dLdepth_dG));
-			atomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * (0*dL_dG+dLdepth_dG));
-			*/
-
-			// Update gradients w.r.t. opacity of the Gaussian
-			atomicAdd(&(dL_dopacity[global_id]), G * dL_dalpha + dL_do);
-
-			//++++++++++++GOF
-			const float dG_dpower = G;
-			const float dL_dpower = dL_dG * dG_dpower;
-
-			// // float power = -0.5f * min_value;
-			const float dL_dmin_value = dL_dpower * -0.5f;
-			// float min_value = -(BB*BB)/(4*AA) + CC;
-			// const float dL_dA = dL_dmin_value * (BB*BB)/4 *  1. / (AA*AA);
-			dL_dA += dL_dmin_value * (BB / AA) * (BB / AA) / 4.f;
-			dL_dB += dL_dmin_value * -BB / (2 *AA);
-			dL_dC += dL_dmin_value * 1.0f;
-
-			// const float normal[3] = { view2gaussian_j[0] * ray.x + view2gaussian_j[1] * ray.y + view2gaussian_j[2], 
-			// 						view2gaussian_j[1] * ray.x + view2gaussian_j[3] * ray.y + view2gaussian_j[4],
-			// 						view2gaussian_j[2] * ray.x + view2gaussian_j[4] * ray.y + view2gaussian_j[5]};
-
-			// use AA, BB, CC so that the name is unique
-			// float AA = ray.x * normal[0] + ray.y * normal[1] + normal[2];
-			// float BB = 2 * (view2gaussian_j[6] * ray_point.x + view2gaussian_j[7] * ray_point.y + view2gaussian_j[8]);
-			// float CC = view2gaussian_j[9];
-			
-
-			dL_dnormal[0] += dL_dA * ray.x;
-			dL_dnormal[1] += dL_dA * ray.y;
-			dL_dnormal[2] += dL_dA;
-			
-			// write the gradients to global memory directly
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 0]), dL_dnormal[0] * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 1]), dL_dnormal[0] * ray.y + dL_dnormal[1] * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 2]), dL_dnormal[0] + dL_dnormal[2] * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 3]), dL_dnormal[1] * ray.y);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 4]), dL_dnormal[1] + dL_dnormal[2] * ray.y);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 5]), dL_dnormal[2]);
-			
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 6]), dL_dB * 2 * ray.x);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 7]), dL_dB * 2 * ray.y);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 8]), dL_dB * 2);
-			atomicAdd(&(dL_dview2gaussian[global_id * VIEW2GAUSSIAN_OFFSET + 9]), dL_dC);
-
-
-			for(int ch =0; ch < CHANNELS;ch++) atomicAdd(&(dL_dcolors[global_id * CHANNELS + ch]), dL_dcolors_gaussian[ch]);
-			// confidence gradient
-			atomicAdd(&(dL_dconfidences[global_id]), blend_data.dL_dconfidence * alpha * blend_data.T);
-
-
-			//++++++++++++GOF
-
-			blend_data.T = test_T;
-#ifdef ENABLE_NAN_CHECKS
-            if(isnan(dL_dnormal[0]) || isnan(dL_dnormal[1]) || isnan(dL_dnormal[2]))
-            {
-                printf("Normals(%f, %f, %f)\n", dL_dnormal[0], dL_dnormal[1], dL_dnormal[2]);
-            }
-            if(isnan(dL_dA) || isnan(dL_dB) || isnan(dL_dC) || isnan(blend_data.dL_dmax_depth))
-            {
-                printf("dABC(%f, %f, %f, %f, %f, %f)\n", dL_dA, dL_dB, dL_dC, dL_dt, blend_data.dL_dmax_depth, blend_data.max_depth);
-            }
-            if(isnan(dL_dmean2D[global_id].x) || isnan(dL_dmean2D[global_id].y) || isnan(dL_dmean2D[global_id].z))
-            {
-               printf("(%f, %f, %f)\n",dL_dmean2D[global_id].x, dL_dmean2D[global_id].y, dL_dmean2D[global_id].z);
-            }
-            for(int i = 0; i < 10; i++)
-            {
-               if(isnan(dL_dview2gaussian[global_id * 10 + i]))
-               {
-                   printf("dL_dview2gaussian %d : %f, %f, %f, %f)\n", i, dL_dview2gaussian[global_id * 10 + i]);
-               }
-            }
-#endif
-
-			return true;
-
-		};
-	auto fin_function = [&](const uint2& pixpos, BlendData& blend_data, CudaRasterizer::DebugVisualization debugType, int range, float3 o)
-		{
-#ifdef DEBUG_OPACITY_FIELD
-			float diff = blend_data.opacity_final - blend_data.opacity;
-			if (abs(diff) > 1e-5)
-				printf("%u, %u:\t O %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff, blend_data.opacity_final, blend_data.opacity);
-			float diff2 = blend_data.T_opa_final - blend_data.T_opa;
-			if (abs(diff2) > 1e-5)
-				printf("%u, %u:\t T %.5f (%.3f - %.3f)\n", pixpos.x, pixpos.y, diff2, blend_data.T_opa_final, blend_data.T_opa);
-#endif
-		if (blend_data.depth_global_id != (uint32_t)-1 &&
-			blend_data.dL_dt != 0.f) {
-			float dL_dA = blend_data.dt_dA * blend_data.dL_dt;
-			float dL_dB = blend_data.dt_dB * blend_data.dL_dt;
-			float dL_dC = 
-				blend_data.dt_dC * blend_data.dL_dt; // NEW
-
-			float dL_dnormal[3] = {dL_dA * blend_data.ray.x,
-									dL_dA * blend_data.ray.y,
-									dL_dA};
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 0],
-					dL_dnormal[0] * blend_data.ray.x);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 1],
-					dL_dnormal[0] * blend_data.ray.y +
-						dL_dnormal[1] * blend_data.ray.x);
-			atomicAdd(
-				&dL_dview2gaussian[blend_data.depth_global_id *
-										VIEW2GAUSSIAN_OFFSET +
-									2],
-				dL_dnormal[0] + dL_dnormal[2] * blend_data.ray.x);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 3],
-					dL_dnormal[1] * blend_data.ray.y);
-			atomicAdd(
-				&dL_dview2gaussian[blend_data.depth_global_id *
-										VIEW2GAUSSIAN_OFFSET +
-									4],
-				dL_dnormal[1] + dL_dnormal[2] * blend_data.ray.y);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET + 5],
-					dL_dnormal[2]);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 6],
-					dL_dB * 2.f * blend_data.ray.x);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 7],
-					dL_dB * 2.f * blend_data.ray.y);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 8],
-					dL_dB * 2.f);
-			atomicAdd(&dL_dview2gaussian
-						[blend_data.depth_global_id * VIEW2GAUSSIAN_OFFSET  + 9],
-					dL_dC); // NEW
-			atomicAdd(&dL_dopacity[blend_data.depth_global_id],
-					blend_data.dt_dw * blend_data.dL_dt);
-		}
-
-                        return false;
-		};
-
-
-	sortGaussiansRayHierarchicaEvaluation<false, 1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
-		ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
-		prep_function, store_function, 
-              blend_function, 
-		fin_function);
+			sortGaussiansRayHierarchicaEvaluation<false, 1, HEAD_WINDOW, MID_WINDOW, CULL_ALPHA>(
+				ranges, point_list, nullptr, W, H, focal_x, focal_y, view2gaussian,  points_xy_image, cov3Ds_inv, projmatrix_inv, cam_pos, conic_opacity, CudaRasterizer::DebugVisualization::Disabled,
+				prep_function, store_function, 
+					blend_function, 
+				fin_function);
 }
+
+
+
+
+
 
 template <int32_t CHANNELS, int32_t N_EXTRA_FEATURES, int HEAD_WINDOW, int MID_WINDOW, bool CULL_ALPHA = true>
 __global__ void __launch_bounds__(16 * 16) sortGaussiansRayHierarchicalCUDA_blendExtraFeaturesBackward(
